@@ -558,20 +558,27 @@ static void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
 static void fill_block_c(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
                          int fill_val, int bit_depth)
 {
-    int x, y;
+    int y;
     if (bit_depth > 8) {
         uint16_t *p16 = (uint16_t *)(void *)dst;
         int stride16 = (int)(dst_stride >> 1);
+        uint16_t v16 = (uint16_t)fill_val;
         for (y = 0; y < h; y++) {
-            for (x = 0; x < w; x++) {
-                p16[y * stride16 + x] = (uint16_t)fill_val;
+            uint16_t *row = p16 + y * stride16;
+            int x = 0;
+            /* 8 像素一组展开, 减少 loop overhead */
+            for (; x + 7 < w; x += 8) {
+                row[x + 0] = v16; row[x + 1] = v16; row[x + 2] = v16; row[x + 3] = v16;
+                row[x + 4] = v16; row[x + 5] = v16; row[x + 6] = v16; row[x + 7] = v16;
+            }
+            for (; x < w; x++) {
+                row[x] = v16;
             }
         }
     } else {
+        /* 8-bit: 每行用 memset (libc 通常用 SIMD 优化) */
         for (y = 0; y < h; y++) {
-            for (x = 0; x < w; x++) {
-                dst[y * dst_stride + x] = (uint8_t)fill_val;
-            }
+            memset(dst + y * dst_stride, fill_val, w);
         }
     }
 }

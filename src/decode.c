@@ -9,6 +9,13 @@
 #include <string.h>
 #include <stdio.h>
 
+/* 编译期性能统计开关: 1=启用每帧计时 (Release 下应保持 0 以避免
+ * clock_gettime/QueryPerformanceCounter 系统调用进入热路径). */
+#ifndef AVS2_PROFILE
+#define AVS2_PROFILE 0
+#endif
+
+#if AVS2_PROFILE
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 static double dbg_time_ms(void) {
@@ -22,7 +29,7 @@ static double dbg_time_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 #endif
-/* 2-pass 性能统计 (临时调试用) */
+/* 2-pass 性能统计 (调试用) */
 static double g_p2_recon_total = 0;
 static int g_2pass_count = 0;
 static int g_frame_types[8] = {0};
@@ -33,6 +40,14 @@ extern volatile double g_p2_wait_total;
 extern volatile double g_pick_fc_wait_total;
 extern volatile int    g_pick_fc_block_count;
 extern volatile double g_worker_idle_total;
+#define AVS2_PROFILE_DECL double _prof_t0 = 0
+#define AVS2_PROFILE_START() _prof_t0 = dbg_time_ms()
+#define AVS2_PROFILE_END_ACCUM(counter) (counter) += dbg_time_ms() - _prof_t0
+#else
+#define AVS2_PROFILE_DECL ((void)0)
+#define AVS2_PROFILE_START() ((void)0)
+#define AVS2_PROFILE_END_ACCUM(counter) ((void)0)
+#endif
 
 static int process_start_code(struct avs2_internal *c, const uint8_t *data,
                               int sz, int sc_pos, int sc_id);
@@ -314,14 +329,17 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
     }
 
     /* 统计帧类型 */
+#if AVS2_PROFILE
     if (fc->slice_type >= 0 && fc->slice_type < 8) g_frame_types[fc->slice_type]++;
+#endif
 
     /* ---- Phase 1: AEC (n_aec_deps 已由 worker 调度保证为 0) ----
      * worker 只在 n_aec_deps==0 时才取此任务, 无需在此等待.
      * col_pic 的 mvbuf/refbuf 在 col_pic 的 Phase 1 中由 store_mv_to_buf 逐行填充.
      * aec_started 在 AEC 初始化后立即设置, 允许依赖此帧的 B 帧 AEC 启动;
      * derive_skip_mv 中按行轮询 col_pic->aec_row_done 保证 mvbuf 可用. */
-    double t_p1_wait_end = dbg_time_ms();
+    AVS2_PROFILE_DECL;
+    AVS2_PROFILE_START();
 
     if (c->shutdown) return AVS2_OK;
     {
@@ -389,7 +407,7 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
         }
         fc->aec = NULL;
     }
-    g_p1_aec_total += dbg_time_ms() - t_p1_wait_end;
+    AVS2_PROFILE_END_ACCUM(g_p1_aec_total);
 
     /* 计算行级 MV 范围 (用于 Phase 2 行级 LF 依赖).
      * cu_grid 已在 AEC 中填充, 可直接扫描 MV 计算. */
@@ -459,7 +477,6 @@ static void p2_do_row(avs2_frame_ctx *fc, struct avs2_internal *c, int lcu_y,
 int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
 {
     avs2_frame *f = fc->fdec;
-    double t4, t5;
 
     if (!f) {
         return AVS2_OK;
@@ -483,7 +500,8 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
 #endif
     avs2_set_thread_scratch(scratch_y, scratch_u, scratch_v);
 
-    t4 = dbg_time_ms();
+    AVS2_PROFILE_DECL;
+    AVS2_PROFILE_START();
 
     /* inline deblock: 逐行 重建+deblock+pad, 保持 L2 cache 局部性 */
     for (int lcu_y = 0; lcu_y < h_lcu; lcu_y++) {
@@ -492,10 +510,9 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
 
     avs2_set_thread_scratch(NULL, NULL, NULL);
 
-    t5 = dbg_time_ms();
-
     /* 累计统计 */
-    g_p2_recon_total += t5 - t4;
+#if AVS2_PROFILE
+    AVS2_PROFILE_END_ACCUM(g_p2_recon_total);
     g_2pass_count++;
     if (g_2pass_count % 100 == 0) {
         FILE *dbg = fopen("dbg_stats.txt", "a");
@@ -526,6 +543,7 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
                 g_frame_types[4], g_frame_types[5], g_frame_types[3], g_frame_types[6]);
         fflush(stderr);
     }
+#endif
 
     /* 设置帧元数据 */
     f->poc = fc->pic_local.poc;
