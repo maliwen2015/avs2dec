@@ -6,6 +6,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* 编译期性能统计开关 (与 decode.c 共用). 默认 0: 不在热路径调用
+ * clock_gettime/QueryPerformanceCounter. */
+#ifndef AVS2_PROFILE
+#define AVS2_PROFILE 0
+#endif
+
+#if AVS2_PROFILE
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 static double dbg_time_ms(void) {
@@ -28,6 +35,7 @@ volatile double g_p2_wait_total = 0;
 volatile double g_pick_fc_wait_total = 0;
 volatile int    g_pick_fc_block_count = 0;
 volatile double g_worker_idle_total = 0;
+#endif /* AVS2_PROFILE */
 
 void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
                     int64_t pts, int64_t dts)
@@ -468,11 +476,15 @@ static void *worker_thread(void *arg)
 
             /* 4. 无任务, 等待 */
             {
+#if AVS2_PROFILE
                 double t_idle_start = dbg_time_ms();
+#endif
                 c->n_waiters_task++;
                 avs2_cond_wait(&c->task_cond, &c->task_lock);
                 c->n_waiters_task--;
+#if AVS2_PROFILE
                 g_worker_idle_total += dbg_time_ms() - t_idle_start;
+#endif
             }
         }
         avs2_mutex_unlock(&c->task_lock);
@@ -551,12 +563,16 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
         }
         if (!fc) {
             /* 无空闲 fc, 等待 worker 完成 */
+#if AVS2_PROFILE
             double t_block_start = dbg_time_ms();
+#endif
             c->n_waiters_done++;
             avs2_cond_wait(&c->done_cond, &c->task_lock);
             c->n_waiters_done--;
+#if AVS2_PROFILE
             g_pick_fc_wait_total += dbg_time_ms() - t_block_start;
             g_pick_fc_block_count++;
+#endif
         }
     }
     /* 标记为 reserved, 防止其他调用选中同一个 fc */

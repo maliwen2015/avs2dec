@@ -90,30 +90,6 @@ static const int tab_intra_mode_scan_type[NUM_INTRA_MODE] = {
 /* DSP 初始化标志 */
 static int g_dsp_inited = 0;
 
-/* recon 子项 profiling (pass=2): MC / intra_pred / residual(idct+recon) / load_coeff */
-volatile double g_recon_mc_total = 0;
-volatile double g_recon_intra_total = 0;
-volatile double g_recon_residual_total = 0;
-volatile double g_recon_load_coeff_total = 0;
-volatile int g_recon_cu_count = 0;
-
-#if defined(_WIN32) || defined(_WIN64)
-#include <windows.h>
-static double cu_dbg_time_ms(void) {
-    static LARGE_INTEGER freq = {0};
-    LARGE_INTEGER c;
-    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)freq.QuadPart * 1000.0;
-}
-#else
-#include <time.h>
-static double cu_dbg_time_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
-#endif
-
 /* 前向声明 */
 static void decode_cu_recursive(avs2_frame_ctx *fc, struct avs2_internal *c,
                                 avs2_aec *aec, int x, int y, int level,
@@ -1465,7 +1441,10 @@ static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
 
             /* bit_size - (i_trans_size != TU_SPLIT_NON) = bit_size - 0 = bit_size */
             avs2_get_quant_params(cu->qp, bit_size, bit_depth, &shift, &scale);
-            memset(fc->coeff_scratch_y, 0, sizeof(int16_t) * 64 * 64);
+            /* 仅清零变换块大小的区域 (blocksize^2), 而非整个 64x64 scratch.
+             * AEC 仅写入 blocksize^2 个系数 (LOT 64x64 时为 32x32=1024,
+             * IDCT 内部展开为 64x64 输出), 8x8 CU 可省 64x 带宽. */
+            memset(fc->coeff_scratch_y, 0, sizeof(int16_t) * blocksize * blocksize);
 
             cu->dct_pattern[0] = read_block_coeffs(aec, cu, &aec_desc,
                                                     fc->coeff_scratch_y,
