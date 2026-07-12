@@ -1,8 +1,8 @@
 /*
  * lf_simd.c - 去块滤波 SIMD 实现 (x86)
  *
- * 当前实现:
- *   - AVX2: 10-bit 亮度去块滤波 (垂直边 + 水平边), 一次处理 8 像素
+ * 当前实现 (SSE4.1, 从 AVX2 降级):
+ *   - SSE4.1: 10-bit 亮度去块滤波 (垂直边 + 水平边), 一次处理 8 像素
  *   - SSE4.1: 10-bit 色度去块滤波 (垂直边 + 水平边), U/V 交错处理 4 像素
  *
  * 算法参考: libudavs2 x86_256/intrinsic_deblock_256.c (8-bit AVX2)
@@ -10,10 +10,10 @@
  * 移植改动: 10-bit 像素为 uint16_t, 无需 8↔16 位扩展/打包,
  *           加载用 loadu_si128 (128-bit = 8 像素), 存储用 storeu_si128.
  *
- * 核心思路 (256-bit 并行处理 L/R 两侧):
- *   TLR0 = [TL0 (low128), TR0 (high128)]  — 同时处理左右两侧
- *   TRL0 = [TR0 (low128), TL0 (high128)]  — 交叉引用
- *   用 blendv 按 FS 值选择不同强度 (0..4) 的滤波结果
+ * 核心思路 (128-bit 分别处理 L/R 两侧):
+ *   原 AVX2 将 L/R 打包到 256-bit 同时计算, SSE4 降级为分别计算 L 侧和 R 侧.
+ *   FS (滤波强度) 对 L/R 两侧相同, 只需计算一次.
+ *   用 blendv 按 FS 值选择不同强度 (0..4) 的滤波结果.
  *
  * 对齐说明:
  *   帧数据在 8x8 网格边界处是 16 字节对齐的 (10-bit: 8 像素 × 2 字节 = 16 字节;
@@ -43,7 +43,8 @@ extern void deblock_chroma_hor(void *src_u, void *src_v, int stride,
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
-#include <immintrin.h>
+#include <tmmintrin.h>
+#include <smmintrin.h>
 
 /* ===========================================================================
  * 8x8 uint16 转置 (SSE 128-bit, 3 级 interleave)
@@ -103,7 +104,7 @@ static inline void transpose8x8_epu16(
  *   sum==3: fs = (|L1-R1|<beta)
  *   else:   fs = 0
  * =========================================================================== */
-static inline void deblock_core_luma_avx2(
+static inline void deblock_core_luma_sse4(
     __m128i TL2, __m128i TL1, __m128i TL0,
     __m128i TR0, __m128i TR1, __m128i TR2,
     int alpha, int beta, int flag0, int flag1,
@@ -116,30 +117,13 @@ static inline void deblock_core_luma_avx2(
     __m128i c_2   = _mm_set1_epi16(2);
     __m128i c_3   = _mm_set1_epi16(3);
     __m128i c_4   = _mm_set1_epi16(4);
+    __m128i c_8   = _mm_set1_epi16(8);
+    __m128i c_16  = _mm_set1_epi16(16);
     __m128i ALPHA = _mm_set1_epi16((short)alpha);
     __m128i BETA  = _mm_set1_epi16((short)beta);
 
-    __m256i c_1_256  = _mm256_set1_epi16(1);
-    __m256i c_2_256  = _mm256_set1_epi16(2);
-    __m256i c_3_256  = _mm256_set1_epi16(3);
-    __m256i c_4_256  = _mm256_set1_epi16(4);
-    __m256i c_8_256  = _mm256_set1_epi16(8);
-    __m256i c_16_256 = _mm256_set1_epi16(16);
-    __m256i BETA_256 = _mm256_set1_epi16((short)beta);
-
-    /* 合并 L/R 到 256-bit: low128=TL, high128=TR */
-    __m256i TLR0 = _mm256_inserti128_si256(_mm256_castsi128_si256(TL0), TR0, 1);
-    __m256i TLR1 = _mm256_inserti128_si256(_mm256_castsi128_si256(TL1), TR1, 1);
-    __m256i TLR2 = _mm256_inserti128_si256(_mm256_castsi128_si256(TL2), TR2, 1);
-    __m256i TRL0 = _mm256_inserti128_si256(_mm256_castsi128_si256(TR0), TL0, 1);
-    __m256i TRL1 = _mm256_inserti128_si256(_mm256_castsi128_si256(TR1), TL1, 1);
-
     __m128i T0, T1, T2, M0, M1;
-    __m128i FLT, FS, FS3, FS4, FS56;
-    __m128i FLT_X_lo;
-    __m256i T0_256, T1_256, T2_256, FLT_X;
-    __m256i TLR0w, TLR1w, TLR2w;
-    __m256i FS_256;
+    __m128i FLT, FLT_L, FLT_R, FS, FS3, FS4, FS56;
 
     /* --- 主掩码 M0 = flt_flag && (|L0-R0|>1) && (|L0-R0|<alpha) --- */
     T0 = _mm_abs_epi16(_mm_subs_epi16(TL0, TR0));
@@ -151,20 +135,23 @@ static inline void deblock_core_luma_avx2(
     M0 = _mm_set_epi32(mflag1, mflag1, mflag0, mflag0);
     M0 = _mm_and_si128(M0, _mm_and_si128(T1, T2));
 
-    /* --- 平坦度 FLT = flat_l + flat_r --- */
-    T0_256 = _mm256_abs_epi16(_mm256_subs_epi16(TLR1, TLR0));
-    FLT_X = _mm256_and_si256(_mm256_cmpgt_epi16(BETA_256, T0_256), c_2_256);
+    /* --- 平坦度: flat_l 和 flat_r 分别计算 --- */
+    /* flat_l = (|L1-L0|<beta ? 2:0) + (|L2-L0|<beta ? 1:0) */
+    T0 = _mm_abs_epi16(_mm_subs_epi16(TL1, TL0));
+    FLT_L = _mm_and_si128(_mm_cmpgt_epi16(BETA, T0), c_2);
+    T0 = _mm_abs_epi16(_mm_subs_epi16(TL2, TL0));
+    FLT_L = _mm_add_epi16(FLT_L, _mm_and_si128(_mm_cmpgt_epi16(BETA, T0), c_1));
 
-    T0_256 = _mm256_abs_epi16(_mm256_subs_epi16(TLR2, TLR0));
-    T1_256 = _mm256_and_si256(_mm256_cmpgt_epi16(BETA_256, T0_256), c_1_256);
-    FLT_X = _mm256_add_epi16(T1_256, FLT_X);
+    /* flat_r = (|R0-R1|<beta ? 2:0) + (|R0-R2|<beta ? 1:0) */
+    T0 = _mm_abs_epi16(_mm_subs_epi16(TR0, TR1));
+    FLT_R = _mm_and_si128(_mm_cmpgt_epi16(BETA, T0), c_2);
+    T0 = _mm_abs_epi16(_mm_subs_epi16(TR0, TR2));
+    FLT_R = _mm_add_epi16(FLT_R, _mm_and_si128(_mm_cmpgt_epi16(BETA, T0), c_1));
 
-    FLT_X_lo = _mm256_castsi256_si128(FLT_X);  /* flat_l */
-    FLT = _mm_add_epi16(FLT_X_lo, _mm256_extracti128_si256(FLT_X, 1));
+    FLT = _mm_add_epi16(FLT_L, FLT_R);
 
     /* --- M1 = (L1==L0) && (R1==R0) --- */
-    T0_256 = _mm256_cmpeq_epi16(TLR1, TLR0);
-    M1 = _mm_and_si128(_mm256_castsi256_si128(T0_256), _mm256_extracti128_si256(T0_256, 1));
+    M1 = _mm_and_si128(_mm_cmpeq_epi16(TL1, TL0), _mm_cmpeq_epi16(TR1, TR0));
 
     /* --- 确定 FS --- */
     T0 = _mm_subs_epi16(FLT, c_2);  /* FLT-2 (饱和) */
@@ -172,83 +159,110 @@ static inline void deblock_core_luma_avx2(
     T2 = _mm_abs_epi16(_mm_subs_epi16(TL1, TR1));
 
     FS56 = _mm_blendv_epi8(T1, T0, M1);  /* M1 ? FLT-2 : FLT-3 */
-    FS4  = _mm_blendv_epi8(c_1, c_2, _mm_cmpeq_epi16(FLT_X_lo, c_2));  /* flat_l==2 ? 2 : 1 */
-    FS3  = _mm_blendv_epi8(c_0, c_1, _mm_cmpgt_epi16(BETA, T2));       /* |L1-R1|<beta ? 1 : 0 */
+    FS4  = _mm_blendv_epi8(c_1, c_2, _mm_cmpeq_epi16(FLT_L, c_2));  /* flat_l==2 ? 2 : 1 */
+    FS3  = _mm_blendv_epi8(c_0, c_1, _mm_cmpgt_epi16(BETA, T2));    /* |L1-R1|<beta ? 1 : 0 */
 
-    FS = _mm_blendv_epi8(c_0, FS56, _mm_cmpgt_epi16(FLT, c_4));    /* FLT>4 → FS56 */
-    FS = _mm_blendv_epi8(FS, FS4, _mm_cmpeq_epi16(FLT, c_4));      /* FLT==4 → FS4 */
-    FS = _mm_blendv_epi8(FS, FS3, _mm_cmpeq_epi16(FLT, c_3));      /* FLT==3 → FS3 */
+    FS = _mm_blendv_epi8(c_0, FS56, _mm_cmpgt_epi16(FLT, c_4));    /* FLT>4 -> FS56 */
+    FS = _mm_blendv_epi8(FS, FS4, _mm_cmpeq_epi16(FLT, c_4));      /* FLT==4 -> FS4 */
+    FS = _mm_blendv_epi8(FS, FS3, _mm_cmpeq_epi16(FLT, c_3));      /* FLT==3 -> FS3 */
     FS = _mm_and_si128(FS, M0);
-    FS_256 = _mm256_inserti128_si256(_mm256_castsi128_si256(FS), FS, 1);
 
-    /* --- 滤波 --- */
-    TLR0w = TLR0;
-    TLR1w = TLR1;
-    TLR2w = TLR2;
+    /* --- 滤波: L 侧和 R 侧分别计算 --- */
+    __m128i L0w = TL0, L1w = TL1, L2w = TL2;
+    __m128i R0w = TR0, R1w = TR1, R2w = TR2;
+
+    /* sumLR = L0+R0+2, 后续每个 fs 级别左移 1 位 (2x, 4x) */
+    __m128i sumLR = _mm_add_epi16(_mm_add_epi16(TL0, TR0), c_2);
 
     /* fs==1: L0'=(3*L0+R0+2)>>2, R0'=(3*R0+L0+2)>>2 */
-    T0 = _mm_add_epi16(_mm_add_epi16(TL0, TR0), c_2);  /* L0+R0+2 */
-    T1_256 = _mm256_castsi128_si256(T0);
-    T1_256 = _mm256_inserti128_si256(T1_256, T0, 1);
-    T0_256 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_slli_epi16(TLR0, 1), T1_256), 2);
-    TLR0w = _mm256_blendv_epi8(TLR0w, T0_256, _mm256_cmpeq_epi16(FS_256, c_1_256));
+    T0 = _mm_srli_epi16(_mm_add_epi16(_mm_slli_epi16(TL0, 1), sumLR), 2);
+    L0w = _mm_blendv_epi8(L0w, T0, _mm_cmpeq_epi16(FS, c_1));
+    T0 = _mm_srli_epi16(_mm_add_epi16(_mm_slli_epi16(TR0, 1), sumLR), 2);
+    R0w = _mm_blendv_epi8(R0w, T0, _mm_cmpeq_epi16(FS, c_1));
 
-    /* fs==2: L0'=(10*L0+3*L1+3*R0+8)>>4, R0'=(10*R0+3*R1+3*L0+8)>>4 */
-    T1_256 = _mm256_slli_epi16(T1_256, 1);  /* 2*(L0+R0+2) */
-    T0_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR1, 1), _mm256_add_epi16(TLR1, TRL0));
-    T0_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR0, 3), _mm256_add_epi16(T0_256, T1_256));
-    T0_256 = _mm256_srli_epi16(_mm256_add_epi16(T0_256, c_4_256), 4);
-    TLR0w = _mm256_blendv_epi8(TLR0w, T0_256, _mm256_cmpeq_epi16(FS_256, c_2_256));
+    /* fs==2: sumLR *= 2 -> 2*(L0+R0+2) */
+    sumLR = _mm_slli_epi16(sumLR, 1);
+    /* L0'=(10*L0+3*L1+3*R0+8)>>4 = (8*L0 + (3*L1+R0) + 2*(L0+R0+2) + 4)>>4 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TL1, 1), _mm_add_epi16(TL1, TR0));  /* 3*L1+R0 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TL0, 3), _mm_add_epi16(T0, sumLR));
+    T0 = _mm_srli_epi16(_mm_add_epi16(T0, c_4), 4);
+    L0w = _mm_blendv_epi8(L0w, T0, _mm_cmpeq_epi16(FS, c_2));
+    /* R0'=(10*R0+3*R1+3*L0+8)>>4 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TR1, 1), _mm_add_epi16(TR1, TL0));  /* 3*R1+L0 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TR0, 3), _mm_add_epi16(T0, sumLR));
+    T0 = _mm_srli_epi16(_mm_add_epi16(T0, c_4), 4);
+    R0w = _mm_blendv_epi8(R0w, T0, _mm_cmpeq_epi16(FS, c_2));
 
-    /* fs==3: L0'=(6*L0+4*L1+L2+4*R0+R1+8)>>4 */
-    T1_256 = _mm256_slli_epi16(T1_256, 1);  /* 4*(L0+R0+2) */
-    T0_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR1, 2), _mm256_add_epi16(TLR2, TRL1));
-    T0_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR0, 1), _mm256_add_epi16(T0_256, T1_256));
-    T0_256 = _mm256_srli_epi16(T0_256, 4);
-    TLR0w = _mm256_blendv_epi8(TLR0w, T0_256, _mm256_cmpeq_epi16(FS_256, c_3_256));
-
-    /* fs==3: L1'=(3*L2+8*L1+4*L0+R0+8)>>4 */
-    T0_256 = _mm256_add_epi16(_mm256_add_epi16(TLR2, TRL0), _mm256_slli_epi16(TLR2, 1));
-    T0_256 = _mm256_add_epi16(T0_256, _mm256_slli_epi16(TLR1, 3));
-    T0_256 = _mm256_add_epi16(T0_256, _mm256_slli_epi16(TLR0, 2));
-    T0_256 = _mm256_srli_epi16(_mm256_add_epi16(T0_256, c_8_256), 4);
-    TLR1w = _mm256_blendv_epi8(TLR1w, T0_256, _mm256_cmpeq_epi16(FS_256, c_3_256));
+    /* fs==3: sumLR *= 2 -> 4*(L0+R0+2) */
+    sumLR = _mm_slli_epi16(sumLR, 1);
+    /* L0'=(6*L0+4*L1+L2+4*R0+R1+8)>>4 = (2*L0 + (4*L1+L2+R1) + 4*(L0+R0+2))>>4 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TL1, 2), _mm_add_epi16(TL2, TR1));  /* 4*L1+L2+R1 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TL0, 1), _mm_add_epi16(T0, sumLR));
+    T0 = _mm_srli_epi16(T0, 4);
+    L0w = _mm_blendv_epi8(L0w, T0, _mm_cmpeq_epi16(FS, c_3));
+    /* R0'=(6*R0+4*R1+R2+4*L0+L1+8)>>4 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TR1, 2), _mm_add_epi16(TR2, TL1));  /* 4*R1+R2+L1 */
+    T0 = _mm_add_epi16(_mm_slli_epi16(TR0, 1), _mm_add_epi16(T0, sumLR));
+    T0 = _mm_srli_epi16(T0, 4);
+    R0w = _mm_blendv_epi8(R0w, T0, _mm_cmpeq_epi16(FS, c_3));
+    /* L1'=(3*L2+8*L1+4*L0+R0+8)>>4 */
+    T0 = _mm_add_epi16(_mm_add_epi16(TL2, TR0), _mm_slli_epi16(TL2, 1));  /* 3*L2+R0 */
+    T0 = _mm_add_epi16(T0, _mm_slli_epi16(TL1, 3));  /* + 8*L1 */
+    T0 = _mm_add_epi16(T0, _mm_slli_epi16(TL0, 2));  /* + 4*L0 */
+    T0 = _mm_srli_epi16(_mm_add_epi16(T0, c_8), 4);
+    L1w = _mm_blendv_epi8(L1w, T0, _mm_cmpeq_epi16(FS, c_3));
+    /* R1'=(3*R2+8*R1+4*R0+L0+8)>>4 */
+    T0 = _mm_add_epi16(_mm_add_epi16(TR2, TL0), _mm_slli_epi16(TR2, 1));  /* 3*R2+L0 */
+    T0 = _mm_add_epi16(T0, _mm_slli_epi16(TR1, 3));  /* + 8*R1 */
+    T0 = _mm_add_epi16(T0, _mm_slli_epi16(TR0, 2));  /* + 4*R0 */
+    T0 = _mm_srli_epi16(_mm_add_epi16(T0, c_8), 4);
+    R1w = _mm_blendv_epi8(R1w, T0, _mm_cmpeq_epi16(FS, c_3));
 
     /* fs==4: 仅当存在 fs==4 的像素时才计算 */
     {
         __m128i FS4_mask = _mm_cmpeq_epi16(FS, c_4);
         if (_mm_extract_epi64(FS4_mask, 0) || _mm_extract_epi64(FS4_mask, 1)) {
-            __m256i TRL2 = _mm256_inserti128_si256(_mm256_castsi128_si256(TR2), TL2, 1);
-            FS_256 = _mm256_inserti128_si256(_mm256_castsi128_si256(FS4_mask), FS4_mask, 1);
-
             /* L0'=(9*L0+9*L2+8*R0+6*R2+16)>>5 */
-            T0_256 = _mm256_slli_epi16(_mm256_add_epi16(_mm256_add_epi16(TLR0, TLR2), TRL0), 3);
-            T0_256 = _mm256_add_epi16(_mm256_add_epi16(T0_256, c_16_256), _mm256_add_epi16(TLR0, TLR2));
-            T2_256 = _mm256_add_epi16(_mm256_slli_epi16(TRL2, 1), _mm256_slli_epi16(TRL2, 2));
-            T0_256 = _mm256_srli_epi16(_mm256_add_epi16(T0_256, T2_256), 5);
-            TLR0w = _mm256_blendv_epi8(TLR0w, T0_256, FS_256);
+            T0 = _mm_slli_epi16(_mm_add_epi16(_mm_add_epi16(TL0, TL2), TR0), 3);  /* 8*(L0+L2+R0) */
+            T0 = _mm_add_epi16(_mm_add_epi16(T0, c_16), _mm_add_epi16(TL0, TL2));  /* + 16 + (L0+L2) */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TR2, 1), _mm_slli_epi16(TR2, 2));    /* 6*R2 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, T2), 5);
+            L0w = _mm_blendv_epi8(L0w, T0, FS4_mask);
+            /* R0'=(9*R0+9*R2+8*L0+6*L2+16)>>5 */
+            T0 = _mm_slli_epi16(_mm_add_epi16(_mm_add_epi16(TR0, TR2), TL0), 3);  /* 8*(R0+R2+L0) */
+            T0 = _mm_add_epi16(_mm_add_epi16(T0, c_16), _mm_add_epi16(TR0, TR2));  /* + 16 + (R0+R2) */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TL2, 1), _mm_slli_epi16(TL2, 2));    /* 6*L2 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, T2), 5);
+            R0w = _mm_blendv_epi8(R0w, T0, FS4_mask);
 
             /* L1'=(7*L0+6*L2+3*R0+8)>>4 */
-            T0_256 = _mm256_slli_epi16(_mm256_add_epi16(TLR2, TRL0), 1);
-            T0_256 = _mm256_add_epi16(T0_256, _mm256_sub_epi16(_mm256_slli_epi16(TLR0, 3), TLR0));
-            T2_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR2, 2), _mm256_add_epi16(TRL0, c_8_256));
-            T0_256 = _mm256_srli_epi16(_mm256_add_epi16(T0_256, T2_256), 4);
-            TLR1w = _mm256_blendv_epi8(TLR1w, T0_256, FS_256);
+            T0 = _mm_slli_epi16(_mm_add_epi16(TL2, TR0), 1);  /* 2*(L2+R0) */
+            T0 = _mm_add_epi16(T0, _mm_sub_epi16(_mm_slli_epi16(TL0, 3), TL0));  /* + 7*L0 */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TL2, 2), _mm_add_epi16(TR0, c_8));  /* 4*L2 + R0 + 8 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, T2), 4);
+            L1w = _mm_blendv_epi8(L1w, T0, FS4_mask);
+            /* R1'=(7*R0+6*R2+3*L0+8)>>4 */
+            T0 = _mm_slli_epi16(_mm_add_epi16(TR2, TL0), 1);  /* 2*(R2+L0) */
+            T0 = _mm_add_epi16(T0, _mm_sub_epi16(_mm_slli_epi16(TR0, 3), TR0));  /* + 7*R0 */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TR2, 2), _mm_add_epi16(TL0, c_8));  /* 4*R2 + L0 + 8 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, T2), 4);
+            R1w = _mm_blendv_epi8(R1w, T0, FS4_mask);
 
             /* L2'=(4*L0+3*L2+R0+4)>>3 */
-            T0_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR2, 1), TLR2);
-            T2_256 = _mm256_add_epi16(_mm256_slli_epi16(TLR0, 2), TRL0);
-            T0_256 = _mm256_srli_epi16(_mm256_add_epi16(T0_256, _mm256_add_epi16(T2_256, c_4_256)), 3);
-            TLR2w = _mm256_blendv_epi8(TLR2w, T0_256, FS_256);
+            T0 = _mm_add_epi16(_mm_slli_epi16(TL2, 1), TL2);  /* 3*L2 */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TL0, 2), TR0);   /* 4*L0 + R0 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, _mm_add_epi16(T2, c_4)), 3);
+            L2w = _mm_blendv_epi8(L2w, T0, FS4_mask);
+            /* R2'=(4*R0+3*R2+L0+4)>>3 */
+            T0 = _mm_add_epi16(_mm_slli_epi16(TR2, 1), TR2);  /* 3*R2 */
+            T2 = _mm_add_epi16(_mm_slli_epi16(TR0, 2), TL0);   /* 4*R0 + L0 */
+            T0 = _mm_srli_epi16(_mm_add_epi16(T0, _mm_add_epi16(T2, c_4)), 3);
+            R2w = _mm_blendv_epi8(R2w, T0, FS4_mask);
         }
     }
 
-    *oTL0 = _mm256_castsi256_si128(TLR0w);
-    *oTR0 = _mm256_extracti128_si256(TLR0w, 1);
-    *oTL1 = _mm256_castsi256_si128(TLR1w);
-    *oTR1 = _mm256_extracti128_si256(TLR1w, 1);
-    *oTL2 = _mm256_castsi256_si128(TLR2w);
-    *oTR2 = _mm256_extracti128_si256(TLR2w, 1);
+    *oTL0 = L0w; *oTL1 = L1w; *oTL2 = L2w;
+    *oTR0 = R0w; *oTR1 = R1w; *oTR2 = R2w;
 }
 
 /* ===========================================================================
@@ -257,7 +271,7 @@ static inline void deblock_core_luma_avx2(
  * 跨边方向: 水平 (inc1=1), 沿边方向: 垂直 (ptr_inc=stride)
  * 加载 8 行 × 8 像素, 转置后滤波, 转置回后存储
  * =========================================================================== */
-static void deblock_luma_ver_avx2(void *src_v, int stride, int alpha,
+static void deblock_luma_ver_sse4(void *src_v, int stride, int alpha,
                                   int beta, uint8_t *flt_flag, int bit_depth)
 {
     if (bit_depth <= 8) {
@@ -295,7 +309,7 @@ static void deblock_luma_ver_avx2(void *src_v, int stride, int alpha,
         }
 
         __m128i oL0, oL1, oL2, oR0, oR1, oR2;
-        deblock_core_luma_avx2(c0, c1, c2, c3, c4, c5,
+        deblock_core_luma_sse4(c0, c1, c2, c3, c4, c5,
                                alpha, beta, flt_flag[0], flt_flag[1],
                                &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
 
@@ -355,7 +369,7 @@ static void deblock_luma_ver_avx2(void *src_v, int stride, int alpha,
     }
 
     __m128i oL0, oL1, oL2, oR0, oR1, oR2;
-    deblock_core_luma_avx2(c0, c1, c2, c3, c4, c5,
+    deblock_core_luma_sse4(c0, c1, c2, c3, c4, c5,
                            alpha, beta, flt_flag[0], flt_flag[1],
                            &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
 
@@ -384,7 +398,7 @@ static void deblock_luma_ver_avx2(void *src_v, int stride, int alpha,
  * 跨边方向: 垂直 (inc1=stride), 沿边方向: 水平 (ptr_inc=1)
  * 每行 8 像素连续, 无需转置
  * =========================================================================== */
-static void deblock_luma_hor_avx2(void *src_v, int stride, int alpha,
+static void deblock_luma_hor_sse4(void *src_v, int stride, int alpha,
                                   int beta, uint8_t *flt_flag, int bit_depth)
 {
     if (bit_depth <= 8) {
@@ -417,7 +431,7 @@ static void deblock_luma_hor_avx2(void *src_v, int stride, int alpha,
         __m128i R2 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(src + s2)));
 
         __m128i oL0, oL1, oL2, oR0, oR1, oR2;
-        deblock_core_luma_avx2(L2, L1, L0, R0, R1, R2,
+        deblock_core_luma_sse4(L2, L1, L0, R0, R1, R2,
                                alpha, beta, flt_flag[0], flt_flag[1],
                                &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
 
@@ -463,7 +477,7 @@ static void deblock_luma_hor_avx2(void *src_v, int stride, int alpha,
     __m128i R2 = _mm_loadu_si128((const __m128i*)(src + stride2));
 
     __m128i oL0, oL1, oL2, oR0, oR1, oR2;
-    deblock_core_luma_avx2(L2, L1, L0, R0, R1, R2,
+    deblock_core_luma_sse4(L2, L1, L0, R0, R1, R2,
                            alpha, beta, flt_flag[0], flt_flag[1],
                            &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
 
@@ -482,7 +496,7 @@ static void deblock_luma_hor_avx2(void *src_v, int stride, int alpha,
  * 色度滤波强度比亮度减 1: 无 fs=4, FLT==3 时 fs=0
  * 参考: deblock_edge_ver_c_sse128_10bit
  * =========================================================================== */
-static void deblock_chroma_ver_avx2(void *src_u_v, void *src_v_v,
+static void deblock_chroma_ver_sse4(void *src_u_v, void *src_v_v,
                                     int stride, int alpha, int beta,
                                     uint8_t *flt_flag, int bit_depth)
 {
@@ -599,8 +613,10 @@ static void deblock_chroma_ver_avx2(void *src_u_v, void *src_v_v,
 
     fs = _mm_and_si128(fs, m0);
 
-    /* 全部像素无需滤波, 数据未修改, 跳过滤波计算和写回 */
-    if (_mm_movemask_epi8(fs) == 0) return;
+    /* 全部像素无需滤波, 数据未修改, 跳过滤波计算和写回.
+     * 注意: 不能用 _mm_movemask_epi8(fs)==0, 因为 fs 值 1/2/3 的 MSB 为 0,
+     * 会误判为全零. 使用 _mm_testz_si128 正确检测全零. */
+    if (_mm_testz_si128(fs, fs)) return;
 
 #undef _mm_subabs_epu16
 
@@ -721,7 +737,7 @@ static void deblock_chroma_ver_avx2(void *src_u_v, void *src_v_v,
  * 色度滤波强度比亮度减 1: 无 fs=4, FLT==3 时 fs=0
  * 参考: deblock_edge_hor_c_sse128_10bit
  * =========================================================================== */
-static void deblock_chroma_hor_avx2(void *src_u_v, void *src_v_v,
+static void deblock_chroma_hor_sse4(void *src_u_v, void *src_v_v,
                                     int stride, int alpha, int beta,
                                     uint8_t *flt_flag, int bit_depth)
 {
@@ -824,7 +840,7 @@ static void deblock_chroma_hor_avx2(void *src_u_v, void *src_v_v,
     fs = _mm_and_si128(fs, m0);
 
     /* 全部像素无需滤波, 数据未修改, 跳过滤波计算和写回 */
-    if (_mm_movemask_epi8(fs) == 0) return;
+    if (_mm_testz_si128(fs, fs)) return;
 
 #undef _mm_subabs_epu16
 
@@ -906,21 +922,377 @@ static void deblock_chroma_hor_avx2(void *src_u_v, void *src_v_v,
 }
 
 /* ===========================================================================
+ * 验证模式: 对比 SIMD 与 C 参考实现的输出差异
+ * =========================================================================== */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static int g_lf_verify = -1;  /* -1=未初始化, 0=关闭, 1=开启 */
+
+static int lf_verify_enabled(void)
+{
+    if (g_lf_verify < 0) {
+        const char *env = getenv("AVS2_LF_VERIFY");
+        g_lf_verify = (env && atoi(env) > 0) ? 1 : 0;
+    }
+    return g_lf_verify;
+}
+
+/* 亮度垂直边验证包装 */
+static void deblock_luma_ver_verify(void *src, int stride, int alpha, int beta,
+                                    uint8_t *flt_flag, int bit_depth)
+{
+    if (!lf_verify_enabled()) {
+        deblock_luma_ver_sse4(src, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    /* 保存原始数据: 8 行 × 8 像素 (从 src-3 开始) */
+    int bps = (bit_depth > 8) ? 2 : 1;
+    int row_bytes = 8 * bps;
+    uint8_t backup[8 * 64];  /* 足够大 */
+    uint8_t simd_result[8 * 64];
+    uint8_t c_result[8 * 64];
+
+    for (int i = 0; i < 8; i++) {
+        memcpy(backup + i * row_bytes,
+               (uint8_t*)src - 3 * bps + i * stride * bps, row_bytes);
+    }
+
+    /* 运行 SIMD */
+    deblock_luma_ver_sse4(src, stride, alpha, beta, flt_flag, bit_depth);
+
+    /* 保存 SIMD 结果 */
+    for (int i = 0; i < 8; i++) {
+        memcpy(simd_result + i * row_bytes,
+               (uint8_t*)src - 3 * bps + i * stride * bps, row_bytes);
+    }
+
+    /* 恢复原始数据 */
+    for (int i = 0; i < 8; i++) {
+        memcpy((uint8_t*)src - 3 * bps + i * stride * bps,
+               backup + i * row_bytes, row_bytes);
+    }
+
+    /* 运行 C 参考 */
+    deblock_luma_ver(src, stride, alpha, beta, flt_flag, bit_depth);
+
+    /* 保存 C 结果 */
+    for (int i = 0; i < 8; i++) {
+        memcpy(c_result + i * row_bytes,
+               (uint8_t*)src - 3 * bps + i * stride * bps, row_bytes);
+    }
+
+    /* 比较 (仅 C 修改的 6 像素: 位置 -3..+2) */
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 6; j++) {
+            int off = (i * 8 + j) * bps;
+            if (memcmp(simd_result + off, c_result + off, bps) != 0) {
+                int pos = j - 3;  /* 相对边界的位置 */
+                if (bps == 2) {
+                    uint16_t sv = *(uint16_t*)(simd_result + off);
+                    uint16_t cv = *(uint16_t*)(c_result + off);
+                    fprintf(stderr, "LF_VERIFY LUMA_VER diff: row=%d pos=%d "
+                            "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                            i, pos, sv, cv, alpha, beta,
+                            flt_flag[0], flt_flag[1]);
+                } else {
+                    fprintf(stderr, "LF_VERIFY LUMA_VER diff: row=%d pos=%d "
+                            "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                            i, pos, simd_result[off], c_result[off],
+                            alpha, beta, flt_flag[0], flt_flag[1]);
+                }
+                /* 恢复为 SIMD 结果 */
+                goto restore_simd;
+            }
+        }
+    }
+restore_simd:
+    /* 恢复为 SIMD 结果 */
+    for (int i = 0; i < 8; i++) {
+        memcpy((uint8_t*)src - 3 * bps + i * stride * bps,
+               simd_result + i * row_bytes, row_bytes);
+    }
+}
+
+/* 亮度水平边验证包装 */
+static void deblock_luma_hor_verify(void *src, int stride, int alpha, int beta,
+                                    uint8_t *flt_flag, int bit_depth)
+{
+    if (!lf_verify_enabled()) {
+        deblock_luma_hor_sse4(src, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    int bps = (bit_depth > 8) ? 2 : 1;
+    int row_bytes = 8 * bps;
+    uint8_t backup[6 * 64];
+    uint8_t simd_result[6 * 64];
+    uint8_t c_result[6 * 64];
+    int offsets[6] = { -3, -2, -1, 0, 1, 2 };  /* L2..R2 相对 src 的行偏移 */
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(backup + i * row_bytes,
+               (uint8_t*)src + offsets[i] * stride * bps, row_bytes);
+    }
+
+    deblock_luma_hor_sse4(src, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(simd_result + i * row_bytes,
+               (uint8_t*)src + offsets[i] * stride * bps, row_bytes);
+    }
+
+    for (int i = 0; i < 6; i++) {
+        memcpy((uint8_t*)src + offsets[i] * stride * bps,
+               backup + i * row_bytes, row_bytes);
+    }
+
+    deblock_luma_hor(src, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(c_result + i * row_bytes,
+               (uint8_t*)src + offsets[i] * stride * bps, row_bytes);
+    }
+
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 8; j++) {
+            int off = (i * 8 + j) * bps;
+            if (memcmp(simd_result + off, c_result + off, bps) != 0) {
+                if (bps == 2) {
+                    uint16_t sv = *(uint16_t*)(simd_result + off);
+                    uint16_t cv = *(uint16_t*)(c_result + off);
+                    fprintf(stderr, "LF_VERIFY LUMA_HOR diff: row_offset=%d pix=%d "
+                            "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                            offsets[i], j, sv, cv, alpha, beta,
+                            flt_flag[0], flt_flag[1]);
+                } else {
+                    fprintf(stderr, "LF_VERIFY LUMA_HOR diff: row_offset=%d pix=%d "
+                            "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                            offsets[i], j, simd_result[off], c_result[off],
+                            alpha, beta, flt_flag[0], flt_flag[1]);
+                }
+                goto restore_simd_hor;
+            }
+        }
+    }
+restore_simd_hor:
+    for (int i = 0; i < 6; i++) {
+        memcpy((uint8_t*)src + offsets[i] * stride * bps,
+               simd_result + i * row_bytes, row_bytes);
+    }
+}
+
+/* 色度垂直边验证包装 */
+static void deblock_chroma_ver_verify(void *src_u, void *src_v, int stride,
+                                      int alpha, int beta, uint8_t *flt_flag,
+                                      int bit_depth)
+{
+    if (!lf_verify_enabled()) {
+        deblock_chroma_ver_sse4(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    int bps = (bit_depth > 8) ? 2 : 1;
+    int row_bytes = 8 * bps;
+    uint8_t backup_u[4 * 64], backup_v[4 * 64];
+    uint8_t simd_u[4 * 64], simd_v[4 * 64];
+    uint8_t c_u[4 * 64], c_v[4 * 64];
+
+    for (int i = 0; i < 4; i++) {
+        memcpy(backup_u + i * row_bytes,
+               (uint8_t*)src_u - 4 * bps + i * stride * bps, row_bytes);
+        memcpy(backup_v + i * row_bytes,
+               (uint8_t*)src_v - 4 * bps + i * stride * bps, row_bytes);
+    }
+
+    deblock_chroma_ver_sse4(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 4; i++) {
+        memcpy(simd_u + i * row_bytes,
+               (uint8_t*)src_u - 4 * bps + i * stride * bps, row_bytes);
+        memcpy(simd_v + i * row_bytes,
+               (uint8_t*)src_v - 4 * bps + i * stride * bps, row_bytes);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        memcpy((uint8_t*)src_u - 4 * bps + i * stride * bps,
+               backup_u + i * row_bytes, row_bytes);
+        memcpy((uint8_t*)src_v - 4 * bps + i * stride * bps,
+               backup_v + i * row_bytes, row_bytes);
+    }
+
+    deblock_chroma_ver(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 4; i++) {
+        memcpy(c_u + i * row_bytes,
+               (uint8_t*)src_u - 4 * bps + i * stride * bps, row_bytes);
+        memcpy(c_v + i * row_bytes,
+               (uint8_t*)src_v - 4 * bps + i * stride * bps, row_bytes);
+    }
+
+    /* 比较 U 和 V (C 修改的 6 像素: 位置 -3..+2) */
+    static int s_cv_diff_count = 0;
+    for (int plane = 0; plane < 2; plane++) {
+        uint8_t *sr = (plane == 0) ? simd_u : simd_v;
+        uint8_t *cr = (plane == 0) ? c_u : c_v;
+        uint8_t *orig = (plane == 0) ? backup_u : backup_v;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 6; j++) {
+                int off = (i * 8 + j) * bps;
+                if (memcmp(sr + off, cr + off, bps) != 0) {
+                    int pos = j - 4;  /* 相对边界的位置 */
+                    if (bps == 2 && s_cv_diff_count < 5) {
+                        s_cv_diff_count++;
+                        uint16_t sv = *(uint16_t*)(sr + off);
+                        uint16_t cv = *(uint16_t*)(cr + off);
+                        /* 打印输入像素: L2,L1,L0,R0,R1,R2 = 位置 -3..+2 */
+                        uint16_t L2 = *(uint16_t*)(orig + (i * 8 + 1) * bps);
+                        uint16_t L1 = *(uint16_t*)(orig + (i * 8 + 2) * bps);
+                        uint16_t L0 = *(uint16_t*)(orig + (i * 8 + 3) * bps);
+                        uint16_t R0 = *(uint16_t*)(orig + (i * 8 + 4) * bps);
+                        uint16_t R1 = *(uint16_t*)(orig + (i * 8 + 5) * bps);
+                        uint16_t R2 = *(uint16_t*)(orig + (i * 8 + 6) * bps);
+                        /* 手动计算 FS */
+                        int fl = 0, fr = 0, fs_manual;
+                        fl = (abs(L1 - L0) < beta) ? 2 : 0;
+                        fl += (abs(L2 - L0) < beta) ? 1 : 0;
+                        fr = (abs(R0 - R1) < beta) ? 2 : 0;
+                        fr += (abs(R0 - R2) < beta) ? 1 : 0;
+                        int flt = fl + fr;
+                        int m1 = (R1 == R0) && (L0 == L1);
+                        switch (flt) {
+                            case 6: fs_manual = 3 + m1; break;
+                            case 5: fs_manual = 2 + m1; break;
+                            case 4: fs_manual = 1 + (fl == 2); break;
+                            case 3: fs_manual = (abs(L1 - R1) < beta); break;
+                            default: fs_manual = 0; break;
+                        }
+                        fs_manual -= (fs_manual > 0);
+                        fprintf(stderr, "LF_VERIFY CHROMA_VER diff: plane=%c row=%d pos=%d "
+                                "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d] "
+                                "L2=%d L1=%d L0=%d R0=%d R1=%d R2=%d "
+                                "flt=%d fl=%d fr=%d m1=%d fs=%d\n",
+                                plane ? 'V' : 'U', i, pos, sv, cv, alpha, beta,
+                                flt_flag[0], flt_flag[1],
+                                L2, L1, L0, R0, R1, R2,
+                                flt, fl, fr, m1, fs_manual);
+                    }
+                    goto restore_simd_cv;
+                }
+            }
+        }
+    }
+restore_simd_cv:
+    for (int i = 0; i < 4; i++) {
+        memcpy((uint8_t*)src_u - 4 * bps + i * stride * bps,
+               simd_u + i * row_bytes, row_bytes);
+        memcpy((uint8_t*)src_v - 4 * bps + i * stride * bps,
+               simd_v + i * row_bytes, row_bytes);
+    }
+}
+
+/* 色度水平边验证包装 */
+static void deblock_chroma_hor_verify(void *src_u, void *src_v, int stride,
+                                      int alpha, int beta, uint8_t *flt_flag,
+                                      int bit_depth)
+{
+    if (!lf_verify_enabled()) {
+        deblock_chroma_hor_sse4(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    int bps = (bit_depth > 8) ? 2 : 1;
+    int npx = 4;  /* 色度每行 4 像素 */
+    int row_bytes = npx * bps;
+    uint8_t backup_u[6 * 32], backup_v[6 * 32];
+    uint8_t simd_u[6 * 32], simd_v[6 * 32];
+    uint8_t c_u[6 * 32], c_v[6 * 32];
+    int offsets[6] = { -3, -2, -1, 0, 1, 2 };
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(backup_u + i * row_bytes,
+               (uint8_t*)src_u + offsets[i] * stride * bps, row_bytes);
+        memcpy(backup_v + i * row_bytes,
+               (uint8_t*)src_v + offsets[i] * stride * bps, row_bytes);
+    }
+
+    deblock_chroma_hor_sse4(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(simd_u + i * row_bytes,
+               (uint8_t*)src_u + offsets[i] * stride * bps, row_bytes);
+        memcpy(simd_v + i * row_bytes,
+               (uint8_t*)src_v + offsets[i] * stride * bps, row_bytes);
+    }
+
+    for (int i = 0; i < 6; i++) {
+        memcpy((uint8_t*)src_u + offsets[i] * stride * bps,
+               backup_u + i * row_bytes, row_bytes);
+        memcpy((uint8_t*)src_v + offsets[i] * stride * bps,
+               backup_v + i * row_bytes, row_bytes);
+    }
+
+    deblock_chroma_hor(src_u, src_v, stride, alpha, beta, flt_flag, bit_depth);
+
+    for (int i = 0; i < 6; i++) {
+        memcpy(c_u + i * row_bytes,
+               (uint8_t*)src_u + offsets[i] * stride * bps, row_bytes);
+        memcpy(c_v + i * row_bytes,
+               (uint8_t*)src_v + offsets[i] * stride * bps, row_bytes);
+    }
+
+    for (int plane = 0; plane < 2; plane++) {
+        uint8_t *sr = (plane == 0) ? simd_u : simd_v;
+        uint8_t *cr = (plane == 0) ? c_u : c_v;
+        for (int i = 0; i < 6; i++) {
+            for (int j = 0; j < npx; j++) {
+                int off = (i * npx + j) * bps;
+                if (memcmp(sr + off, cr + off, bps) != 0) {
+                    if (bps == 2) {
+                        uint16_t sv = *(uint16_t*)(sr + off);
+                        uint16_t cv = *(uint16_t*)(cr + off);
+                        fprintf(stderr, "LF_VERIFY CHROMA_HOR diff: plane=%c row_off=%d pix=%d "
+                                "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                                plane ? 'V' : 'U', offsets[i], j, sv, cv, alpha, beta,
+                                flt_flag[0], flt_flag[1]);
+                    } else {
+                        fprintf(stderr, "LF_VERIFY CHROMA_HOR diff: plane=%c row_off=%d pix=%d "
+                                "simd=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                                plane ? 'V' : 'U', offsets[i], j, sr[off], cr[off],
+                                alpha, beta, flt_flag[0], flt_flag[1]);
+                    }
+                    goto restore_simd_ch;
+                }
+            }
+        }
+    }
+restore_simd_ch:
+    for (int i = 0; i < 6; i++) {
+        memcpy((uint8_t*)src_u + offsets[i] * stride * bps,
+               simd_u + i * row_bytes, row_bytes);
+        memcpy((uint8_t*)src_v + offsets[i] * stride * bps,
+               simd_v + i * row_bytes, row_bytes);
+    }
+}
+
+/* ===========================================================================
  * 注册函数
  * =========================================================================== */
 
-/* SSE4.1: 暂用 C 回退 */
-void avs2_lf_init_sse41(const avs2_cpu_flags *flags) { (void)flags; }
-
-/* AVX2: 注册 10-bit 亮度+色度去块滤波 */
-void avs2_lf_init_avx2(const avs2_cpu_flags *flags)
+/* SSE4.1: 注册亮度+色度去块滤波 */
+void avs2_lf_init_sse41(const avs2_cpu_flags *flags)
 {
     (void)flags;
-    avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_avx2;
-    avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_avx2;
-    avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_avx2;
-    avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_avx2;
+    avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_verify;
+    avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_verify;
+    avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_verify;
+    avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_verify;
 }
+
+/* AVX2: 已降级为 SSE4, 无额外注册 */
+void avs2_lf_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 
 /* AVX512 预留 */
 void avs2_lf_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }

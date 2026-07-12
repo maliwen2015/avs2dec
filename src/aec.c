@@ -310,18 +310,24 @@ int aec_bits_read(avs2_aec *p_aec)
  * ===========================================================================
  */
 
-/* AEC 归一化: 当处于 R 域或区间耗尽时, 用 clz 批量读取比特替代逐比特循环.
- * 提取为内联函数, 供 biari_decode_symbol / _final / _continue0 / _continu0_ext 共用.
+/* AEC 归一化快速检查: 返回 1 表示需要归一化.
+ * 内联到各 biari_decode_* 调用方, 避免常见路径 (无需归一化) 的函数调用开销.
+ *   需要归一化: 处于 R 域 (b_val_domain!=0) 或 LG 域区间耗尽
+ *               (i_s1==AEC_VALUE_BOUND && b_val_bound) */
+static inline int aec_renormalize_needed(const avs2_aec *p_aec)
+{
+    return p_aec->b_val_domain != 0 ||
+           (p_aec->i_s1 == AEC_VALUE_BOUND && p_aec->b_val_bound != 0);
+}
+
+/* AEC 归一化慢速路径: 实际执行归一化工作.
+ * 调用方应先用 aec_renormalize_needed() 做快速检查, 仅在需要时调用本函数.
+ * 用 clz 批量读取比特替代逐比特循环.
  * \param p_aec       AEC 状态
  * \param pi_value_s  指向 value_s (可能是局部或 p_aec->i_value_s)
  * \return 0=成功, 1=错误 */
-static inline int aec_renormalize(avs2_aec *p_aec, uint32_t *pi_value_s)
+static inline int aec_renormalize_slow(avs2_aec *p_aec, uint32_t *pi_value_s)
 {
-    if (likely(!(p_aec->b_val_domain != 0 ||
-                 (p_aec->i_s1 == AEC_VALUE_BOUND && p_aec->b_val_bound != 0)))) {
-        return 0;
-    }
-
     *pi_value_s = 0;
     p_aec->i_s1 = 0;
 
@@ -350,19 +356,26 @@ static inline int aec_renormalize(avs2_aec *p_aec, uint32_t *pi_value_s)
     return 0;
 }
 
-/* 带上下文的双域算术解码 */
+/* 带上下文的双域算术解码.
+ * 优化: (A) MPS 快速路径 + 显式位移替代位域访问; (C) 内联归一化检查.
+ * 位域映射: lg_pmps = v >> 5 (字段 lg_pmps(11位, 起始位3) >> LG_PMPS_SHIFTNO=2),
+ *           mps = (v >> 2) & 1. 显式位移避免位域实现的编译器依赖开销. */
 static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
 {
-    uint32_t lg_pmps = ctx->b.lg_pmps >> LG_PMPS_SHIFTNO;
-    uint32_t t2;
-    uint32_t s2;
-    uint32_t s_flag;
+    uint32_t v = ctx->v;
+    uint32_t lg_pmps = v >> 5;            /* ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
+    int bit = (int)((v >> 2) & 1);        /* ctx->b.mps */
     uint32_t i_value_s = p_aec->i_value_s;
-    int bit = ctx->b.mps;
+    uint32_t s_flag;
+    uint32_t s2;
+    uint32_t t2;
     int is_LPS;
 
-    if (unlikely(aec_renormalize(p_aec, &i_value_s))) {
-        return 0;
+    /* 内联归一化快速检查 (方案 C): 常见路径无需归一化, 跳过函数调用 */
+    if (unlikely(aec_renormalize_needed(p_aec))) {
+        if (unlikely(aec_renormalize_slow(p_aec, &i_value_s))) {
+            return 0;
+        }
     }
 
     if (unlikely(i_value_s > AEC_VALUE_BOUND)) {
@@ -378,7 +391,16 @@ static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
 
     p_aec->b_val_domain = is_LPS;
 
-    if (unlikely(is_LPS)) {     /* LPS */
+    if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A): 80%+ 的 bin 走此路径 */
+        p_aec->i_s1 = s2;
+        p_aec->i_t1 = t2;
+        p_aec->i_value_s = i_value_s;
+        update_ctx_mps(ctx, p_aec->tab_ctx_mps);
+        return bit;
+    }
+
+    /* LPS 慢速路径 */
+    {
         uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
         int n_bits;
         bit = !bit;
@@ -404,14 +426,9 @@ static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
 
         p_aec->i_s1 = 0;
         p_aec->i_t1 = t_rlps & 0xff;
+        p_aec->i_value_s = i_value_s;
         update_ctx_lps(ctx, p_aec->tab_ctx_lps);
-    } else {        /* MPS */
-        p_aec->i_s1 = s2;
-        p_aec->i_t1 = t2;
-        update_ctx_mps(ctx, p_aec->tab_ctx_mps);
     }
-
-    p_aec->i_value_s = i_value_s;
 
     return bit;
 }
@@ -457,7 +474,8 @@ static inline int biari_decode_symbol_eq_prob(avs2_aec *p_aec)
     }
 }
 
-/* 终止符号解码 (固定 lg_pmps=1) */
+/* 终止符号解码 (固定 lg_pmps=1).
+ * 优化: (C) 内联归一化检查. */
 static inline int biari_decode_final(avs2_aec *p_aec)
 {
     const uint32_t lg_pmps = 1;
@@ -466,8 +484,11 @@ static inline int biari_decode_final(avs2_aec *p_aec)
     uint32_t s_flag;
     int is_LPS;
 
-    if (unlikely(aec_renormalize(p_aec, &p_aec->i_value_s))) {
-        return 0;
+    /* 内联归一化快速检查 (方案 C) */
+    if (unlikely(aec_renormalize_needed(p_aec))) {
+        if (unlikely(aec_renormalize_slow(p_aec, &p_aec->i_value_s))) {
+            return 0;
+        }
     }
 
     s_flag = p_aec->i_t1 < lg_pmps;
@@ -507,7 +528,8 @@ static inline int biari_decode_final(avs2_aec *p_aec)
     return is_LPS;
 }
 
-/* 使用同一上下文连续解码，直到得到 0 或达到 max_num */
+/* 使用同一上下文连续解码，直到得到 0 或达到 max_num.
+ * 优化: (A) MPS 快速路径 + 显式位移; (C) 内联归一化检查. */
 static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, int max_num)
 {
     uint32_t i_value_s = p_aec->i_value_s;
@@ -515,16 +537,20 @@ static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, i
     int i;
 
     for (i = 0; i < max_num && !bit; i++) {
-        uint32_t lg_pmps = ctx->b.lg_pmps >> LG_PMPS_SHIFTNO;
+        uint32_t v = ctx->v;
+        uint32_t lg_pmps = v >> 5;          /* ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
         uint32_t t2;
         uint32_t s2;
         uint32_t s_flag;
         int is_LPS;
 
-        bit = ctx->b.mps;
+        bit = (int)((v >> 2) & 1);          /* ctx->b.mps */
 
-        if (unlikely(aec_renormalize(p_aec, &i_value_s))) {
-            return 0;
+        /* 内联归一化快速检查 (方案 C) */
+        if (unlikely(aec_renormalize_needed(p_aec))) {
+            if (unlikely(aec_renormalize_slow(p_aec, &i_value_s))) {
+                return 0;
+            }
         }
 
         s_flag = p_aec->i_t1 < lg_pmps;
@@ -539,7 +565,11 @@ static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, i
         is_LPS = (s2 > i_value_s || (s2 == i_value_s && p_aec->i_value_t >= t2)) && p_aec->b_val_bound == 0;
         p_aec->b_val_domain = is_LPS;
 
-        if (unlikely(is_LPS)) {     /* LPS */
+        if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A) */
+            p_aec->i_s1 = s2;
+            p_aec->i_t1 = t2;
+            update_ctx_mps(ctx, p_aec->tab_ctx_mps);
+        } else {     /* LPS */
             uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
             int n_bits;
             bit = !bit;
@@ -566,10 +596,6 @@ static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, i
             p_aec->i_s1 = 0;
             p_aec->i_t1 = t_rlps & 0xff;
             update_ctx_lps(ctx, p_aec->tab_ctx_lps);
-        } else {        /* MPS */
-            p_aec->i_s1 = s2;
-            p_aec->i_t1 = t2;
-            update_ctx_mps(ctx, p_aec->tab_ctx_mps);
         }
     }
 
@@ -577,7 +603,8 @@ static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, i
     return i - bit;
 }
 
-/* 连续解码，上下文按 ctx_add 递增 (最多 max_ctx_inc) */
+/* 连续解码，上下文按 ctx_add 递增 (最多 max_ctx_inc).
+ * 优化: (A) MPS 快速路径 + 显式位移; (C) 内联归一化检查. */
 static inline int biari_decode_symbol_continu0_ext(avs2_aec *p_aec, aec_ctx *ctx, int max_ctx_inc, int max_num)
 {
     int bit = 0;
@@ -586,16 +613,20 @@ static inline int biari_decode_symbol_continu0_ext(avs2_aec *p_aec, aec_ctx *ctx
     for (i = 0; i < max_num && !bit; i++) {
         int ctx_add = DAVS2_MIN(i, max_ctx_inc);
         aec_ctx *p_ctx = ctx + ctx_add;
-        uint32_t lg_pmps = p_ctx->b.lg_pmps >> LG_PMPS_SHIFTNO;
+        uint32_t v = p_ctx->v;
+        uint32_t lg_pmps = v >> 5;          /* p_ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
         uint32_t t2;
         uint32_t s2;
         int is_LPS;
         int s_flag;
 
-        bit = p_ctx->b.mps;
+        bit = (int)((v >> 2) & 1);          /* p_ctx->b.mps */
 
-        if (unlikely(aec_renormalize(p_aec, &p_aec->i_value_s))) {
-            return 0;
+        /* 内联归一化快速检查 (方案 C) */
+        if (unlikely(aec_renormalize_needed(p_aec))) {
+            if (unlikely(aec_renormalize_slow(p_aec, &p_aec->i_value_s))) {
+                return 0;
+            }
         }
 
         s_flag = p_aec->i_t1 < lg_pmps;
@@ -610,7 +641,11 @@ static inline int biari_decode_symbol_continu0_ext(avs2_aec *p_aec, aec_ctx *ctx
         is_LPS = (s2 > p_aec->i_value_s || (s2 == p_aec->i_value_s && p_aec->i_value_t >= t2)) && p_aec->b_val_bound == 0;
         p_aec->b_val_domain = is_LPS;
 
-        if (unlikely(is_LPS)) {     /* LPS */
+        if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A) */
+            p_aec->i_s1 = s2;
+            p_aec->i_t1 = t2;
+            update_ctx_mps(p_ctx, p_aec->tab_ctx_mps);
+        } else {     /* LPS */
             uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
             int n_bits;
             bit = !bit;
@@ -637,10 +672,6 @@ static inline int biari_decode_symbol_continu0_ext(avs2_aec *p_aec, aec_ctx *ctx
             p_aec->i_s1 = 0;
             p_aec->i_t1 = t_rlps & 0xff;
             update_ctx_lps(p_ctx, p_aec->tab_ctx_lps);
-        } else {        /* MPS */
-            p_aec->i_s1 = s2;
-            p_aec->i_t1 = t2;
-            update_ctx_mps(p_ctx, p_aec->tab_ctx_mps);
         }
     }
 

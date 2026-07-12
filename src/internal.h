@@ -15,6 +15,9 @@
 #define AVS2_DEC_BLOCK_SIZE 8  /* min CU in pixels */
 #define AVS2_LCU_MAX 64
 
+/* 最大 LCU 行数, 覆盖 8K (4320/32=135) 并留余量 */
+#define AVS2_MAX_H_LCU 256
+
 /* 帧边界扩展 padding (像素数)
  * 对应 davs2 AVS2_PAD: 亮度 64, 色度 32 (420) */
 #define AVS2_PAD_LUMA   64
@@ -134,16 +137,27 @@ typedef struct avs2_frame {
     /* 行级 LF 完成跟踪 (2-pass 帧并行行级依赖).
      * lf_row_done[i]=1 当 LCU 行 i 的 LF+padding 完成.
      * 原子操作: 依赖此帧的后续帧在 Phase 2 中按行轮询, 无锁读取.
-     * 在 avs2_frame_alloc 中分配, avs2_frame_free 中释放.
      * Phase 2 开始时重置 (此时无其他线程读取此帧的 lf_row_done). */
-    volatile int *lf_row_done;       /* [h_lcu] */
+    volatile int  lf_row_done[AVS2_MAX_H_LCU]; /* [h_lcu] */
     volatile int  lf_row_done_count; /* 已完成 LF 的行数 */
 
     /* 行级 AEC 完成跟踪 (2-pass 帧并行 P1 依赖优化).
      * aec_row_done[i]=1 当 LCU 行 i 的 AEC 解码 (含 store_mv_to_buf) 完成.
      * 原子操作: 依赖此帧 mvbuf 的后续帧在 derive_skip_mv 中按行轮询.
      * Phase 1 开始时重置为 0, 每行 AEC 完成后原子存储. */
-    volatile int *aec_row_done;      /* [h_lcu] */
+    volatile int  aec_row_done[AVS2_MAX_H_LCU]; /* [h_lcu] */
+
+    /* 帧缓冲池化: 记录已分配缓冲区的尺寸, 用于复用判断.
+     * alloc_*==0 表示尚未分配. 分辨率变化时重新分配. */
+    int alloc_width;       /* 已分配的图像宽度 */
+    int alloc_height;      /* 已分配的图像高度 */
+    int alloc_bit_depth;   /* 已分配的位深 */
+    int alloc_chroma;      /* 已分配的色度格式 */
+
+    /* 辅助缓冲区: 将 refbuf/deblock_flags/intra_border/ipredmode_base
+     * 合并为单次分配, 减少内存碎片和 alloc/free 次数.
+     * 各子缓冲区按 32 字节对齐切分. */
+    uint8_t *aux_buf;
 } avs2_frame;
 
 /* Frame decoding context (one per concurrent frame). */
@@ -185,10 +199,11 @@ typedef struct avs2_frame_ctx {
     /* coefficient scratch buffers (reused per-CU, NOT stored in cu_grid).
      * 大小覆盖最大 TU: 亮度 64x64, 色度 32x32.
      * 帧级并行模式: 直接使用 coeff_scratch_y/u/v.
-     * 行级并行模式: 使用 cur_lcu_coeff_y/u/v 指向 per-LCU 缓冲区. */
-    int16_t *coeff_scratch_y;  /* [64 * 64] */
-    int16_t *coeff_scratch_u;  /* [32 * 32] */
-    int16_t *coeff_scratch_v;  /* [32 * 32] */
+     * 行级并行模式: 使用 cur_lcu_coeff_y/u/v 指向 per-LCU 缓冲区.
+     * 32 字节对齐: SIMD 量化/变换操作 (AVX2) 要求. */
+    AVS2_ALIGNED_32(int16_t coeff_scratch_y[64 * 64]);  /* 亮度系数 scratch */
+    AVS2_ALIGNED_32(int16_t coeff_scratch_u[32 * 32]);  /* U 色度系数 scratch */
+    AVS2_ALIGNED_32(int16_t coeff_scratch_v[32 * 32]);  /* V 色度系数 scratch */
     /* 当前 LCU 的系数基址 (avs2_decode_lcu 中设置):
      * 帧级模式 = coeff_scratch_y/u/v; 行级模式 = per-LCU 缓冲区对应位置 */
     int16_t *cur_lcu_coeff_y;
@@ -211,6 +226,9 @@ typedef struct avs2_frame_ctx {
      * task_state: 0=idle, 1=queued, 2=decoding, 3=done, 4=reserved, 5=phase1_done
      *   5=phase1_done: Phase 1 (AEC) 已完成, 等待 n_deps==0 后执行 Phase 2 (重建).
      *     worker 在 Phase 2 等待期间释放, 可处理其他帧的 Phase 1, 提高并行度.
+     *   6=aec_running: AEC 线程正在执行 Phase 1, 重建线程可按行 pipeline 跟随.
+     *     (行级流水线模式: aec_row_done[i] 逐行置位, 重建线程按行重建+LF)
+     *   7=aec_done_state: AEC 整帧完成, 重建线程可能仍在收尾. 等重建完成 → done(3).
      * n_deps: 未完成 (非 done) 的参考帧数量, Phase 2 (重建) 等待其归零.
      *   worker 等待其归零后才开始解码 (单 pass 模式).
      * n_aec_deps: 未完成 AEC (非 aec_done) 的参考帧数量, Phase 1 (AEC) 等待其归零.
@@ -229,22 +247,29 @@ typedef struct avs2_frame_ctx {
     avs2_pic_header pic_local;
     int64_t saved_pts, saved_dts;  /* 提交任务时保存的 pts/dts */
 
+    /* 行级流水线: 重建线程在此帧上的工作状态.
+     * recon_active: 1 = 有重建线程正在此帧上工作 (防止重复进入)
+     * recon_started: 1 = 重建已启动 (AEC 完成首行后即可)
+     * recon_cond: AEC 完成新行后唤醒等待的重建线程 */
+    int recon_active;
+    int recon_started;
+
     /* 行级 LF 依赖: 每行所需的额外参考帧 LF 行数 (基于 MV y 范围).
      * mv_row_range[i] = 当前帧行 i 的 inter 块需要参考帧 LF 完成的额外行数.
      *   所需参考帧行 = min(i + mv_row_range[i], h_lcu-1).
      * Phase 1 完成后 (cu_grid 已填充) 计算, Phase 2 中按行等待使用.
      * 含插值滤波器余量 (8-tap: +4 像素, 约 1 LCU 行). */
-    int *mv_row_range;             /* [h_lcu] */
+    int mv_row_range[AVS2_MAX_H_LCU]; /* [h_lcu] */
     int mv_row_range_h_lcu;        /* 分配时的 h_lcu */
 
     /* 行级并行: per-row 进度 (volatile, 在 task_lock 保护下访问).
      * row_aec_done[i]: 第 i 行的 AEC 解码完成 (Pass 1)
      * row_recon_done[i]: 第 i 行的重建完成 (Pass 2 重建, 不含 LF)
      * row_lf_done[i]: 第 i 行的环路滤波完成 (Pass 2 LF)
-     * 仅 thread_mode==ROW 时使用, 在帧解码开始时分配/重置 */
-    volatile int *row_aec_done;    /* [h_lcu] */
-    volatile int *row_recon_done;  /* [h_lcu] */
-    volatile int *row_lf_done;     /* [h_lcu] */
+     * 仅 thread_mode==ROW 时使用, 在帧解码开始时重置 */
+    volatile int row_aec_done[AVS2_MAX_H_LCU];    /* [h_lcu] */
+    volatile int row_recon_done[AVS2_MAX_H_LCU];  /* [h_lcu] */
+    volatile int row_lf_done[AVS2_MAX_H_LCU];     /* [h_lcu] */
     int row_parallel_h_lcu;        /* 分配时的 h_lcu */
     int row_aec_completed;         /* Pass 1 全部完成 (所有行 AEC done) */
     int row_recon_completed;       /* Pass 2 全部完成 (所有行 LF done) */
@@ -280,6 +305,7 @@ struct avs2_internal {
     int strict_std_compliance;
     int skip_loop_filter;
     int thread_mode;  /* avs2_thread_mode: 0=frame, 1=row */
+    int force_8bit;   /* 1 = 强制 8-bit 解码 (有损) */
     avs2_picture_alloc allocator;
     avs2_logger logger;
 
@@ -310,13 +336,23 @@ struct avs2_internal {
     int out_initialized;    /* out_next_poc 是否已初始化 */
     int i_tr_wrap_cnt;      /* COI 回绕计数 (对应 davs2 i_tr_wrap_cnt) */
     int i_prev_coi;         /* 上一个 COI (对应 davs2 i_prev_coi), 初始 -1 */
+    int seq_logged;         /* 序列头日志是否已打印 (去重, 避免重复序列头刷屏) */
 
-    /* 线程池 (帧级并行). n_threads=1 时不创建 worker, 走同步路径. */
-    avs2_thread_t *threads;
+    /* 线程池 (帧级并行). n_threads=1 时不创建 worker, 走同步路径.
+     * 线程分组: AEC 线程 (专做 Phase 1) + 重建线程 (专做 Phase 2 行级 pipeline).
+     * n_aec_threads: AEC 线程数 (建议 1-2). 0 = 不分组 (回退到通用 worker).
+     * n_recon_threads: 重建线程数 = n_threads - 1 - n_aec_threads.
+     * aec_threads[] / recon_threads[]: 分组线程句柄. */
+    avs2_thread_t *threads;       /* 通用 worker (n_aec_threads==0 时使用) */
+    avs2_thread_t *aec_threads;   /* AEC 专用线程 */
+    avs2_thread_t *recon_threads; /* 重建专用线程 */
     int n_threads_active;   /* 实际创建的 worker 线程数 (n_threads-1 或 0) */
+    int n_aec_threads;      /* AEC 线程数 (0=不分组) */
+    int n_recon_threads;    /* 重建线程数 */
     avs2_mutex_t task_lock;  /* 保护任务队列/fc 状态/DPB 完成状态 */
-    avs2_cond_t task_cond;   /* 任务就绪信号 (worker 等待) */
+    avs2_cond_t task_cond;   /* 任务就绪信号 (AEC 线程等待) */
     avs2_cond_t done_cond;   /* 帧完成信号 (get_picture 等待) */
+    avs2_cond_t recon_cond;  /* 行级 pipeline 信号 (AEC→重建, 唤醒等待新行的重建线程) */
     int task_queue[AVS2_MAX_FRAME_DELAY]; /* 待解码 fc 索引队列 (Phase 1) */
     int task_q_head, task_q_tail;
     int phase2_queue[AVS2_MAX_FRAME_DELAY]; /* Phase 2 就绪 fc 索引队列 */
@@ -325,6 +361,7 @@ struct avs2_internal {
     int shutdown;            /* 关闭信号 */
     int n_waiters_task;      /* 等待 task_cond 的 worker 数 (Win32 广播用) */
     int n_waiters_done;      /* 等待 done_cond 的线程数 (Win32 广播用) */
+    int n_waiters_recon;     /* 等待 recon_cond 的重建线程数 (Win32 广播用) */
     int n_p2_active;         /* 当前正在执行 Phase 2 的 worker 数 (task_lock 保护) */
     int p2_cap;              /* Phase 2 并发上限 (防止 P1 饥饿) */
 
@@ -349,6 +386,7 @@ struct avs2_internal {
 /* picture.c */
 int  avs2_frame_alloc(avs2_frame *f, struct avs2_internal *c);
 void avs2_frame_free(avs2_frame *f);
+void avs2_frame_free_buffers(avs2_frame *f);
 void avs2_frame_ref(avs2_frame *dst, avs2_frame *src);
 avs2_frame *avs2_dpb_get_free(struct avs2_internal *c);
 void avs2_dpb_clear(struct avs2_internal *c);
@@ -381,6 +419,10 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc);
 /* 2-pass 帧并行: Phase 2 (重建+LF) — 执行重建和环路滤波, 设置帧元数据.
  * 调用前需确保 n_deps==0 (所有参考帧完全完成). */
 int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc);
+/* 2-pass 行级并行: Phase 2 (重建+LF, 行级并行). 重置 fc 行状态, 设置 row_task_fc
+ * 唤醒辅助 worker, 调用 avs2_row_parallel_pass2 行级并行重建+LF, 等待辅助 worker 退出.
+ * 调用前需确保 n_deps==0 (所有参考帧完全完成). */
+int avs2_decode_frame_fc_phase2_row(struct avs2_internal *c, avs2_frame_ctx *fc);
 /* 行级并行: worker 参与 Pass 2 重建+LF. is_helper=1 时为辅助 worker, 可在
  * 无任务且有待处理 P1 任务时提前退出. 返回 1=帧完成, 0=helper 提前退出. */
 int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_helper);

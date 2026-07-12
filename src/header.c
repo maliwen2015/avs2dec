@@ -348,6 +348,9 @@ int avs2_parse_sequence_header(struct avs2_internal *c, avs2_bs *bs)
     s->enc_width  = ((s->horizontal_size + MIN_CU_SIZE - 1) >> MIN_CU_SIZE_IN_BIT) << MIN_CU_SIZE_IN_BIT;
     s->enc_height = ((s->vertical_size   + MIN_CU_SIZE - 1) >> MIN_CU_SIZE_IN_BIT) << MIN_CU_SIZE_IN_BIT;
 
+    /* force_8bit: 始终在原始位深空间解码, 仅在输出时降为 8-bit.
+     * force_8bit 标志由输出路径 (yuv.c) 检查, 逐像素右移 >>2 输出. */
+
     /* 多线程优化: 比较新旧 sequence header.
      * 若内容相同 (同一序列的重复 sequence header), 跳过写入 c->seq/c->bit_depth/g_dc_value,
      * 避免 memset 竞争, 无需等待 worker.
@@ -380,13 +383,17 @@ int avs2_parse_sequence_header(struct avs2_internal *c, avs2_bs *bs)
 
     UNUSED_PARAMETER(j);
 
-    avs2_info(c, "Sequence: profile=%02x level=%02x %ux%u chroma=%u bd=%d lcu=%d\n",
-              s->profile_id, s->level_id, s->horizontal_size, s->vertical_size,
-              s->chroma_format, c->bit_depth, c->max_cu_size);
-    avs2_info(c, "  tools: wqm=%d 2nd_t=%d nsqt=%d sdip=%d amp=%d mhpskip=%d wsm=%d dhp=%d sao=%d alf=%d pmvr=%d\n",
-              s->enable_weighted_quant, s->enable_2nd_transform, s->enable_nsqt, s->enable_sdip, s->enable_amp,
-              s->enable_mhpskip, s->enable_wsm, s->enable_dhp,
-              s->enable_sao, s->enable_alf, s->enable_pmvr);
+    /* 仅在首次或序列参数变化时打印日志 (避免重复序列头导致日志刷屏) */
+    if (!c->seq_logged) {
+        avs2_info(c, "Sequence: profile=%02x level=%02x %ux%u chroma=%u bd=%d lcu=%d\n",
+                  s->profile_id, s->level_id, s->horizontal_size, s->vertical_size,
+                  s->chroma_format, c->bit_depth, c->max_cu_size);
+        avs2_info(c, "  tools: wqm=%d 2nd_t=%d nsqt=%d sdip=%d amp=%d mhpskip=%d wsm=%d dhp=%d sao=%d alf=%d pmvr=%d\n",
+                  s->enable_weighted_quant, s->enable_2nd_transform, s->enable_nsqt, s->enable_sdip, s->enable_amp,
+                  s->enable_mhpskip, s->enable_wsm, s->enable_dhp,
+                  s->enable_sao, s->enable_alf, s->enable_pmvr);
+        c->seq_logged = 1;
+    }
 
     return bs->error ? AVS2_ERR_INVALID : AVS2_OK;
 }
@@ -857,10 +864,11 @@ void avs2_build_reference_list(struct avs2_internal *c, avs2_frame_ctx *fc)
             avs2_frame *f = c->dpb[j];
             if (f && f->used && f->coi == remove_coi) {
                 f->referenced = 0;  /* 不再被后续帧参考 */
-                /* 如果已输出且无用户引用, 立即释放 */
-                if (f->output && f->ref_cnt <= 1) {
-                    avs2_frame_free(f);
-                }
+                /* 不在此处调用 avs2_frame_free: 当前帧可能仍在 ref_pic 列表中,
+                 * ref_cnt++ 尚未执行 (在 avs2_submit_frame_task 中).
+                 * 提前释放会使 avs2_dpb_get_free 的 !used 快速路径跳过 ref_cnt
+                 * 检查, 导致帧在 worker 仍读取 mvbuf/refbuf 时被复用 memset.
+                 * 释放交给 avs2_dpb_get_free 统一在 ref_cnt 安全时执行. */
                 break;
             }
         }
@@ -879,6 +887,16 @@ void avs2_build_reference_list(struct avs2_internal *c, avs2_frame_ctx *fc)
                 fc->n_refs++;
                 break;
             }
+        }
+    }
+
+    /* 一个帧可能同时在 remove_pic 和 ref_pic 列表中 (AVS2 常见场景):
+     * 上面 remove_pic 循环将 referenced 置 0, 但此帧仍被当前帧参考.
+     * 重新标记所有 fref 中的帧为 referenced=1, 防止 avs2_picture_unref
+     * 在 ref_cnt 递增前释放它们. */
+    for (i = 0; i < fc->n_refs; i++) {
+        if (fc->fref[i]) {
+            fc->fref[i]->referenced = 1;
         }
     }
 

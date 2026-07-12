@@ -1441,10 +1441,7 @@ static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
 
             /* bit_size - (i_trans_size != TU_SPLIT_NON) = bit_size - 0 = bit_size */
             avs2_get_quant_params(cu->qp, bit_size, bit_depth, &shift, &scale);
-            /* 仅清零变换块大小的区域 (blocksize^2), 而非整个 64x64 scratch.
-             * AEC 仅写入 blocksize^2 个系数 (LOT 64x64 时为 32x32=1024,
-             * IDCT 内部展开为 64x64 输出), 8x8 CU 可省 64x 带宽. */
-            memset(fc->coeff_scratch_y, 0, sizeof(int16_t) * blocksize * blocksize);
+            memset(fc->coeff_scratch_y, 0, sizeof(int16_t) * 64 * 64);
 
             cu->dct_pattern[0] = read_block_coeffs(aec, cu, &aec_desc,
                                                     fc->coeff_scratch_y,

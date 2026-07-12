@@ -558,41 +558,39 @@ static void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
 static void fill_block_c(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
                          int fill_val, int bit_depth)
 {
-    int y;
+    int x, y;
     if (bit_depth > 8) {
         uint16_t *p16 = (uint16_t *)(void *)dst;
         int stride16 = (int)(dst_stride >> 1);
-        uint16_t v16 = (uint16_t)fill_val;
         for (y = 0; y < h; y++) {
-            uint16_t *row = p16 + y * stride16;
-            int x = 0;
-            /* 8 像素一组展开, 减少 loop overhead */
-            for (; x + 7 < w; x += 8) {
-                row[x + 0] = v16; row[x + 1] = v16; row[x + 2] = v16; row[x + 3] = v16;
-                row[x + 4] = v16; row[x + 5] = v16; row[x + 6] = v16; row[x + 7] = v16;
-            }
-            for (; x < w; x++) {
-                row[x] = v16;
+            for (x = 0; x < w; x++) {
+                p16[y * stride16 + x] = (uint16_t)fill_val;
             }
         }
     } else {
-        /* 8-bit: 每行用 memset (libc 通常用 SIMD 优化) */
         for (y = 0; y < h; y++) {
-            memset(dst + y * dst_stride, fill_val, w);
+            for (x = 0; x < w; x++) {
+                dst[y * dst_stride + x] = (uint8_t)fill_val;
+            }
         }
     }
 }
 
-/* MC + 双向平均 C 回退: 先 MC 到 pred2, 再与 dst 平均 */
+/* MC + 双向平均 C 回退: 先 MC 到 pred2, 再与 dst 平均.
+ * 注意: 8-bit 和 10-bit 的 pred2 步长不同.
+ *   10-bit: pred2 为 int16_t[], 步长 w*sizeof(int16_t) 字节 (mc_luma_c 按 uint16_t 写入)
+ *   8-bit:  pred2 为 uint8_t[], 步长 w 字节 (mc_luma_c 按 uint8_t 写入)
+ * 若 8-bit 也用 int16_t[] + 步长 w*2, 则每行只有前 w 字节被写入,
+ * 后 w 字节未初始化, 读取 pred2[y*w+x] (按 int16_t 步长 2) 会读到随机值. */
 void mc_luma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
                           ptrdiff_t dstride, int w, int h, int mx, int my,
                           int bit_depth)
 {
-    int16_t pred2[64 * 64];
     int x, y;
-    mc_luma_c(src, sstride, (uint8_t *)pred2, w * sizeof(int16_t),
-              w, h, mx, my, bit_depth);
     if (bit_depth > 8) {
+        int16_t pred2[64 * 64];
+        mc_luma_c(src, sstride, (uint8_t *)pred2, w * sizeof(int16_t),
+                  w, h, mx, my, bit_depth);
         uint16_t *p16 = (uint16_t *)(void *)dst;
         int stride16 = (int)(dstride >> 1);
         for (y = 0; y < h; y++)
@@ -601,9 +599,12 @@ void mc_luma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
                 p16[y * stride16 + x] = (uint16_t)((v + 1) >> 1);
             }
     } else {
+        uint8_t pred2[64 * 64];
+        mc_luma_c(src, sstride, pred2, w,
+                  w, h, mx, my, bit_depth);
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
-                int v = dst[y * dstride + x] + (uint8_t)pred2[y * w + x];
+                int v = dst[y * dstride + x] + pred2[y * w + x];
                 dst[y * dstride + x] = (uint8_t)((v + 1) >> 1);
             }
     }
@@ -613,11 +614,11 @@ void mc_chroma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
                             ptrdiff_t dstride, int w, int h, int mx, int my,
                             int bit_depth)
 {
-    int16_t pred2[32 * 32];
     int x, y;
-    mc_chroma_c(src, sstride, (uint8_t *)pred2, w * sizeof(int16_t),
-                w, h, mx, my, bit_depth);
     if (bit_depth > 8) {
+        int16_t pred2[32 * 32];
+        mc_chroma_c(src, sstride, (uint8_t *)pred2, w * sizeof(int16_t),
+                    w, h, mx, my, bit_depth);
         uint16_t *p16 = (uint16_t *)(void *)dst;
         int stride16 = (int)(dstride >> 1);
         for (y = 0; y < h; y++)
@@ -626,9 +627,12 @@ void mc_chroma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
                 p16[y * stride16 + x] = (uint16_t)((v + 1) >> 1);
             }
     } else {
+        uint8_t pred2[32 * 32];
+        mc_chroma_c(src, sstride, pred2, w,
+                    w, h, mx, my, bit_depth);
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
-                int v = dst[y * dstride + x] + (uint8_t)pred2[y * w + x];
+                int v = dst[y * dstride + x] + pred2[y * w + x];
                 dst[y * dstride + x] = (uint8_t)((v + 1) >> 1);
             }
     }

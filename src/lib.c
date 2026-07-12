@@ -6,36 +6,18 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* 编译期性能统计开关 (与 decode.c 共用). 默认 0: 不在热路径调用
- * clock_gettime/QueryPerformanceCounter. */
-#ifndef AVS2_PROFILE
-#define AVS2_PROFILE 0
-#endif
-
-#if AVS2_PROFILE
-#if defined(_WIN32) || defined(_WIN64)
+#define PIPELINE_DEBUG 0
+#if PIPELINE_DEBUG
+#if defined(_WIN32)
 #include <windows.h>
-static double dbg_time_ms(void) {
-    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)f.QuadPart * 1000.0;
-}
+#define PDBG(fmt, ...) fprintf(stderr, "[PDBG %lu] " fmt, (unsigned long)GetCurrentThreadId(), ##__VA_ARGS__)
 #else
-#include <time.h>
-static double dbg_time_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
+#include <pthread.h>
+#define PDBG(fmt, ...) fprintf(stderr, "[PDBG %lu] " fmt, (unsigned long)pthread_self(), ##__VA_ARGS__)
 #endif
-
-
-/* 2-pass profiling counters (volatile double, approximate for tuning) */
-volatile double g_p1_wait_total = 0;
-volatile double g_p1_aec_total = 0;
-volatile double g_p2_wait_total = 0;
-volatile double g_pick_fc_wait_total = 0;
-volatile int    g_pick_fc_block_count = 0;
-volatile double g_worker_idle_total = 0;
-#endif /* AVS2_PROFILE */
+#else
+#define PDBG(fmt, ...) ((void)0)
+#endif
 
 void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
                     int64_t pts, int64_t dts)
@@ -70,6 +52,7 @@ void avs2_default_settings(avs2_settings *s)
     s->strict_std_compliance = 0;
     s->skip_loop_filter = 0;
     s->thread_mode = AVS2_THREAD_FRAME;
+    s->force_8bit = 0;
 }
 
 /* ===================================================================
@@ -129,6 +112,9 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
 #endif
     avs2_set_thread_scratch(scratch_y, scratch_u, scratch_v);
 
+    /* pipeline 模式 helper 空转计数: 超限返回 0, 让 recon_thread_fn cond_wait */
+    int helper_idle_cnt = 0;
+
     for (;;) {
         /* 帧完成检查 */
         if (avs2_atomic_load(&fc->row_recon_completed)) {
@@ -142,8 +128,10 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
         {
             int row = avs2_atomic_load(&fc->row_recon_next);
             while (row < h_lcu) {
-                /* 检查依赖: AEC 完成 + 上一行重建完成 */
-                if (!avs2_atomic_load(&fc->row_aec_done[row]) ||
+                /* 检查依赖: AEC 完成 + 上一行重建完成.
+                 * 2-pass 模式: Phase 1 设置 f->aec_row_done (帧级).
+                 * 单 pass 模式: avs2_decode_frame_fc_row 也设置 f->aec_row_done. */
+                if (!avs2_atomic_load(&f->aec_row_done[row]) ||
                     (row > 0 && !avs2_atomic_load(&fc->row_recon_done[row - 1]))) {
                     break;  /* 依赖未满足 */
                 }
@@ -169,10 +157,16 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
                                 }
                             }
                             if (all_ready) break;
-                            if ((++spin_cnt & 0x3ff) == 0 &&
-                                (c->shutdown ||
-                                 avs2_atomic_load(&fc->row_recon_completed)))
-                                break;
+                            if ((++spin_cnt & 0x3ff) == 0) {
+                                PDBG("SPIN: fc[%d] row=%d wait ref lf (req=%d refs=%d done=%d cnt=%d)\n",
+                                     (int)(fc - c->fc), row, required_row, fc->n_refs,
+                                     fc->n_refs > 0 && fc->fref[0] ? fc->fref[0]->done : -1,
+                                     fc->n_refs > 0 && fc->fref[0] ?
+                                     (int)avs2_atomic_load(&fc->fref[0]->lf_row_done_count) : -1);
+                                if (c->shutdown ||
+                                    avs2_atomic_load(&fc->row_recon_completed))
+                                    break;
+                            }
                             avs2_cpu_relax();
                         }
                     }
@@ -245,22 +239,52 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
             return 1;
         }
 
-        /* 辅助 worker: 检查 pending P1 任务, 有则退出 */
+        /* 辅助 worker: 检查是否有更高优先级任务, 有则退出.
+         * 通用模式: 检查 pending P1 任务 (state==1 && n_aec_deps==0).
+         * 行级流水线模式: 检查是否有新的 P2 帧可用 (state==6/5 && !recon_active). */
         if (is_helper) {
             avs2_mutex_lock(&c->task_lock);
-            for (int i = 0; i < c->n_fc; i++) {
-                if (c->fc[i].task_state == 1 &&
-                    c->fc[i].n_aec_deps == 0) {
-                    avs2_mutex_unlock(&c->task_lock);
-                    avs2_set_thread_scratch(NULL, NULL, NULL);
-                    return 0;
+            int should_exit = 0;
+            if (c->n_aec_threads > 0) {
+                /* 行级流水线: 检查是否有新 P2 帧可接管 */
+                for (int i = 0; i < c->n_fc; i++) {
+                    if ((c->fc[i].task_state == 6 || c->fc[i].task_state == 5) &&
+                        !c->fc[i].recon_active) {
+                        should_exit = 1;
+                        break;
+                    }
+                }
+            } else {
+                /* 通用模式: 检查 pending P1 任务 */
+                for (int i = 0; i < c->n_fc; i++) {
+                    if (c->fc[i].task_state == 1 &&
+                        c->fc[i].n_aec_deps == 0) {
+                        should_exit = 1;
+                        break;
+                    }
                 }
             }
             avs2_mutex_unlock(&c->task_lock);
+            if (should_exit) {
+                avs2_set_thread_scratch(NULL, NULL, NULL);
+                return 0;
+            }
         }
 
         /* spin-wait: 短暂等待新任务可用 */
         avs2_cpu_relax();
+
+        /* pipeline 模式 helper: 有界自旋, 无进展则返回 0.
+         * recon_thread_fn 收到返回值 0 后 cond_wait(recon_cond),
+         * 等 AEC 完成下一行 signal 时唤醒, 避免空转. */
+        if (is_helper && c->n_aec_threads > 0) {
+            if (++helper_idle_cnt >= 256) {
+                avs2_set_thread_scratch(NULL, NULL, NULL);
+                return 0;
+            }
+        } else {
+            helper_idle_cnt = 0;
+        }
     }
 
     return 1;  /* unreachable */
@@ -355,6 +379,7 @@ static void complete_frame(struct avs2_internal *c, avs2_frame_ctx *fc)
     fc->task_state = 3;  /* done */
     fc->fdec->done = 1;
     c->n_pending--;
+    PDBG("COMPLETE: fc[%d] state->3 done, pending=%d\n", (int)(fc - c->fc), c->n_pending);
 
     /* 递减依赖此帧的 queued/decoding/phase1_done 任务的 n_deps.
      * state==1(queued): 尚未开始, n_deps 将在其 Phase 2 前被检查.
@@ -365,12 +390,19 @@ static void complete_frame(struct avs2_internal *c, avs2_frame_ctx *fc)
     for (int i = 0; i < c->n_fc; i++) {
         avs2_frame_ctx *other = &c->fc[i];
         if (other != fc && (other->task_state == 1 || other->task_state == 2 ||
-                            other->task_state == 5)) {
+                            other->task_state == 5 || other->task_state == 6)) {
             for (int j = 0; j < other->n_refs; j++) {
                 if (other->fref[j] == fc->fdec) {
                     other->n_deps--;
-                    if (!fc->aec_started && j == 0 && !IS_INTRA(other->slice_type)) {
-                        other->n_aec_deps--;
+                    /* n_aec_deps 补偿递减: 若此帧 (col_pic) 的 AEC 信号未递减.
+                     * 通用模式: aec_started==0 时未递减.
+                     * 行级流水线模式: aec_done==0 时未递减. */
+                    if (j == 0 && !IS_INTRA(other->slice_type)) {
+                        int not_signaled = (c->n_aec_threads > 0) ?
+                            !fc->aec_done : !fc->aec_started;
+                        if (not_signaled) {
+                            other->n_aec_deps--;
+                        }
                     }
                     /* 行级 LF 依赖: Phase 2 在 Phase 1 完成后已推入 phase2_queue,
                      * 不再由 n_deps 归零触发推入, 避免重复入队. n_deps 仅用于
@@ -395,11 +427,197 @@ static void complete_frame(struct avs2_internal *c, avs2_frame_ctx *fc)
     avs2_cond_signal(&c->task_cond);
 }
 
-/* worker 线程主循环 */
+/* ===========================================================================
+ * 行级流水线线程模型 (AEC-重建分离)
+ *
+ * aec_thread_fn: 专做 Phase 1 (熵解码). 取 state==1 && n_aec_deps==0 的帧,
+ *   state→6 (aec_running), 逐行 AEC, 每行完成设置 aec_row_done[i]=1 并
+ *   signal(recon_cond) 唤醒重建线程. 整帧完成后 state→5 (phase1_done).
+ *   不等重建, 立即取下一帧.
+ *
+ * recon_thread_fn: 专做 Phase 2 (重建+LF). 扫描 state==6 或 state==5 的帧,
+ *   按行 pipeline 跟随 AEC (CAS 领行, 等待 aec_row_done[i]).
+ *   无行可领时 cond_wait(recon_cond) 替代 spin-wait, 消除 CPU 空转.
+ *   帧所有行 LF 完成后 complete_frame.
+ * =========================================================================== */
+
+/* AEC 线程: 专做 Phase 1 (熵解码), 不做重建 */
+static void *aec_thread_fn(void *arg)
+{
+    struct avs2_internal *c = (struct avs2_internal *)arg;
+
+    for (;;) {
+        avs2_frame_ctx *fc = NULL;
+
+        /* 取 state==1 && n_aec_deps==0 的帧 */
+        avs2_mutex_lock(&c->task_lock);
+        for (;;) {
+            if (c->shutdown) break;
+            for (int i = 0; i < c->n_fc; i++) {
+                if (c->fc[i].task_state == 1 && c->fc[i].n_aec_deps == 0) {
+                    fc = &c->fc[i];
+                    fc->task_state = 6;  /* aec_running */
+                    PDBG("AEC: take fc[%d] state->6\n", i);
+                    break;
+                }
+            }
+            if (fc) break;
+            c->n_waiters_task++;
+            avs2_cond_wait(&c->task_cond, &c->task_lock);
+            c->n_waiters_task--;
+        }
+        avs2_mutex_unlock(&c->task_lock);
+
+        if (c->shutdown) break;
+
+        PDBG("AEC: start phase1 fc[%d]\n", (int)(fc - c->fc));
+
+        /* 执行 Phase 1 (AEC).
+         * avs2_decode_frame_fc_phase1 内部逐行设置 aec_row_done[i]=1,
+         * 每行完成后 signal(recon_cond) 唤醒重建线程 (行级 pipeline). */
+        avs2_decode_frame_fc_phase1(c, fc);
+
+        if (c->shutdown) break;
+
+        /* Phase 1 完成: state→5 (phase1_done), 释放 AEC 线程.
+         * 重建线程扫描 state==5 帧并检查参考帧就绪后启动 Phase 2.
+         * broadcast recon_cond 确保等待的重建线程被唤醒.
+         * 若重建线程已在 AEC 循环期间完成 Phase 2 (pipeline 模式下可能发生),
+         * state 已为 3 (done), 不覆盖. */
+        avs2_mutex_lock(&c->task_lock);
+        if (fc->task_state != 3) {
+            fc->task_state = 5;
+        }
+        PDBG("AEC: done phase1 fc[%d] state=%d, waiters_recon=%d\n",
+             (int)(fc - c->fc), fc->task_state, c->n_waiters_recon);
+        avs2_cond_signal(&c->task_cond);
+        avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
+        avs2_mutex_unlock(&c->task_lock);
+    }
+
+    return NULL;
+}
+
+/* 重建线程: 专做 Phase 2 (重建+LF), 按行 pipeline 跟随 AEC.
+ * 无 owning 任务时做 helper (参与其他帧的行级并行). */
+static void *recon_thread_fn(void *arg)
+{
+    struct avs2_internal *c = (struct avs2_internal *)arg;
+    int just_helped = 0;  /* 刚从 helper 返回无进展, 跳过 helper 选择直接 cond_wait */
+
+    for (;;) {
+        avs2_frame_ctx *fc = NULL;
+        avs2_frame_ctx *helper_fc = NULL;
+
+        avs2_mutex_lock(&c->task_lock);
+        for (;;) {
+            if (c->shutdown) break;
+
+            /* 优先: 取 owning 任务 (state==6/5 且 recon_active==0 且 row_task_fc==NULL). */
+            if (c->n_p2_active < c->p2_cap && c->row_task_fc == NULL) {
+                for (int i = 0; i < c->n_fc; i++) {
+                    avs2_frame_ctx *cand = &c->fc[i];
+                    if (cand->task_state != 6 && cand->task_state != 5) continue;
+
+                    int refs_ready = 1;
+                    for (int j = 0; j < cand->n_refs; j++) {
+                        avs2_frame *ref = cand->fref[j];
+                        if (ref && !ref->done &&
+                            avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                            refs_ready = 0;
+                            break;
+                        }
+                    }
+                    if (!refs_ready) {
+                        continue;
+                    }
+
+                    if (!cand->recon_active) {
+                        fc = cand;
+                        fc->recon_active = 1;
+                        fc->recon_started = 1;
+                        c->n_p2_active++;
+                        just_helped = 0;
+                        break;
+                    }
+                }
+            }
+            if (fc) break;
+
+            /* 次选: 做 helper (just_helped 时跳过, 避免 AEC 未就绪时空转) */
+            if (!just_helped && c->row_task_fc) {
+                avs2_frame_ctx *rfc = c->row_task_fc;
+                if (rfc->task_state == 6 || rfc->task_state == 5 ||
+                    rfc->task_state == 2) {
+                    if (!rfc->row_recon_completed) {
+                        helper_fc = rfc;
+                        rfc->n_row_workers++;
+                        break;
+                    }
+                }
+            }
+
+            /* 无任务, 等待 recon_cond */
+            just_helped = 0;
+            c->n_waiters_recon++;
+            avs2_cond_wait(&c->recon_cond, &c->task_lock);
+            c->n_waiters_recon--;
+        }
+        avs2_mutex_unlock(&c->task_lock);
+
+        if (c->shutdown) break;
+
+        if (helper_fc) {
+            /* helper: 参与行级并行 P2.
+             * 返回 1=帧完成/shutdown, 0=无进展 (AEC 行未就绪) 或有更高优先级任务. */
+            int did_work = avs2_row_parallel_pass2(c, helper_fc, 1);
+            avs2_mutex_lock(&c->task_lock);
+            helper_fc->n_row_workers--;
+            if (helper_fc->n_row_workers == 0) {
+                avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
+            }
+            avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
+            avs2_mutex_unlock(&c->task_lock);
+            if (!did_work) just_helped = 1;  /* 无进展: 下次跳过 helper, cond_wait */
+            continue;
+        }
+
+        /* owning: 执行 Phase 2 */
+        if (c->thread_mode == AVS2_THREAD_ROW) {
+            avs2_decode_frame_fc_phase2_row(c, fc);
+        } else {
+            avs2_decode_frame_fc_phase2(c, fc);
+        }
+
+        /* Phase 2 完成: 等待 AEC 完全结束后才 complete_frame.
+         * AEC 线程在 AEC 循环后还有 aec_done 设置 + n_aec_deps 递减.
+         * 若不等 aec_done, complete_frame 的 n_aec_deps 补偿与 aec_done 信号
+         * 可能双重递减, 且 AEC 线程的 state=5 会覆盖 state=3. */
+        avs2_mutex_lock(&c->task_lock);
+        c->n_p2_active--;
+        fc->recon_active = 0;
+        while (!fc->aec_done && !c->shutdown) {
+            c->n_waiters_done++;
+            avs2_cond_wait(&c->done_cond, &c->task_lock);
+            c->n_waiters_done--;
+        }
+        complete_frame(c, fc);
+        avs2_cond_signal(&c->task_cond);
+        avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
+        avs2_mutex_unlock(&c->task_lock);
+    }
+
+    return NULL;
+}
+
+/* 通用 worker 线程主循环 (n_aec_threads==0 时使用, 保持原 2-pass 逻辑) */
 static void *worker_thread(void *arg)
 {
     struct avs2_internal *c = (struct avs2_internal *)arg;
-    const int use_2pass = (c->thread_mode == AVS2_THREAD_FRAME && c->n_threads > 1);
+    /* 2-pass 调度: ROW 和 FRAME 模式均使用. ROW 的 Phase 2 调用
+     * avs2_decode_frame_fc_phase2_row (行级并行重建+LF), FRAME 调用
+     * avs2_decode_frame_fc_phase2 (逐行 inline deblock). */
+    const int use_2pass = (c->n_threads > 1);
 
     for (;;) {
         int fc_idx = -1;
@@ -436,6 +654,8 @@ static void *worker_thread(void *arg)
                         if (refs_ready) {
                             fc = cand;
                             fc->task_state = 2;  /* decoding */
+                            if (c->thread_mode == AVS2_THREAD_ROW)
+                                fc->recon_active = 1;
                             phase = 2;
                             c->n_p2_active++;
                             break;
@@ -464,27 +684,25 @@ static void *worker_thread(void *arg)
                 break;
             }
 
-            /* 3. 单 pass row 辅助 (最低优先级, 仅在无帧级任务时参与). */
-            if (c->row_task_fc) {
-                avs2_frame_ctx *rfc = c->row_task_fc;
-                if (rfc->task_state == 2 && !rfc->row_recon_completed) {
-                    row_fc = rfc;
-                    rfc->n_row_workers++;
+            /* 3. 行级并行 helper: 扫描所有正在 P2 重建且未完成的帧.
+             * Phase C 优化: 放宽 row_task_fc 单值限制, 允许 helper 帮助
+             * 任意正在重建的帧, 提高行级并行度. */
+            for (int i = 0; i < c->n_fc; i++) {
+                avs2_frame_ctx *cand = &c->fc[i];
+                if (cand->task_state == 2 && cand->recon_active &&
+                    !cand->row_recon_completed) {
+                    row_fc = cand;
+                    cand->n_row_workers++;
                     break;
                 }
             }
+            if (row_fc) break;
 
             /* 4. 无任务, 等待 */
             {
-#if AVS2_PROFILE
-                double t_idle_start = dbg_time_ms();
-#endif
                 c->n_waiters_task++;
                 avs2_cond_wait(&c->task_cond, &c->task_lock);
                 c->n_waiters_task--;
-#if AVS2_PROFILE
-                g_worker_idle_total += dbg_time_ms() - t_idle_start;
-#endif
             }
         }
         avs2_mutex_unlock(&c->task_lock);
@@ -517,10 +735,18 @@ static void *worker_thread(void *arg)
             avs2_cond_signal(&c->task_cond);
             avs2_mutex_unlock(&c->task_lock);
         } else if (phase == 2) {
-            /* ---- 2-pass Phase 2 (重建+LF, 行级 LF 依赖) ---- */
-            avs2_decode_frame_fc_phase2(c, fc);
+            /* ---- 2-pass Phase 2 (重建+LF) ----
+             * ROW 模式: 行级并行重建+LF (avs2_row_parallel_pass2)
+             * FRAME 模式: 逐行 inline deblock (cache 友好) */
+            if (c->thread_mode == AVS2_THREAD_ROW) {
+                avs2_decode_frame_fc_phase2_row(c, fc);
+            } else {
+                avs2_decode_frame_fc_phase2(c, fc);
+            }
             avs2_mutex_lock(&c->task_lock);
             c->n_p2_active--;  /* 释放 P2 名额 */
+            if (c->thread_mode == AVS2_THREAD_ROW)
+                fc->recon_active = 0;
             complete_frame(c, fc);
             avs2_mutex_unlock(&c->task_lock);
         } else {
@@ -532,6 +758,8 @@ static void *worker_thread(void *arg)
                 avs2_cond_wait(&c->done_cond, &c->task_lock);
                 c->n_waiters_done--;
             }
+            if (c->thread_mode == AVS2_THREAD_ROW)
+                fc->recon_active = 1;
             avs2_mutex_unlock(&c->task_lock);
 
             if (c->shutdown) break;
@@ -539,6 +767,8 @@ static void *worker_thread(void *arg)
             avs2_decode_frame_fc(c, fc);
 
             avs2_mutex_lock(&c->task_lock);
+            if (c->thread_mode == AVS2_THREAD_ROW)
+                fc->recon_active = 0;
             complete_frame(c, fc);
             avs2_mutex_unlock(&c->task_lock);
         }
@@ -563,20 +793,15 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
         }
         if (!fc) {
             /* 无空闲 fc, 等待 worker 完成 */
-#if AVS2_PROFILE
-            double t_block_start = dbg_time_ms();
-#endif
+            PDBG("PICK: no idle fc, cond_wait(done_cond) pending=%d\n", c->n_pending);
             c->n_waiters_done++;
             avs2_cond_wait(&c->done_cond, &c->task_lock);
             c->n_waiters_done--;
-#if AVS2_PROFILE
-            g_pick_fc_wait_total += dbg_time_ms() - t_block_start;
-            g_pick_fc_block_count++;
-#endif
         }
     }
     /* 标记为 reserved, 防止其他调用选中同一个 fc */
     fc->task_state = 4;
+    PDBG("PICK: idle fc[%d] -> reserved(4)\n", (int)(fc - c->fc));
     avs2_mutex_unlock(&c->task_lock);
     return fc;
 }
@@ -585,7 +810,7 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
 int avs2_submit_frame_task(struct avs2_internal *c, avs2_frame_ctx *fc)
 {
     int fc_idx = (int)(fc - c->fc);
-    const int use_2pass = (c->thread_mode == AVS2_THREAD_FRAME && c->n_threads > 1);
+    const int use_2pass = (c->n_threads > 1);
 
     avs2_mutex_lock(&c->task_lock);
 
@@ -623,15 +848,26 @@ int avs2_submit_frame_task(struct avs2_internal *c, avs2_frame_ctx *fc)
                 avs2_frame_ctx *fc2 = &c->fc[i];
                 if (fc2 != fc && fc2->fdec == ref &&
                     (fc2->task_state == 1 || fc2->task_state == 2 ||
-                     fc2->task_state == 5)) {
-                    /* 参考帧的 owning fc 未完成 (queued/decoding/phase1_done).
-                     * state==5: Phase 1 完成 but Phase 2 未完成, 像素不可用. */
+                     fc2->task_state == 5 || fc2->task_state == 6)) {
+                    /* 参考帧的 owning fc 未完成 (queued/decoding/phase1_done/aec_running).
+                     * state==5: Phase 1 完成 but Phase 2 未完成, 像素不可用.
+                     * state==6: AEC 进行中 (行级流水线), 重建未完成. */
                     fc->n_deps++;
                     /* n_aec_deps 仅统计 col_pic 且 AEC 未完成的参考帧.
-                     * aec_started==1 表示参考帧 AEC 已开始, Phase 1 信号已发送,
-                     * 新帧不会收到该信号, 不应计入 n_aec_deps. */
-                    if (ref == col_pic && !fc2->aec_started) {
-                        fc->n_aec_deps++;
+                     * 通用模式 (多 worker): 等待 aec_started 即可, B 帧 AEC
+                     *   可与 col_pic AEC 在不同 worker 并行 (derive_skip_mv
+                     *   按行 spin-wait col_pic->aec_row_done, col_pic AEC
+                     *   在另一线程持续推进).
+                     * 行级流水线模式 (单 AEC 线程): 必须等待 aec_done, 否则
+                     *   AEC 线程在 B 帧 Phase 1 的 derive_skip_mv 中 spin-wait
+                     *   col_pic->aec_row_done, 但 col_pic AEC 尚未开始
+                     *   (AEC 线程串行处理), 导致死锁. */
+                    if (ref == col_pic) {
+                        if (c->n_aec_threads > 0) {
+                            if (!fc2->aec_done) fc->n_aec_deps++;
+                        } else {
+                            if (!fc2->aec_started) fc->n_aec_deps++;
+                        }
                     }
                     break;
                 }
@@ -641,12 +877,8 @@ int avs2_submit_frame_task(struct avs2_internal *c, avs2_frame_ctx *fc)
     fc->aec_done = 0;
     fc->aec_started = 0;
 
-    /* 增加参考帧引用计数, 防止 DPB 在 worker 解码期间释放它们 */
-    for (int j = 0; j < fc->n_refs; j++) {
-        if (fc->fref[j]) {
-            fc->fref[j]->ref_cnt++;
-        }
-    }
+    /* 参考帧 ref_cnt 已在 process_start_code 的 avs2_build_reference_list 后
+     * (task_lock 保护下) 递增, 此处无需重复. */
 
     /* 设置为 queued.
      * 2-pass: 不推入 task_queue, worker 扫描 fc 数组取 state==1 && n_aec_deps==0.
@@ -682,6 +914,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->strict_std_compliance = s->strict_std_compliance;
         c->skip_loop_filter = s->skip_loop_filter;
         c->thread_mode = s->thread_mode;
+        c->force_8bit = s->force_8bit;
         c->allocator = s->allocator;
         c->logger = s->logger;
     } else {
@@ -700,17 +933,13 @@ avs2_ctx *avs2_open(const avs2_settings *s)
 
     int nfc = c->max_frame_delay;
     if (nfc <= 0) {
-        if (c->thread_mode == AVS2_THREAD_ROW) {
-            /* 行级并行: 单帧内并行重建, 帧上下文数较少.
-             * n_fc=2 允许一帧在重建时, 下一帧可以开始 AEC. */
-            nfc = (nthr > 1) ? 2 : 1;
-        } else {
-            /* 帧级并行 (2-pass): Phase 1 (AEC) 完成后帧进入 state==5 等待 Phase 2.
-             * 行级 LF 依赖 (spin-wait): Phase 2 可在参考帧 Phase 2 开始后即启动,
-             * P2 重叠执行提高吞吐. n_fc = n_threads * 2: 足够覆盖 P1 并行 +
-             * P2 pipeline 深度, 让更多帧同时进入 Phase 2 重叠执行. */
-            nfc = nthr * 2;
-        }
+        /* 2-pass 调度 (ROW 和 FRAME): Phase 1 (AEC) 完成后帧进入 state==5 等待
+         * Phase 2. 行级 LF 依赖 (spin-wait): Phase 2 可在参考帧 Phase 2 开始后
+         * 即启动, P2 重叠执行提高吞吐. n_fc = n_threads * 2: 足够覆盖 P1 并行 +
+         * P2 pipeline 深度, 让更多帧同时进入 Phase 2 重叠执行.
+         * ROW 模式 Phase 2 使用行级并行 (avs2_row_parallel_pass2), 仍需帧间
+         * pipeline 深度使 P1(AEC) 与 P2(重建) 重叠. */
+        nfc = nthr * 2;
         if (nfc < 1) nfc = 1;
         if (nfc > AVS2_MAX_FRAME_DELAY) nfc = AVS2_MAX_FRAME_DELAY;
     }
@@ -720,17 +949,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     if (!c->fc) { avs2_mem_free(c); return NULL; }
     for (int i = 0; i < c->n_fc; i++) {
         avs2_mutex_init(&c->fc[i].lock);
-        /* allocate per-frame-context coefficient scratch buffers.
-         * These are reused for each CU during decoding, avoiding ~12KB
-         * per CU entry in the cu_grid (saves ~400MB/frame at 1080p). */
-        c->fc[i].coeff_scratch_y = avs2_mem_allocz(sizeof(int16_t) * 64 * 64);
-        c->fc[i].coeff_scratch_u = avs2_mem_allocz(sizeof(int16_t) * 32 * 32);
-        c->fc[i].coeff_scratch_v = avs2_mem_allocz(sizeof(int16_t) * 32 * 32);
-        if (!c->fc[i].coeff_scratch_y || !c->fc[i].coeff_scratch_u ||
-            !c->fc[i].coeff_scratch_v) {
-            avs2_close((avs2_ctx **)&c);
-            return NULL;
-        }
+        /* coeff_scratch_y/u/v 为静态数组, 无需分配 */
         c->fc[i].task_state = 0;  /* idle */
         /* 预分配 AEC 上下文 (避免每帧 create/destroy 堆操作) */
         c->fc[i].aec_pool = avs2_aec_create(c->aec_tab_ctx_mps, c->aec_tab_ctx_lps);
@@ -745,57 +964,154 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     avs2_mutex_init(&c->task_lock);
     avs2_cond_init(&c->task_cond);
     avs2_cond_init(&c->done_cond);
+    avs2_cond_init(&c->recon_cond);
     c->task_q_head = c->task_q_tail = 0;
     c->phase2_q_head = c->phase2_q_tail = 0;
     c->n_pending = 0;
     c->shutdown = 0;
     c->n_waiters_task = 0;
     c->n_waiters_done = 0;
+    c->n_waiters_recon = 0;
     c->n_p2_active = 0;
     /* P2 并发上限: 防止 P2 优先调度导致 P1 (AEC) 饥饿.
-     * 设为 worker 数的一半, 留足够 worker 持续执行 P1 产生 state==5 帧.
-     * P2 帧间并受依赖链限制 (~4 有效并发), p2_cap=7 已足够. */
-    c->p2_cap = (c->n_threads > 1) ? (c->n_threads - 1) / 2 : 1;
+     * ROW 模式: P2 用行级并行, 多 worker 可同时帮助一个帧的 P2,
+     *   p2_cap = n_workers 允许所有 worker 同时做 P2, 行级 helper 机制
+     *   会在无 P2 任务时让 worker 回去做 P1.
+     * FRAME 模式: P2 无行级并行, p2_cap = n_workers/2 平衡 P1/P2 供给. */
+    if (c->n_threads > 1) {
+        c->p2_cap = (c->thread_mode == AVS2_THREAD_ROW) ?
+                    (c->n_threads - 1) : (c->n_threads - 1) / 2;
+    } else {
+        c->p2_cap = 1;
+    }
     if (c->p2_cap < 1) c->p2_cap = 1;
     c->n_threads_active = 0;
     c->threads = NULL;
+    c->aec_threads = NULL;
+    c->recon_threads = NULL;
+    c->n_aec_threads = 0;
+    c->n_recon_threads = 0;
     c->row_task_fc = NULL;     /* 行级并行: 当前无 fc 在 WPP */
 
     /* 创建 worker 线程 (n_threads > 1 时).
      * n_threads=1: n_threads_active=0, 走同步路径.
-     * n_threads>1: 创建 n_threads-1 个 worker (主线程负责 header 解析+提交). */
+     * n_threads>1: 线程分组 — AEC 线程 (1个) + 重建线程 (剩余).
+     *   n_aec_threads=1: 1 个 AEC 专线程做 Phase 1, 其余做 Phase 2 行级 pipeline.
+     *   回退: 若线程创建失败, 回退到单线程模式. */
     if (c->n_threads > 1) {
         int n_workers = c->n_threads - 1;
-        c->threads = avs2_mem_allocz(sizeof(avs2_thread_t) * (size_t)n_workers);
-        if (!c->threads) {
-            avs2_close((avs2_ctx **)&c);
-            return NULL;
-        }
-        for (int i = 0; i < n_workers; i++) {
-            if (avs2_thread_create(&c->threads[i], worker_thread, c) != 0) {
-                /* 创建失败: 唤醒已创建的 worker 并 join, 回退到单线程模式 */
+        /* 行级流水线模式: 1 AEC + (n_workers-1) 重建.
+         * 仅 ROW 模式启用分组 (FRAME 模式 P2 无行级并行, 分组无收益).
+         * n_workers<=2 时不分组 (AEC+重建各1线程无并行收益). */
+        int use_pipeline = 0;  /* 禁用 pipeline: AEC 串行瓶颈导致性能下降 */
+
+        if (use_pipeline) {
+            /* 行级流水线: AEC 线程 + 重建线程 */
+            c->n_aec_threads = 1;
+            c->n_recon_threads = n_workers - c->n_aec_threads;
+
+            c->aec_threads = avs2_mem_allocz(sizeof(avs2_thread_t) * (size_t)c->n_aec_threads);
+            c->recon_threads = avs2_mem_allocz(sizeof(avs2_thread_t) * (size_t)c->n_recon_threads);
+            if (!c->aec_threads || !c->recon_threads) {
+                avs2_close((avs2_ctx **)&c);
+                return NULL;
+            }
+
+            /* p2_cap: 重建线程全部可用 */
+            c->p2_cap = c->n_recon_threads;
+
+            int create_ok = 1;
+            /* 创建 AEC 线程 */
+            for (int i = 0; i < c->n_aec_threads; i++) {
+                if (avs2_thread_create(&c->aec_threads[i], aec_thread_fn, c) != 0) {
+                    create_ok = 0;
+                    break;
+                }
+                c->n_threads_active++;
+            }
+            /* 创建重建线程 */
+            if (create_ok) {
+                for (int i = 0; i < c->n_recon_threads; i++) {
+                    if (avs2_thread_create(&c->recon_threads[i], recon_thread_fn, c) != 0) {
+                        create_ok = 0;
+                        break;
+                    }
+                    c->n_threads_active++;
+                }
+            }
+
+            if (!create_ok) {
+                /* 创建失败: 唤醒已创建的线程并 join, 回退到通用 worker 模式 */
                 avs2_mutex_lock(&c->task_lock);
                 c->shutdown = 1;
                 avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
+                avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
                 avs2_mutex_unlock(&c->task_lock);
-                for (int j = 0; j < c->n_threads_active; j++) {
-                    avs2_thread_join(&c->threads[j], NULL);
-                }
-                avs2_mem_free(c->threads);
-                c->threads = NULL;
+                for (int j = 0; j < c->n_aec_threads; j++)
+                    avs2_thread_join(&c->aec_threads[j], NULL);
+                for (int j = 0; j < c->n_recon_threads && c->n_threads_active > c->n_aec_threads; j++)
+                    avs2_thread_join(&c->recon_threads[j], NULL);
+                avs2_mem_free(c->aec_threads); c->aec_threads = NULL;
+                avs2_mem_free(c->recon_threads); c->recon_threads = NULL;
+                c->n_aec_threads = 0;
+                c->n_recon_threads = 0;
                 c->n_threads_active = 0;
                 c->shutdown = 0;
-                break;
+                /* 回退到通用 worker */
+            } else {
+                /* 行级流水线创建成功, 跳过通用 worker 创建 */
+                goto threads_created;
             }
-            c->n_threads_active++;
+        }
+
+        /* 通用 worker 模式 (n_aec_threads==0 或回退) */
+        {
+            c->n_aec_threads = 0;
+            c->n_recon_threads = 0;
+            c->threads = avs2_mem_allocz(sizeof(avs2_thread_t) * (size_t)n_workers);
+            if (!c->threads) {
+                avs2_close((avs2_ctx **)&c);
+                return NULL;
+            }
+            for (int i = 0; i < n_workers; i++) {
+                if (avs2_thread_create(&c->threads[i], worker_thread, c) != 0) {
+                    avs2_mutex_lock(&c->task_lock);
+                    c->shutdown = 1;
+                    avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
+                    avs2_mutex_unlock(&c->task_lock);
+                    for (int j = 0; j < c->n_threads_active; j++) {
+                        avs2_thread_join(&c->threads[j], NULL);
+                    }
+                    avs2_mem_free(c->threads);
+                    c->threads = NULL;
+                    c->n_threads_active = 0;
+                    c->shutdown = 0;
+                    break;
+                }
+                c->n_threads_active++;
+            }
         }
     }
+threads_created:;
 
     c->i_prev_coi = -1;  /* 对应 davs2 davs2.cc:504 mgr->i_prev_coi = -1 */
 
     c->seq = avs2_mem_allocz(sizeof(avs2_seq_header));
     c->pic = avs2_mem_allocz(sizeof(avs2_pic_header));
     if (!c->seq || !c->pic) { avs2_close((avs2_ctx **)&c); return NULL; }
+
+    /* 预分配 DPB 帧结构 (avs2_frame), 避免解码过程中逐步分配.
+     * 帧数据 (data[]) 仍在 avs2_frame_alloc 时按需分配并池化复用.
+     * 容量 = n_fc + 参考帧数 + 2 余量, 覆盖稳态需求. */
+    {
+        int dpb_cap = c->n_fc + AVS2_MAX_REFS + 2;
+        if (dpb_cap > AVS2_MAX_FRAME_DELAY) dpb_cap = AVS2_MAX_FRAME_DELAY;
+        for (int i = 0; i < dpb_cap; i++) {
+            c->dpb[i] = avs2_mem_allocz(sizeof(avs2_frame));
+            if (!c->dpb[i]) { avs2_close((avs2_ctx **)&c); return NULL; }
+        }
+        c->n_dpb = dpb_cap;
+    }
 
     avs2_info(c, "avs2dec %s opened (%d threads, %d frame contexts, %d workers)\n",
               AVS2DEC_VERSION_STR, c->n_threads, c->n_fc, c->n_threads_active);
@@ -813,15 +1129,27 @@ void avs2_close(avs2_ctx **ctx)
         c->shutdown = 1;
         avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
         avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
+        avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
         avs2_mutex_unlock(&c->task_lock);
 
-        for (int i = 0; i < c->n_threads_active; i++) {
-            if (c->threads[i]) {
-                avs2_thread_join(&c->threads[i], NULL);
+        if (c->n_aec_threads > 0) {
+            /* 行级流水线模式: join AEC + 重建线程 */
+            for (int i = 0; i < c->n_aec_threads; i++)
+                avs2_thread_join(&c->aec_threads[i], NULL);
+            for (int i = 0; i < c->n_recon_threads; i++)
+                avs2_thread_join(&c->recon_threads[i], NULL);
+            avs2_mem_free(c->aec_threads); c->aec_threads = NULL;
+            avs2_mem_free(c->recon_threads); c->recon_threads = NULL;
+        } else {
+            /* 通用 worker 模式 */
+            for (int i = 0; i < c->n_threads_active; i++) {
+                if (c->threads[i]) {
+                    avs2_thread_join(&c->threads[i], NULL);
+                }
             }
+            avs2_mem_free(c->threads);
+            c->threads = NULL;
         }
-        avs2_mem_free(c->threads);
-        c->threads = NULL;
         c->n_threads_active = 0;
     }
 
@@ -829,6 +1157,7 @@ void avs2_close(avs2_ctx **ctx)
     avs2_mutex_destroy(&c->task_lock);
     avs2_cond_destroy(&c->task_cond);
     avs2_cond_destroy(&c->done_cond);
+    avs2_cond_destroy(&c->recon_cond);
 
     avs2_dpb_clear(c);
     for (int i = 0; i < c->n_dpb; i++)
@@ -836,17 +1165,12 @@ void avs2_close(avs2_ctx **ctx)
 
     for (int i = 0; i < c->n_fc; i++) {
         avs2_mutex_destroy(&c->fc[i].lock);
-        avs2_mem_free(c->fc[i].coeff_scratch_y);
-        avs2_mem_free(c->fc[i].coeff_scratch_u);
-        avs2_mem_free(c->fc[i].coeff_scratch_v);
+        /* coeff_scratch_y/u/v, row_aec_done/recon_done/lf_done, mv_row_range 为静态数组, 无需释放 */
         avs2_mem_free(c->fc[i].slice_buf);
-        /* 行级并行: 释放 per-LCU 系数缓冲区和 per-row 进度数组 */
+        /* 行级并行: 释放 per-LCU 系数缓冲区 */
         avs2_mem_free(c->fc[i].coeff_lcu_y);
         avs2_mem_free(c->fc[i].coeff_lcu_u);
         avs2_mem_free(c->fc[i].coeff_lcu_v);
-        avs2_mem_free((void *)c->fc[i].row_aec_done);
-        avs2_mem_free((void *)c->fc[i].row_recon_done);
-        avs2_mem_free((void *)c->fc[i].row_lf_done);
         /* LF 临时帧 (SAO/ALF 预分配复用) */
         avs2_lf_tmp_free(&c->fc[i]);
         /* 预分配的 AEC 上下文 */
@@ -904,26 +1228,14 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
 {
     struct avs2_internal *c = (struct avs2_internal *)ctx;
     if (!data) {
-        /* flush signal */
+        /* flush signal: 设置 flushing 标志, 然后处理缓冲区中剩余的帧.
+         * 不在此处解码 — 落入下面的通用帧提取循环处理. */
         c->flushing = 1;
-        /* decode any remaining buffered frame */
-        if (c->in_buf_sz > 0) {
-            /* 多线程: 选取空闲 fc */
-            if (c->n_threads_active > 0) {
-                if (c->cur_fc && c->cur_fc->task_state == 4) {
-                    c->cur_fc->task_state = 0;  /* 释放未提交的 reserved fc */
-                }
-                c->cur_fc = pick_idle_fc(c);
-            }
-            int r = avs2_decode_frame(c, c->in_buf, c->in_buf_sz);
-            c->in_buf_sz = 0;
-            if (r < 0) return r;
-        }
-        return AVS2_OK;
+    } else {
+        int r = append_input(c, data);
+        if (r) return r;
+        if (data->free_cb) data->free_cb(data->data, data->ref);
     }
-    int r = append_input(c, data);
-    if (r) return r;
-    if (data->free_cb) data->free_cb(data->data, data->ref);
 
     /* Try to extract and decode complete frames. */
     int scan = 0;
@@ -950,6 +1262,24 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
          * pass the whole prefix so headers are re-parsed. We decode from
          * the start of the buffer up to q. */
         int r2 = avs2_decode_frame(c, c->in_buf, q);
+        if (r2 == AVS2_ERR_NOMEM) {
+            /* DPB 满: 不消费比特流数据, 释放预留 fc.
+             * 等待 worker 完成帧后返回, 让调用者 avs2_get_picture 输出帧释放 DPB 空间.
+             * 避免 busy-spin: 阻塞等待 done_cond 而非空转轮询. */
+            if (c->n_threads_active > 0 && c->cur_fc && c->cur_fc->task_state == 4) {
+                c->cur_fc->task_state = 0;
+            }
+            if (c->n_threads_active > 0 && c->n_pending > 0) {
+                avs2_mutex_lock(&c->task_lock);
+                if (c->n_pending > 0) {
+                    c->n_waiters_done++;
+                    avs2_cond_wait(&c->done_cond, &c->task_lock);
+                    c->n_waiters_done--;
+                }
+                avs2_mutex_unlock(&c->task_lock);
+            }
+            return AVS2_OK;
+        }
         if (r2 < 0) {
             avs2_warn(c, "decode error: %d\n", r2);
         }

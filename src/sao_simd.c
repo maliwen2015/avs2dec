@@ -1,8 +1,8 @@
 /*
- * sao_simd.c - SAO SIMD 实现 (x86 AVX2)
+ * sao_simd.c - SAO SIMD 实现 (x86 SSE4.1)
  *
  * 当前实现:
- *   - AVX2: 10-bit EO_0(水平), EO_90(垂直), BO(带偏移)
+ *   - SSE4.1: 10-bit/8-bit EO_0(水平), EO_90(垂直), BO(带偏移)
  *   - EO_135, EO_45 保持 C 回退 (符号缓存行依赖复杂, 暂不实现 SIMD)
  *
  * 算法:
@@ -10,18 +10,18 @@
  *   BO (Band Offset): 按像素值右移分带 (32 带), 加对应偏移
  *
  * SIMD 要点:
- *   - 16 像素/寄存器 (__m256i = 16 x int16)
+ *   - 8 像素/寄存器 (__m128i = 8 x int16)
  *   - 符号计算: cmpgt + sub 组合得到 +1/0/-1
  *     sign(diff) = (zero>diff) - (diff>zero)  即 lt - gt
  *   - EO 偏移查表: 5 类比较选择 (cmpeq + and + or)
- *   - BO 偏移查表: cvtepi16_epi32 扩展 + i32gather_epi32 收集 32 带偏移
- *   - 32->16 压缩: packs_epi32 (有符号饱和) + permute4x64_epi64 通道重排
+ *   - BO 偏移查表: 标量提取索引 + 数组查表 + setr_epi16 组装
+ *     (SSE4.1 无 gather 指令, 用标量 gather 替代 AVX2 _mm256_i32gather_epi32)
  *   - 裁剪: max_epi16(>=0) + min_epi16(<=max_pel), 有符号比较
  *
  * 边界处理:
  *   - 帧数据有 padding (AVS2_PAD_LUMA>=64), 越界访问 padding 区域安全
  *   - 左右上下邻域可用性由 avail 数组控制循环起止位置
- *   - 不足 16 像素的尾部用标量处理
+ *   - 不足 8 像素的尾部用标量处理
  */
 
 #include "internal.h"
@@ -49,7 +49,8 @@ enum {
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
-#include <immintrin.h>
+#include <tmmintrin.h>
+#include <smmintrin.h>
 
 /* ===========================================================================
  * 辅助函数
@@ -60,12 +61,12 @@ enum {
  *   gt = (diff > 0) ? -1 : 0
  *   lt = (0 > diff) ? -1 : 0
  *   sign = lt - gt  =>  diff>0: 0-(-1)=+1, diff<0: -1-0=-1, diff==0: 0-0=0 */
-static inline __m256i sao_sign_epi16(__m256i diff)
+static inline __m128i sao_sign_epi16(__m128i diff)
 {
-    __m256i zero = _mm256_setzero_si256();
-    __m256i gt = _mm256_cmpgt_epi16(diff, zero);
-    __m256i lt = _mm256_cmpgt_epi16(zero, diff);
-    return _mm256_sub_epi16(lt, gt);
+    __m128i zero = _mm_setzero_si128();
+    __m128i gt = _mm_cmpgt_epi16(diff, zero);
+    __m128i lt = _mm_cmpgt_epi16(zero, diff);
+    return _mm_sub_epi16(lt, gt);
 }
 
 /* ===========================================================================
@@ -77,7 +78,7 @@ static inline __m256i sao_sign_epi16(__m256i diff)
  *   edge_type  = left_sign + right_sign + 2   (0..4)
  *   dst[x]     = clip(src[x] + offset[edge_type])
  * =========================================================================== */
-static void sao_eo_0_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
+static void sao_eo_0_sse4(uint8_t *_dst, int dst_stride, const uint8_t *_src,
                           int src_stride, int w, int h, int bit_depth,
                           const int *avail, const int *offset)
 {
@@ -91,68 +92,66 @@ static void sao_eo_0_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
     int ex = avail[sao_nb_r] ? w : (w - 1);
     int y;
 
-    __m256i v_zero = _mm256_setzero_si256();
-    __m256i v_max  = _mm256_set1_epi16((short)max_pel);
-    __m256i v_two  = _mm256_set1_epi16(2);
+    __m128i v_zero = _mm_setzero_si128();
+    __m128i v_max  = _mm_set1_epi16((short)max_pel);
+    __m128i v_two  = _mm_set1_epi16(2);
 
     /* EO 偏移广播 (5 类, edge_type 0..4) */
-    __m256i v_off0 = _mm256_set1_epi16((short)offset[0]);
-    __m256i v_off1 = _mm256_set1_epi16((short)offset[1]);
-    __m256i v_off2 = _mm256_set1_epi16((short)offset[2]);
-    __m256i v_off3 = _mm256_set1_epi16((short)offset[3]);
-    __m256i v_off4 = _mm256_set1_epi16((short)offset[4]);
-    __m256i v_et1  = _mm256_set1_epi16(1);
-    __m256i v_et2  = _mm256_set1_epi16(2);
-    __m256i v_et3  = _mm256_set1_epi16(3);
-    __m256i v_et4  = _mm256_set1_epi16(4);
+    __m128i v_off0 = _mm_set1_epi16((short)offset[0]);
+    __m128i v_off1 = _mm_set1_epi16((short)offset[1]);
+    __m128i v_off2 = _mm_set1_epi16((short)offset[2]);
+    __m128i v_off3 = _mm_set1_epi16((short)offset[3]);
+    __m128i v_off4 = _mm_set1_epi16((short)offset[4]);
+    __m128i v_et1  = _mm_set1_epi16(1);
+    __m128i v_et2  = _mm_set1_epi16(2);
+    __m128i v_et3  = _mm_set1_epi16(3);
+    __m128i v_et4  = _mm_set1_epi16(4);
 
     for (y = 0; y < h; y++) {
         int x = sx;
 
-        /* SIMD 主循环: 每次 16 像素 */
-        for (; x + 16 <= ex; x += 16) {
-            __m256i v_left, v_center, v_right;
+        /* SIMD 主循环: 每次 8 像素 */
+        for (; x + 8 <= ex; x += 8) {
+            __m128i v_left, v_center, v_right;
             if (is_8bit) {
-                /* 8-bit: 加载 16 字节 → 扩展为 16 个 uint16 */
-                v_left   = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(src8 + x - 1)));
-                v_center = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(src8 + x)));
-                v_right  = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(src8 + x + 1)));
+                /* 8-bit: 加载 8 字节 → 扩展为 8 个 uint16 */
+                v_left   = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(src8 + x - 1)));
+                v_center = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(src8 + x)));
+                v_right  = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(src8 + x + 1)));
             } else {
-                v_left   = _mm256_loadu_si256((const __m256i *)(src + x - 1));
-                v_center = _mm256_loadu_si256((const __m256i *)(src + x));
-                v_right  = _mm256_loadu_si256((const __m256i *)(src + x + 1));
+                v_left   = _mm_loadu_si128((const __m128i *)(src + x - 1));
+                v_center = _mm_loadu_si128((const __m128i *)(src + x));
+                v_right  = _mm_loadu_si128((const __m128i *)(src + x + 1));
             }
 
-            __m256i left_sign  = sao_sign_epi16(_mm256_sub_epi16(v_center, v_left));
-            __m256i right_sign = sao_sign_epi16(_mm256_sub_epi16(v_center, v_right));
+            __m128i left_sign  = sao_sign_epi16(_mm_sub_epi16(v_center, v_left));
+            __m128i right_sign = sao_sign_epi16(_mm_sub_epi16(v_center, v_right));
 
-            __m256i edge_type = _mm256_add_epi16(
-                _mm256_add_epi16(left_sign, right_sign), v_two);
+            __m128i edge_type = _mm_add_epi16(
+                _mm_add_epi16(left_sign, right_sign), v_two);
 
             /* 按 edge_type 查找偏移量 (0..4) */
-            __m256i v_off = _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_zero), v_off0);
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et1), v_off1));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et2), v_off2));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et3), v_off3));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et4), v_off4));
+            __m128i v_off = _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_zero), v_off0);
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et1), v_off1));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et2), v_off2));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et3), v_off3));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et4), v_off4));
 
-            __m256i v_result = _mm256_add_epi16(v_center, v_off);
-            v_result = _mm256_max_epi16(v_result, v_zero);
-            v_result = _mm256_min_epi16(v_result, v_max);
+            __m128i v_result = _mm_add_epi16(v_center, v_off);
+            v_result = _mm_max_epi16(v_result, v_zero);
+            v_result = _mm_min_epi16(v_result, v_max);
 
             if (is_8bit) {
-                /* 8-bit: packus 压缩 16 个 uint16 → 16 字节, 存 128 位 */
-                __m256i packed = _mm256_permute4x64_epi64(
-                    _mm256_packus_epi16(v_result, v_zero), 0xD8);
-                _mm_storeu_si128((__m128i *)(dst8 + x),
-                                 _mm256_castsi256_si128(packed));
+                /* 8-bit: packus 压缩 8 个 uint16 → 8 字节, 存 64 位 */
+                __m128i packed = _mm_packus_epi16(v_result, v_zero);
+                _mm_storel_epi64((__m128i *)(dst8 + x), packed);
             } else {
-                _mm256_storeu_si256((__m256i *)(dst + x), v_result);
+                _mm_storeu_si128((__m128i *)(dst + x), v_result);
             }
         }
 
@@ -185,12 +184,8 @@ static void sao_eo_0_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
  *   bottom_sign = sign(src[y] - src[y+1])
  *   edge_type   = top_sign + bottom_sign + 2   (0..4)
  *   dst[y]      = clip(src[y] + offset[edge_type])
- *
- * 注: C 代码按列遍历 (x 外层, y 内层) 利用 left_sign 传递优化,
- *     SIMD 改为按行遍历 (y 外层, x 内层), 每像素独立计算 top/bottom sign,
- *     结果等价 (left_sign 传递 = sign(src[y]-src[y-1]) 的展开形式).
  * =========================================================================== */
-static void sao_eo_90_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
+static void sao_eo_90_sse4(uint8_t *_dst, int dst_stride, const uint8_t *_src,
                            int src_stride, int w, int h, int bit_depth,
                            const int *avail, const int *offset)
 {
@@ -204,19 +199,19 @@ static void sao_eo_90_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
     int ey = avail[sao_nb_d] ? h : (h - 1);
     int y;
 
-    __m256i v_zero = _mm256_setzero_si256();
-    __m256i v_max  = _mm256_set1_epi16((short)max_pel);
-    __m256i v_two  = _mm256_set1_epi16(2);
+    __m128i v_zero = _mm_setzero_si128();
+    __m128i v_max  = _mm_set1_epi16((short)max_pel);
+    __m128i v_two  = _mm_set1_epi16(2);
 
-    __m256i v_off0 = _mm256_set1_epi16((short)offset[0]);
-    __m256i v_off1 = _mm256_set1_epi16((short)offset[1]);
-    __m256i v_off2 = _mm256_set1_epi16((short)offset[2]);
-    __m256i v_off3 = _mm256_set1_epi16((short)offset[3]);
-    __m256i v_off4 = _mm256_set1_epi16((short)offset[4]);
-    __m256i v_et1  = _mm256_set1_epi16(1);
-    __m256i v_et2  = _mm256_set1_epi16(2);
-    __m256i v_et3  = _mm256_set1_epi16(3);
-    __m256i v_et4  = _mm256_set1_epi16(4);
+    __m128i v_off0 = _mm_set1_epi16((short)offset[0]);
+    __m128i v_off1 = _mm_set1_epi16((short)offset[1]);
+    __m128i v_off2 = _mm_set1_epi16((short)offset[2]);
+    __m128i v_off3 = _mm_set1_epi16((short)offset[3]);
+    __m128i v_off4 = _mm_set1_epi16((short)offset[4]);
+    __m128i v_et1  = _mm_set1_epi16(1);
+    __m128i v_et2  = _mm_set1_epi16(2);
+    __m128i v_et3  = _mm_set1_epi16(3);
+    __m128i v_et4  = _mm_set1_epi16(4);
 
     for (y = sy; y < ey; y++) {
         const uint8_t  *row_top8, *row_center8, *row_bottom8;
@@ -237,47 +232,45 @@ static void sao_eo_90_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
             row_dst    = dst + y * dst_stride;
         }
 
-        /* SIMD 主循环: 每次 16 像素 */
-        for (; x + 16 <= w; x += 16) {
-            __m256i v_top, v_center, v_bottom;
+        /* SIMD 主循环: 每次 8 像素 */
+        for (; x + 8 <= w; x += 8) {
+            __m128i v_top, v_center, v_bottom;
             if (is_8bit) {
-                v_top    = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(row_top8 + x)));
-                v_center = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(row_center8 + x)));
-                v_bottom = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(row_bottom8 + x)));
+                v_top    = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(row_top8 + x)));
+                v_center = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(row_center8 + x)));
+                v_bottom = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(row_bottom8 + x)));
             } else {
-                v_top    = _mm256_loadu_si256((const __m256i *)(row_top + x));
-                v_center = _mm256_loadu_si256((const __m256i *)(row_center + x));
-                v_bottom = _mm256_loadu_si256((const __m256i *)(row_bottom + x));
+                v_top    = _mm_loadu_si128((const __m128i *)(row_top + x));
+                v_center = _mm_loadu_si128((const __m128i *)(row_center + x));
+                v_bottom = _mm_loadu_si128((const __m128i *)(row_bottom + x));
             }
 
-            __m256i top_sign    = sao_sign_epi16(_mm256_sub_epi16(v_center, v_top));
-            __m256i bottom_sign = sao_sign_epi16(_mm256_sub_epi16(v_center, v_bottom));
+            __m128i top_sign    = sao_sign_epi16(_mm_sub_epi16(v_center, v_top));
+            __m128i bottom_sign = sao_sign_epi16(_mm_sub_epi16(v_center, v_bottom));
 
-            __m256i edge_type = _mm256_add_epi16(
-                _mm256_add_epi16(top_sign, bottom_sign), v_two);
+            __m128i edge_type = _mm_add_epi16(
+                _mm_add_epi16(top_sign, bottom_sign), v_two);
 
-            __m256i v_off = _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_zero), v_off0);
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et1), v_off1));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et2), v_off2));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et3), v_off3));
-            v_off = _mm256_or_si256(v_off, _mm256_and_si256(
-                _mm256_cmpeq_epi16(edge_type, v_et4), v_off4));
+            __m128i v_off = _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_zero), v_off0);
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et1), v_off1));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et2), v_off2));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et3), v_off3));
+            v_off = _mm_or_si128(v_off, _mm_and_si128(
+                _mm_cmpeq_epi16(edge_type, v_et4), v_off4));
 
-            __m256i v_result = _mm256_add_epi16(v_center, v_off);
-            v_result = _mm256_max_epi16(v_result, v_zero);
-            v_result = _mm256_min_epi16(v_result, v_max);
+            __m128i v_result = _mm_add_epi16(v_center, v_off);
+            v_result = _mm_max_epi16(v_result, v_zero);
+            v_result = _mm_min_epi16(v_result, v_max);
 
             if (is_8bit) {
-                __m256i packed = _mm256_permute4x64_epi64(
-                    _mm256_packus_epi16(v_result, v_zero), 0xD8);
-                _mm_storeu_si128((__m128i *)(row_dst8 + x),
-                                 _mm256_castsi256_si128(packed));
+                __m128i packed = _mm_packus_epi16(v_result, v_zero);
+                _mm_storel_epi64((__m128i *)(row_dst8 + x), packed);
             } else {
-                _mm256_storeu_si256((__m256i *)(row_dst + x), v_result);
+                _mm_storeu_si128((__m128i *)(row_dst + x), v_result);
             }
         }
 
@@ -300,22 +293,346 @@ static void sao_eo_90_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
 }
 
 /* ===========================================================================
+ * EO_135: 135 度对角方向 (左上-右下邻居)
+ *
+ * 算法: edge_type = sign(c-tl) + sign(c-dr) + 2, dst = clip(c + offset[et])
+ *   tl = src[y-stride-1] (左上), dr = src[y+stride+1] (右下)
+ *
+ * 边界处理: 首尾行有角落像素 (TL/DR) 可用性问题, 用标量处理.
+ *   内部 LCU (avail 全 1): 所有行用 SIMD.
+ *   边界 LCU: 首尾行用标量, 中间行用 SIMD.
+ * =========================================================================== */
+static void sao_eo_135_sse4(uint8_t *_dst, int dst_stride, const uint8_t *_src,
+                            int src_stride, int w, int h, int bit_depth,
+                            const int *avail, const int *offset)
+{
+    int is_8bit = (bit_depth <= 8);
+    uint8_t *dst8 = (uint8_t *)_dst;
+    const uint8_t *src8 = (const uint8_t *)_src;
+    uint16_t *dst = (uint16_t *)_dst;
+    const uint16_t *src = (const uint16_t *)_src;
+    const int max_pel = (1 << bit_depth) - 1;
+    int sx = avail[sao_nb_l] ? 0 : 1;
+    int ex = avail[sao_nb_r] ? w : (w - 1);
+    int y;
+
+    __m128i v_zero = _mm_setzero_si128();
+    __m128i v_max  = _mm_set1_epi16((short)max_pel);
+    __m128i v_two  = _mm_set1_epi16(2);
+    __m128i v_off0 = _mm_set1_epi16((short)offset[0]);
+    __m128i v_off1 = _mm_set1_epi16((short)offset[1]);
+    __m128i v_off2 = _mm_set1_epi16((short)offset[2]);
+    __m128i v_off3 = _mm_set1_epi16((short)offset[3]);
+    __m128i v_off4 = _mm_set1_epi16((short)offset[4]);
+    __m128i v_et1  = _mm_set1_epi16(1);
+    __m128i v_et2  = _mm_set1_epi16(2);
+    __m128i v_et3  = _mm_set1_epi16(3);
+    __m128i v_et4  = _mm_set1_epi16(4);
+
+    /* 首行: 标量处理 (角落 TL/DR 可用性不同) */
+    if (avail[sao_nb_t]) {
+        int sx0 = avail[sao_nb_tl] ? 0 : 1;
+        int ex0 = ex;
+        int x;
+        y = 0;
+        if (is_8bit) {
+            const uint8_t *rc = src8 + y * src_stride;
+            uint8_t *rd = dst8 + y * dst_stride;
+            for (x = sx0; x < ex0; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x - 1];
+                int pd_d = c - rc[src_stride + x + 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        } else {
+            const uint16_t *rc = src + y * src_stride;
+            uint16_t *rd = dst + y * dst_stride;
+            for (x = sx0; x < ex0; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x - 1];
+                int pd_d = c - rc[src_stride + x + 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        }
+    }
+
+    /* 中间行: SIMD 处理 */
+    {
+        int sy_mid = avail[sao_nb_t] ? 1 : 1;
+        int ey_mid = avail[sao_nb_d] ? (h - 1) : (h - 1);
+        for (y = sy_mid; y < ey_mid; y++) {
+            int x = sx;
+            if (is_8bit) {
+                const uint8_t *rc = src8 + y * src_stride;
+                const uint8_t *rtl = rc - src_stride - 1;
+                const uint8_t *rdr = rc + src_stride + 1;
+                uint8_t *rd = dst8 + y * dst_stride;
+                for (; x + 8 <= ex; x += 8) {
+                    __m128i vc = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rc + x)));
+                    __m128i vtl = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rtl + x)));
+                    __m128i vdr = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rdr + x)));
+                    __m128i ts = sao_sign_epi16(_mm_sub_epi16(vc, vtl));
+                    __m128i ds = sao_sign_epi16(_mm_sub_epi16(vc, vdr));
+                    __m128i et = _mm_add_epi16(_mm_add_epi16(ts, ds), v_two);
+                    __m128i vo = _mm_and_si128(_mm_cmpeq_epi16(et, v_zero), v_off0);
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et1), v_off1));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et2), v_off2));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et3), v_off3));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et4), v_off4));
+                    __m128i vr = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(vc, vo), v_zero), v_max);
+                    _mm_storel_epi64((__m128i*)(rd + x), _mm_packus_epi16(vr, v_zero));
+                }
+                for (; x < ex; x++) {
+                    int c = rc[x], pd_t = c - rtl[x], pd_d = c - rdr[x];
+                    int ts2 = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                    int ds2 = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                    int et2 = ts2 + ds2 + 2;
+                    rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et2]);
+                }
+            } else {
+                const uint16_t *rc = src + y * src_stride;
+                const uint16_t *rtl = rc - src_stride - 1;
+                const uint16_t *rdr = rc + src_stride + 1;
+                uint16_t *rd = dst + y * dst_stride;
+                for (; x + 8 <= ex; x += 8) {
+                    __m128i vc = _mm_loadu_si128((const __m128i*)(rc + x));
+                    __m128i vtl = _mm_loadu_si128((const __m128i*)(rtl + x));
+                    __m128i vdr = _mm_loadu_si128((const __m128i*)(rdr + x));
+                    __m128i ts = sao_sign_epi16(_mm_sub_epi16(vc, vtl));
+                    __m128i ds = sao_sign_epi16(_mm_sub_epi16(vc, vdr));
+                    __m128i et = _mm_add_epi16(_mm_add_epi16(ts, ds), v_two);
+                    __m128i vo = _mm_and_si128(_mm_cmpeq_epi16(et, v_zero), v_off0);
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et1), v_off1));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et2), v_off2));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et3), v_off3));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et4), v_off4));
+                    __m128i vr = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(vc, vo), v_zero), v_max);
+                    _mm_storeu_si128((__m128i*)(rd + x), vr);
+                }
+                for (; x < ex; x++) {
+                    int c = rc[x], pd_t = c - rtl[x], pd_d = c - rdr[x];
+                    int ts2 = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                    int ds2 = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                    int et2 = ts2 + ds2 + 2;
+                    rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et2]);
+                }
+            }
+        }
+    }
+
+    /* 末行: 标量处理 */
+    if (avail[sao_nb_d]) {
+        int sxn = avail[sao_nb_l] ? 0 : 1;
+        int exn = avail[sao_nb_dr] ? w : (w - 1);
+        int x;
+        y = h - 1;
+        if (is_8bit) {
+            const uint8_t *rc = src8 + y * src_stride;
+            uint8_t *rd = dst8 + y * dst_stride;
+            for (x = sxn; x < exn; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x - 1];
+                int pd_d = c - rc[src_stride + x + 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        } else {
+            const uint16_t *rc = src + y * src_stride;
+            uint16_t *rd = dst + y * dst_stride;
+            for (x = sxn; x < exn; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x - 1];
+                int pd_d = c - rc[src_stride + x + 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        }
+    }
+}
+
+/* ===========================================================================
+ * EO_45: 45 度对角方向 (右上-左下邻居)
+ *
+ * 算法: edge_type = sign(c-tr) + sign(c-dl) + 2, dst = clip(c + offset[et])
+ *   tr = src[y-stride+1] (右上), dl = src[y+stride-1] (左下)
+ *
+ * 边界处理: 首尾行有角落像素 (TR/DL) 可用性问题, 用标量处理.
+ * =========================================================================== */
+static void sao_eo_45_sse4(uint8_t *_dst, int dst_stride, const uint8_t *_src,
+                           int src_stride, int w, int h, int bit_depth,
+                           const int *avail, const int *offset)
+{
+    int is_8bit = (bit_depth <= 8);
+    uint8_t *dst8 = (uint8_t *)_dst;
+    const uint8_t *src8 = (const uint8_t *)_src;
+    uint16_t *dst = (uint16_t *)_dst;
+    const uint16_t *src = (const uint16_t *)_src;
+    const int max_pel = (1 << bit_depth) - 1;
+    int sx = avail[sao_nb_l] ? 0 : 1;
+    int ex = avail[sao_nb_r] ? w : (w - 1);
+    int y;
+
+    __m128i v_zero = _mm_setzero_si128();
+    __m128i v_max  = _mm_set1_epi16((short)max_pel);
+    __m128i v_two  = _mm_set1_epi16(2);
+    __m128i v_off0 = _mm_set1_epi16((short)offset[0]);
+    __m128i v_off1 = _mm_set1_epi16((short)offset[1]);
+    __m128i v_off2 = _mm_set1_epi16((short)offset[2]);
+    __m128i v_off3 = _mm_set1_epi16((short)offset[3]);
+    __m128i v_off4 = _mm_set1_epi16((short)offset[4]);
+    __m128i v_et1  = _mm_set1_epi16(1);
+    __m128i v_et2  = _mm_set1_epi16(2);
+    __m128i v_et3  = _mm_set1_epi16(3);
+    __m128i v_et4  = _mm_set1_epi16(4);
+
+    /* 首行: 标量处理 */
+    if (avail[sao_nb_t]) {
+        int sx0 = sx;
+        int ex0 = avail[sao_nb_tr] ? w : (w - 1);
+        int x;
+        y = 0;
+        if (is_8bit) {
+            const uint8_t *rc = src8 + y * src_stride;
+            uint8_t *rd = dst8 + y * dst_stride;
+            for (x = sx0; x < ex0; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x + 1];
+                int pd_d = c - rc[src_stride + x - 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        } else {
+            const uint16_t *rc = src + y * src_stride;
+            uint16_t *rd = dst + y * dst_stride;
+            for (x = sx0; x < ex0; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x + 1];
+                int pd_d = c - rc[src_stride + x - 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        }
+    }
+
+    /* 中间行: SIMD 处理 */
+    {
+        int sy_mid = avail[sao_nb_t] ? 1 : 1;
+        int ey_mid = avail[sao_nb_d] ? (h - 1) : (h - 1);
+        for (y = sy_mid; y < ey_mid; y++) {
+            int x = sx;
+            if (is_8bit) {
+                const uint8_t *rc = src8 + y * src_stride;
+                const uint8_t *rtr = rc - src_stride + 1;
+                const uint8_t *rdl = rc + src_stride - 1;
+                uint8_t *rd = dst8 + y * dst_stride;
+                for (; x + 8 <= ex; x += 8) {
+                    __m128i vc = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rc + x)));
+                    __m128i vtr = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rtr + x)));
+                    __m128i vdl = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(rdl + x)));
+                    __m128i ts = sao_sign_epi16(_mm_sub_epi16(vc, vtr));
+                    __m128i ds = sao_sign_epi16(_mm_sub_epi16(vc, vdl));
+                    __m128i et = _mm_add_epi16(_mm_add_epi16(ts, ds), v_two);
+                    __m128i vo = _mm_and_si128(_mm_cmpeq_epi16(et, v_zero), v_off0);
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et1), v_off1));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et2), v_off2));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et3), v_off3));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et4), v_off4));
+                    __m128i vr = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(vc, vo), v_zero), v_max);
+                    _mm_storel_epi64((__m128i*)(rd + x), _mm_packus_epi16(vr, v_zero));
+                }
+                for (; x < ex; x++) {
+                    int c = rc[x], pd_t = c - rtr[x], pd_d = c - rdl[x];
+                    int ts2 = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                    int ds2 = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                    int et2 = ts2 + ds2 + 2;
+                    rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et2]);
+                }
+            } else {
+                const uint16_t *rc = src + y * src_stride;
+                const uint16_t *rtr = rc - src_stride + 1;
+                const uint16_t *rdl = rc + src_stride - 1;
+                uint16_t *rd = dst + y * dst_stride;
+                for (; x + 8 <= ex; x += 8) {
+                    __m128i vc = _mm_loadu_si128((const __m128i*)(rc + x));
+                    __m128i vtr = _mm_loadu_si128((const __m128i*)(rtr + x));
+                    __m128i vdl = _mm_loadu_si128((const __m128i*)(rdl + x));
+                    __m128i ts = sao_sign_epi16(_mm_sub_epi16(vc, vtr));
+                    __m128i ds = sao_sign_epi16(_mm_sub_epi16(vc, vdl));
+                    __m128i et = _mm_add_epi16(_mm_add_epi16(ts, ds), v_two);
+                    __m128i vo = _mm_and_si128(_mm_cmpeq_epi16(et, v_zero), v_off0);
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et1), v_off1));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et2), v_off2));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et3), v_off3));
+                    vo = _mm_or_si128(vo, _mm_and_si128(_mm_cmpeq_epi16(et, v_et4), v_off4));
+                    __m128i vr = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(vc, vo), v_zero), v_max);
+                    _mm_storeu_si128((__m128i*)(rd + x), vr);
+                }
+                for (; x < ex; x++) {
+                    int c = rc[x], pd_t = c - rtr[x], pd_d = c - rdl[x];
+                    int ts2 = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                    int ds2 = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                    int et2 = ts2 + ds2 + 2;
+                    rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et2]);
+                }
+            }
+        }
+    }
+
+    /* 末行: 标量处理 */
+    if (avail[sao_nb_d]) {
+        int sxn = avail[sao_nb_dl] ? 0 : 1;
+        int exn = ex;
+        int x;
+        y = h - 1;
+        if (is_8bit) {
+            const uint8_t *rc = src8 + y * src_stride;
+            uint8_t *rd = dst8 + y * dst_stride;
+            for (x = sxn; x < exn; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x + 1];
+                int pd_d = c - rc[src_stride + x - 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint8_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        } else {
+            const uint16_t *rc = src + y * src_stride;
+            uint16_t *rd = dst + y * dst_stride;
+            for (x = sxn; x < exn; x++) {
+                int c = rc[x], pd_t = c - rc[-src_stride + x + 1];
+                int pd_d = c - rc[src_stride + x - 1];
+                int ts = (pd_t > 0) ? 1 : ((pd_t < 0) ? -1 : 0);
+                int ds = (pd_d > 0) ? 1 : ((pd_d < 0) ? -1 : 0);
+                int et = ts + ds + 2;
+                rd[x] = (uint16_t)AVS2_CLIP3(0, max_pel, c + offset[et]);
+            }
+        }
+    }
+}
+
+/* ===========================================================================
  * BO: 带偏移 (32 带)
  *
  * 对每个像素:
  *   edge_type = src[x] >> band_shift   (band_shift = bit_depth - 5)
  *   dst[x]    = clip(src[x] + offset[edge_type])
  *
- * SIMD 流程:
- *   1. 加载 16 个 uint16
- *   2. 拆分为两个 128-bit, 各扩展为 32-bit (cvtepi16_epi32)
- *   3. 算术右移 band_shift 得到带索引 (值非负, 等价逻辑右移)
- *   4. i32gather_epi32 收集 32 带偏移
- *   5. packs_epi32 压缩回 16-bit (有符号饱和, SAO 偏移在 int16 范围内)
- *   6. permute4x64_epi64(0xD8) 修正 packs 的 128-bit 通道交错
- *   7. 加偏移并裁剪
+ * SSE4.1 SIMD 流程 (8 像素/次):
+ *   1. 加载 8 个 uint16
+ *   2. 算术右移 band_shift 得到带索引 (0..31, 值非负)
+ *   3. 标量 gather: 逐个提取索引查表 (SSE4.1 无 gather 指令)
+ *   4. 用 _mm_setr_epi16 组装偏移向量
+ *   5. 加偏移并裁剪
  * =========================================================================== */
-static void sao_bo_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
+static void sao_bo_sse4(uint8_t *_dst, int dst_stride, const uint8_t *_src,
                         int src_stride, int w, int h, int bit_depth,
                         const int *offset)
 {
@@ -328,54 +645,48 @@ static void sao_bo_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
     const int band_shift = bit_depth - NUM_SAO_BO_CLASSES_IN_BIT;
     int y;
 
-    __m256i v_zero = _mm256_setzero_si256();
-    __m256i v_max  = _mm256_set1_epi16((short)max_pel);
+    __m128i v_zero = _mm_setzero_si128();
+    __m128i v_max  = _mm_set1_epi16((short)max_pel);
 
     for (y = 0; y < h; y++) {
         int x = 0;
 
-        /* SIMD 主循环: 每次 16 像素 */
-        for (; x + 16 <= w; x += 16) {
-            __m256i v_src;
+        /* SIMD 主循环: 每次 8 像素 */
+        for (; x + 8 <= w; x += 8) {
+            __m128i v_src;
             if (is_8bit) {
-                /* 8-bit: 加载 16 字节 → 扩展为 16 个 uint16 */
-                v_src = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(src8 + x)));
+                /* 8-bit: 加载 8 字节 → 扩展为 8 个 uint16 */
+                v_src = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(src8 + x)));
             } else {
-                v_src = _mm256_loadu_si256((const __m256i *)(src + x));
+                v_src = _mm_loadu_si128((const __m128i *)(src + x));
             }
 
-            /* 拆分为两个 128-bit (各 8 像素), 扩展为 32-bit 以便 gather */
-            __m128i v_lo16 = _mm256_castsi256_si128(v_src);
-            __m128i v_hi16 = _mm256_extracti128_si256(v_src, 1);
-
-            __m256i v_idx_lo = _mm256_cvtepi16_epi32(v_lo16);
-            __m256i v_idx_hi = _mm256_cvtepi16_epi32(v_hi16);
-
             /* 计算带索引 (像素值非负, 算术右移 = 逻辑右移) */
-            v_idx_lo = _mm256_srai_epi32(v_idx_lo, band_shift);
-            v_idx_hi = _mm256_srai_epi32(v_idx_hi, band_shift);
+            __m128i v_idx = _mm_srai_epi16(v_src, band_shift);
 
-            /* 收集偏移量 (32 带, scale=sizeof(int)=4) */
-            __m256i v_off_lo = _mm256_i32gather_epi32(offset, v_idx_lo, sizeof(int));
-            __m256i v_off_hi = _mm256_i32gather_epi32(offset, v_idx_hi, sizeof(int));
-
-            /* 压缩回 16-bit (有符号饱和) + 通道重排 */
-            __m256i v_off16 = _mm256_packs_epi32(v_off_lo, v_off_hi);
-            v_off16 = _mm256_permute4x64_epi64(v_off16, 0xD8);
+            /* 标量 gather: 逐个提取索引查表, 组装为偏移向量 */
+            __m128i v_off = _mm_setr_epi16(
+                (short)offset[_mm_extract_epi16(v_idx, 0)],
+                (short)offset[_mm_extract_epi16(v_idx, 1)],
+                (short)offset[_mm_extract_epi16(v_idx, 2)],
+                (short)offset[_mm_extract_epi16(v_idx, 3)],
+                (short)offset[_mm_extract_epi16(v_idx, 4)],
+                (short)offset[_mm_extract_epi16(v_idx, 5)],
+                (short)offset[_mm_extract_epi16(v_idx, 6)],
+                (short)offset[_mm_extract_epi16(v_idx, 7)]
+            );
 
             /* 加偏移并裁剪 */
-            __m256i v_result = _mm256_add_epi16(v_src, v_off16);
-            v_result = _mm256_max_epi16(v_result, v_zero);
-            v_result = _mm256_min_epi16(v_result, v_max);
+            __m128i v_result = _mm_add_epi16(v_src, v_off);
+            v_result = _mm_max_epi16(v_result, v_zero);
+            v_result = _mm_min_epi16(v_result, v_max);
 
             if (is_8bit) {
-                /* 8-bit: packus 压缩 16 个 uint16 → 16 字节, 存 128 位 */
-                __m256i packed = _mm256_permute4x64_epi64(
-                    _mm256_packus_epi16(v_result, v_zero), 0xD8);
-                _mm_storeu_si128((__m128i *)(dst8 + x),
-                                 _mm256_castsi256_si128(packed));
+                /* 8-bit: packus 压缩 8 个 uint16 → 8 字节, 存 64 位 */
+                __m128i packed = _mm_packus_epi16(v_result, v_zero);
+                _mm_storel_epi64((__m128i *)(dst8 + x), packed);
             } else {
-                _mm256_storeu_si256((__m256i *)(dst + x), v_result);
+                _mm_storeu_si128((__m128i *)(dst + x), v_result);
             }
         }
 
@@ -398,20 +709,21 @@ static void sao_bo_avx2(uint8_t *_dst, int dst_stride, const uint8_t *_src,
  * 注册函数
  * =========================================================================== */
 
-/* SSE4.1: 暂用 C 回退 */
+/* SSE4.1: 注册全部 SAO 函数 (EO_0, EO_90, EO_135, EO_45, BO) */
 void avs2_sao_init_sse41(const avs2_cpu_flags *flags)
 {
     UNUSED_PARAMETER(flags);
+    avs2_dsp_table.sao_eo[0] = sao_eo_0_sse4;
+    avs2_dsp_table.sao_eo[1] = sao_eo_90_sse4;
+    avs2_dsp_table.sao_eo[2] = sao_eo_135_sse4;
+    avs2_dsp_table.sao_eo[3] = sao_eo_45_sse4;
+    avs2_dsp_table.sao_bo   = sao_bo_sse4;
 }
 
-/* AVX2: 注册 EO_0, EO_90, BO (EO_135/EO_45 保持 C 回退) */
+/* AVX2: 已清空 (降级为 SSE4.1) */
 void avs2_sao_init_avx2(const avs2_cpu_flags *flags)
 {
     UNUSED_PARAMETER(flags);
-    avs2_dsp_table.sao_eo[0] = sao_eo_0_avx2;
-    avs2_dsp_table.sao_eo[1] = sao_eo_90_avx2;
-    /* sao_eo[2] (EO_135) 和 sao_eo[3] (EO_45) 保持 C 实现 */
-    avs2_dsp_table.sao_bo   = sao_bo_avx2;
 }
 
 #else /* 非 x86 平台 */

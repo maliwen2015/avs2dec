@@ -10,6 +10,7 @@ typedef struct avs2_output {
     int is_y4m;
     int frame_written;
     int width, height, bit_depth, chroma_format;
+    int force_8bit;  /* 1 = 将 10-bit 解码输出降为 8-bit (逐像素 >>2) */
 } avs2_output;
 
 int avs2_output_open(avs2_output *out, const char *path, int is_y4m);

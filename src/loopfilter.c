@@ -16,7 +16,6 @@
 #include "quant.h"
 #include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
 
 /* 辅助宏 (本文件局部使用) */
 #ifndef AVS2_MIN
@@ -456,7 +455,10 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
         const int byte_stride_c = (int)f->stride[1];
         const int stride    = byte_stride / bps;     /* 元素步长 */
         const int stride_c  = byte_stride_c / bps;
-        const int shift = c->bit_depth - 8;
+        /* qp_shift: 码流中 QP 包含 8*(bit_depth-8) 的偏移, 需减回后查表.
+         * val_shift: alpha/beta 表是 8-bit, 需左移到当前位深. */
+        const int qp_shift  = c->bit_depth - 8;
+        const int val_shift = c->bit_depth - 8;
         avs2_cu *scu_p = (dir) ? (scu_q - w_in_scu) : (scu_q - 1);
         uint8_t b_filter_flag[2];
         int qp;
@@ -486,9 +488,9 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
 
             /* 10/12-bit 时 QP 已在配置中加 8*(bit_depth-8), 此处减回 */
             alpha = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                          qp - (shift << 3) + fc->pic_local.alpha_offset)] << shift;
+                                          qp - (qp_shift << 3) + fc->pic_local.alpha_offset)] << val_shift;
             beta  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                          qp - (shift << 3) + fc->pic_local.beta_offset)] << shift;
+                                          qp - (qp_shift << 3) + fc->pic_local.beta_offset)] << val_shift;
 
             avs2_dsp_table.deblock_luma[dir](src_y, stride, alpha, beta,
                                              b_filter_flag, c->bit_depth);
@@ -506,11 +508,11 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
                               : fc->pic_local.chroma_quant_param_delta_cb;
                 int alpha, beta;
 
-                qp = avs2_chroma_qp(qp, delta_cb, c->bit_depth) - (shift << 3);
+                qp = avs2_chroma_qp(qp, delta_cb, c->bit_depth) - (qp_shift << 3);
                 alpha = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                              qp + fc->pic_local.alpha_offset)] << shift;
+                                              qp + fc->pic_local.alpha_offset)] << val_shift;
                 beta  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                              qp + fc->pic_local.beta_offset)] << shift;
+                                              qp + fc->pic_local.beta_offset)] << val_shift;
 
                 avs2_dsp_table.deblock_chroma[dir](src_u, src_v, stride_c,
                                                    alpha, beta, b_filter_flag,

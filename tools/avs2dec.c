@@ -13,9 +13,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* 测试用: 禁用 SIMD 的全局开关 (定义在 lf_apply.c) */
 extern int g_disable_simd;
+
+/* 逐帧 FNV-1a 64位哈希 (用于定位 pipeline 首个出错帧) */
+static uint64_t fnv1a_frame_hash(const avs2_picture *pic)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (int p = 0; p < 3; p++) {
+        const uint8_t *d = pic->data[p];
+        ptrdiff_t stride = pic->stride[p];
+        int w = pic->width[p];
+        int h = pic->height[p];
+        int bps = pic->bytes_per_sample;
+        for (int y = 0; y < h; y++) {
+            const uint8_t *row = d + y * stride;
+            for (int i = 0; i < w * bps; i++) {
+                hash ^= row[i];
+                hash *= 1099511628211ULL;
+            }
+        }
+    }
+    return hash;
+}
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -52,6 +74,8 @@ static void usage(const char *prog)
         "  --benchmark  decode without writing output, print fps\n"
         "  --frames N   stop after decoding N frames\n"
         "  --no-simd    disable SIMD optimizations\n"
+        "  --8bit       force 8-bit decode (lossy, faster)\n"
+        "  --frame-hash  print per-frame FNV-1a hash (for diff debugging)\n"
         "  -v           verbose (debug)\n"
         "  --version    print version and exit\n",
         prog);
@@ -66,6 +90,8 @@ int main(int argc, char *argv[])
     int thread_mode = 0;  /* 0=frame, 1=row */
     int max_frames = 0;  /* 0 = unlimited */
     int no_simd = 0;
+    int frame_hash = 0;  /* 逐帧哈希输出 */
+    int force_8bit = 0;  /* 强制 8-bit 解码 */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc) in_path = argv[++i];
@@ -78,6 +104,8 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "--benchmark")) benchmark = 1;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-simd")) no_simd = 1;
+        else if (!strcmp(argv[i], "--8bit")) force_8bit = 1;
+        else if (!strcmp(argv[i], "--frame-hash")) { frame_hash = 1; benchmark = 1; }
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "--version")) {
             printf("avs2dec %s (API 0x%06x)\n", avs2_version(), avs2_version_api());
@@ -100,6 +128,7 @@ int main(int argc, char *argv[])
     s.thread_mode = thread_mode;
     s.log_level = quiet ? AVS2_LOG_ERROR : (verbose ? AVS2_LOG_DEBUG : AVS2_LOG_INFO);
     s.skip_loop_filter = no_filter;
+    s.force_8bit = force_8bit;
 
     avs2_ctx *ctx = avs2_open(&s);
     if (!ctx) { fprintf(stderr, "avs2_open failed\n"); return 1; }
@@ -122,6 +151,7 @@ int main(int argc, char *argv[])
             avs2_close(&ctx);
             return 1;
         }
+        out.force_8bit = force_8bit;
         has_output = 1;
     }
 
@@ -146,6 +176,10 @@ int main(int argc, char *argv[])
             avs2_picture pic; avs2_seq_header seq;
             r = avs2_get_picture(ctx, &pic, &seq);
             if (r == AVS2_OK) {
+                if (frame_hash) {
+                    uint64_t h = fnv1a_frame_hash(&pic);
+                    fprintf(stderr, "FRAME %d POC %d HASH %016llx\n", n_frames, pic.poc, (unsigned long long)h);
+                }
                 if (has_output) {
                     if (is_y4m) {
                         extern int avs2_output_write_y4m(avs2_output *, const avs2_picture *, const avs2_seq_header *);
@@ -163,13 +197,47 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* flush */
+    /* flush: 交替输出帧和解码剩余缓冲区.
+     * DPB 满时 avs2_send_data 会返回, 需要先 avs2_get_picture 输出帧释放 DPB 空间,
+     * 再调 avs2_send_data(NULL) 重试解码. */
     avs2_flush(ctx);
     for (;;) {
         if (max_frames > 0 && n_frames >= max_frames) break;
+        /* 先输出所有可用帧 */
+        for (;;) {
+            if (max_frames > 0 && n_frames >= max_frames) break;
+            avs2_picture pic; avs2_seq_header seq;
+            int r = avs2_get_picture(ctx, &pic, &seq);
+            if (r == AVS2_OK) {
+                if (frame_hash) {
+                    uint64_t h = fnv1a_frame_hash(&pic);
+                    fprintf(stderr, "FRAME %d POC %d HASH %016llx\n", n_frames, pic.poc, (unsigned long long)h);
+                }
+                if (has_output) {
+                    if (is_y4m) {
+                        extern int avs2_output_write_y4m(avs2_output *, const avs2_picture *, const avs2_seq_header *);
+                        avs2_output_write_y4m(&out, &pic, &seq);
+                    } else {
+                        extern int avs2_output_write_yuv(avs2_output *, const avs2_picture *);
+                        avs2_output_write_yuv(&out, &pic);
+                    }
+                }
+                n_frames++;
+                avs2_picture_unref(ctx, &pic);
+            } else break;
+        }
+        /* 尝试解码更多帧 (从剩余缓冲区) */
+        int r = avs2_send_data(ctx, NULL);
+        if (r != AVS2_OK) break;
+        /* 检查是否还有未解码的数据: 若 avs2_get_picture 返回 EOF 且
+         * avs2_send_data 没有新进展, 退出. */
         avs2_picture pic; avs2_seq_header seq;
-        int r = avs2_get_picture(ctx, &pic, &seq);
-        if (r == AVS2_OK) {
+        int ck = avs2_get_picture(ctx, &pic, &seq);
+        if (ck == AVS2_OK) {
+            if (frame_hash) {
+                uint64_t h = fnv1a_frame_hash(&pic);
+                fprintf(stderr, "FRAME %d POC %d HASH %016llx\n", n_frames, pic.poc, (unsigned long long)h);
+            }
             if (has_output) {
                 if (is_y4m) {
                     extern int avs2_output_write_y4m(avs2_output *, const avs2_picture *, const avs2_seq_header *);
@@ -181,7 +249,9 @@ int main(int argc, char *argv[])
             }
             n_frames++;
             avs2_picture_unref(ctx, &pic);
-        } else break;
+        } else {
+            break;  /* 没有更多帧可输出或解码 */
+        }
     }
 
     double t_end = get_time_ms();

@@ -1,32 +1,16 @@
 /*
  * ipred_simd.c - 帧内预测 SIMD 实现 (x86)
  *
- * 当前实现:
- *   - AVX2: 垂直 / 水平 / DC / Plane 预测 (256-bit 路径, 参考 libudavs2 xPredIntra*Adi_sse256_10bit)
- *     8-bit 与 10-bit 共用同一路径 (内部均按 pel_t/uint16_t 处理;
- *     8-bit 由 avs2_get_intra_pred 分配 uint16_t 临时缓冲, 再打包回 uint8_t)
- *   - SSE4.1: 角度预测 - 水平方向 (模式 3..11) 4 抽头滤波
- *   - 小块 (bsx < 8 的 Plane) 回退到 C 实现 (ipred.c)
+ * SSE4 实现, 从 libudavs2 (x86/intrinsic_intra-pred.c) 移植.
+ * 统一用 10-bit 路径: 8-bit 数据也转 uint16_t 处理再打包回 uint8_t.
  *
  * 函数签名 (avs2_intra_pred_fn):
  *   void (*)(uint8_t *src, uint8_t *dst, int i_dst,
  *            int mode, int bsx, int bsy, int bit_depth)
  *   - src: EP 参考样本数组 (uint16_t 内部表示), 左侧用负索引, 上方用正索引
- *   - dst: 预测输出, 步长 i_dst (10-bit 为 uint16 元素步长, 8-bit 为字节步长)
+ *   - dst: 预测输出, 步长 i_dst (uint16 元素步长)
  *   - bsx/bsy: 块宽高 (4..64)
  *   - mode: 预测模式 (DC 时高 8 位=b_top, 低 8 位=b_left)
- *
- * 对齐说明:
- *   - EP 参考样本数组 (ipred.c 中 ep_buf) 已声明 32 字节对齐,
- *     EP+1 (上方参考起始) 为 32 字节对齐, ver 路径可用对齐加载
- *   - dst 为帧数据, 位于 4 像素边界:
- *       10-bit 即 8 字节对齐, 8-bit 即 4 字节对齐, 均不保证 32 字节对齐
- *   - stride 为 32 字节倍数 (帧步长 64/128B, pred_buf 步长 w*2>=32B),
- *     每行 dst 对齐相同, 头部偏移只需计算一次
- *   - bsx >= 16: 头部未对齐用 128/64-bit storeu, 主体用 256-bit 对齐 store,
- *     尾部用 128/64-bit storeu
- *   - bsx == 8/4: 数据不保证 128-bit 对齐, 保持 loadu/storeu
- *   - 参考 libudavs2, 按块宽度选择 256-bit / 128-bit / 64-bit 路径
  */
 
 #include "internal.h"
@@ -38,10 +22,32 @@
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
-#include <immintrin.h>
+#include <tmmintrin.h>
+#include <smmintrin.h>
 
 /* 10-bit 像素类型 (与 ipred.c 一致) */
 typedef uint16_t pel_t;
+typedef int16_t  i16s_t;
+typedef uint16_t i16u_t;
+typedef uint64_t i64u_t;
+
+/* 兼容 libudavs2 的宏 */
+#define COM_CLIP3(min, max, val) (((val) < (min)) ? (min) : (((val) > (max)) ? (max) : (val)))
+#define CP64(dst, src) (*(uint64_t*)(dst) = *(const uint64_t*)(src))
+#define M64(p) (*(uint64_t*)(p))
+
+/* libudavs2 的 tab_log2 查找表 (intrinsic_intra-pred.c 依赖) */
+static const int8_t tab_log2_ipred[65] = {
+    -1,
+    0, 1, -1, 2, -1, -1, -1, 3,
+    -1, -1, -1, -1, -1, -1, -1, 4,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, 5,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, 6
+};
 
 /* C 回退函数声明 (在 ipred.c 中定义, 供 8-bit 或不支持尺寸回退) */
 extern void intra_pred_ver_c(uint8_t *src, uint8_t *dst, int i_dst, int mode,
@@ -62,8 +68,9 @@ extern void intra_pred_bilinear_c(uint8_t *src, uint8_t *dst, int i_dst, int mod
 
 /* ===========================================================================
  * 垂直预测: 复制上方参考行 (src + 1) 到 dst
+ * SSE4 实现, 移植自 libudavs2 xPredIntraVertAdi_sse128_10bit
  * =========================================================================== */
-static void intra_pred_ver_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
+static void intra_pred_ver_sse4(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
                                 int bsx, int bsy, int bit_depth)
 {
     pel_t *src = (pel_t *)(void *)src_u8;
@@ -72,57 +79,81 @@ static void intra_pred_ver_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int
     int y;
 
     UNUSED_PARAMETER(mode);
+    UNUSED_PARAMETER(bit_depth);
 
-    if (bsx >= 16) {
-        /* stride 为 32 字节倍数, 每行 dst 对齐相同 */
-        int head = (int)((-(uintptr_t)dst) & 31) >> 1;
+    switch (bsx) {
+    case 4:
+        for (y = 0; y < bsy; y += 2) {
+            CP64(dst,         p_src);
+            CP64(dst + i_dst, p_src);
+            dst += i_dst << 1;
+        }
+        break;
+    case 8: {
+        __m128i t = _mm_loadu_si128((const __m128i*)p_src);
         for (y = 0; y < bsy; y++) {
-            int x = 0;
-            /* 头部未对齐部分 (0, 4, 8 或 12 元素) */
-            for (; x + 8 <= head; x += 8) {
-                __m128i v = _mm_loadu_si128((const __m128i*)(p_src + x));
-                _mm_storeu_si128((__m128i*)(dst + x), v);
-            }
-            for (; x + 4 <= head; x += 4) {
-                __m128i v = _mm_loadl_epi64((const __m128i*)(p_src + x));
-                _mm_storel_epi64((__m128i*)(dst + x), v);
-            }
-            /* 对齐主体: 256-bit 对齐存储 (src 偏移后可能未对齐, 用 loadu) */
-            for (; x + 16 <= bsx; x += 16) {
-                __m256i v = _mm256_loadu_si256((const __m256i*)(p_src + x));
-                _mm256_store_si256((__m256i*)(dst + x), v);
-            }
-            /* 尾部未对齐部分 */
-            for (; x + 8 <= bsx; x += 8) {
-                __m128i v = _mm_loadu_si128((const __m128i*)(p_src + x));
-                _mm_storeu_si128((__m128i*)(dst + x), v);
-            }
-            for (; x + 4 <= bsx; x += 4) {
-                __m128i v = _mm_loadl_epi64((const __m128i*)(p_src + x));
-                _mm_storel_epi64((__m128i*)(dst + x), v);
-            }
+            _mm_storeu_si128((__m128i*)dst, t);
             dst += i_dst;
         }
-    } else if (bsx == 8) {
-        __m128i v = _mm_loadu_si128((const __m128i*)p_src);
+        break;
+    }
+    case 16: {
+        __m128i t0 = _mm_loadu_si128((const __m128i*)(p_src + 0));
+        __m128i t1 = _mm_loadu_si128((const __m128i*)(p_src + 8));
         for (y = 0; y < bsy; y++) {
-            _mm_storeu_si128((__m128i*)dst, v);
+            _mm_storeu_si128((__m128i*)(dst + 0), t0);
+            _mm_storeu_si128((__m128i*)(dst + 8), t1);
             dst += i_dst;
         }
-    } else {
-        /* bsx == 4 */
-        __m128i v = _mm_loadl_epi64((const __m128i*)p_src);
+        break;
+    }
+    case 32: {
+        __m128i t0 = _mm_loadu_si128((const __m128i*)(p_src + 0));
+        __m128i t1 = _mm_loadu_si128((const __m128i*)(p_src + 8));
+        __m128i t2 = _mm_loadu_si128((const __m128i*)(p_src + 16));
+        __m128i t3 = _mm_loadu_si128((const __m128i*)(p_src + 24));
         for (y = 0; y < bsy; y++) {
-            _mm_storel_epi64((__m128i*)dst, v);
+            _mm_storeu_si128((__m128i*)(dst + 0),  t0);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t1);
+            _mm_storeu_si128((__m128i*)(dst + 16), t2);
+            _mm_storeu_si128((__m128i*)(dst + 24), t3);
             dst += i_dst;
         }
+        break;
+    }
+    case 64: {
+        __m128i t0 = _mm_loadu_si128((const __m128i*)(p_src + 0));
+        __m128i t1 = _mm_loadu_si128((const __m128i*)(p_src + 8));
+        __m128i t2 = _mm_loadu_si128((const __m128i*)(p_src + 16));
+        __m128i t3 = _mm_loadu_si128((const __m128i*)(p_src + 24));
+        __m128i t4 = _mm_loadu_si128((const __m128i*)(p_src + 32));
+        __m128i t5 = _mm_loadu_si128((const __m128i*)(p_src + 40));
+        __m128i t6 = _mm_loadu_si128((const __m128i*)(p_src + 48));
+        __m128i t7 = _mm_loadu_si128((const __m128i*)(p_src + 56));
+        for (y = 0; y < bsy; y++) {
+            _mm_storeu_si128((__m128i*)(dst + 0),  t0);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t1);
+            _mm_storeu_si128((__m128i*)(dst + 16), t2);
+            _mm_storeu_si128((__m128i*)(dst + 24), t3);
+            _mm_storeu_si128((__m128i*)(dst + 32), t4);
+            _mm_storeu_si128((__m128i*)(dst + 40), t5);
+            _mm_storeu_si128((__m128i*)(dst + 48), t6);
+            _mm_storeu_si128((__m128i*)(dst + 56), t7);
+            dst += i_dst;
+        }
+        break;
+    }
+    default:
+        intra_pred_ver_c(src_u8, dst_u8, i_dst, mode, bsx, bsy, bit_depth);
+        break;
     }
 }
 
 /* ===========================================================================
  * 水平预测: 复制左侧参考列 (src - 1, 按 src[-1-y] 取值) 广播到每行
+ * SSE4 实现, 移植自 libudavs2 xPredIntraHorAdi_sse128_10bit
  * =========================================================================== */
-static void intra_pred_hor_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
+static void intra_pred_hor_sse4(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
                                 int bsx, int bsy, int bit_depth)
 {
     pel_t *src = (pel_t *)(void *)src_u8;
@@ -131,57 +162,66 @@ static void intra_pred_hor_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int
     int y;
 
     UNUSED_PARAMETER(mode);
+    UNUSED_PARAMETER(bit_depth);
 
-    if (bsx >= 16) {
-        int head = (int)((-(uintptr_t)dst) & 31) >> 1;
+    switch (bsx) {
+    case 4:
         for (y = 0; y < bsy; y++) {
-            __m256i v = _mm256_set1_epi16((short)p_src[-y]);
-            int x = 0;
-            /* 头部未对齐部分 */
-            for (; x + 8 <= head; x += 8) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storeu_si128((__m128i*)(dst + x), v128);
-            }
-            for (; x + 4 <= head; x += 4) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storel_epi64((__m128i*)(dst + x), v128);
-            }
-            /* 对齐主体: 256-bit 对齐存储 */
-            for (; x + 16 <= bsx; x += 16) {
-                _mm256_store_si256((__m256i*)(dst + x), v);
-            }
-            /* 尾部未对齐部分 */
-            for (; x + 8 <= bsx; x += 8) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storeu_si128((__m128i*)(dst + x), v128);
-            }
-            for (; x + 4 <= bsx; x += 4) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storel_epi64((__m128i*)(dst + x), v128);
-            }
+            M64(dst) = 0x0001000100010001ULL * p_src[-y];
             dst += i_dst;
         }
-    } else if (bsx == 8) {
+        break;
+    case 8:
         for (y = 0; y < bsy; y++) {
-            __m128i v = _mm_set1_epi16((short)p_src[-y]);
-            _mm_storeu_si128((__m128i*)dst, v);
+            __m128i t = _mm_set1_epi16((short)p_src[-y]);
+            _mm_storeu_si128((__m128i*)dst, t);
             dst += i_dst;
         }
-    } else {
-        /* bsx == 4 */
+        break;
+    case 16:
         for (y = 0; y < bsy; y++) {
-            __m128i v = _mm_set1_epi16((short)p_src[-y]);
-            _mm_storel_epi64((__m128i*)dst, v);
+            __m128i t = _mm_set1_epi16((short)p_src[-y]);
+            _mm_storeu_si128((__m128i*)(dst + 0), t);
+            _mm_storeu_si128((__m128i*)(dst + 8), t);
             dst += i_dst;
         }
+        break;
+    case 32:
+        for (y = 0; y < bsy; y++) {
+            __m128i t = _mm_set1_epi16((short)p_src[-y]);
+            _mm_storeu_si128((__m128i*)(dst + 0),  t);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t);
+            _mm_storeu_si128((__m128i*)(dst + 16), t);
+            _mm_storeu_si128((__m128i*)(dst + 24), t);
+            dst += i_dst;
+        }
+        break;
+    case 64:
+        for (y = 0; y < bsy; y++) {
+            __m128i t = _mm_set1_epi16((short)p_src[-y]);
+            _mm_storeu_si128((__m128i*)(dst + 0),  t);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t);
+            _mm_storeu_si128((__m128i*)(dst + 16), t);
+            _mm_storeu_si128((__m128i*)(dst + 24), t);
+            _mm_storeu_si128((__m128i*)(dst + 32), t);
+            _mm_storeu_si128((__m128i*)(dst + 40), t);
+            _mm_storeu_si128((__m128i*)(dst + 48), t);
+            _mm_storeu_si128((__m128i*)(dst + 56), t);
+            dst += i_dst;
+        }
+        break;
+    default:
+        intra_pred_hor_c(src_u8, dst_u8, i_dst, mode, bsx, bsy, bit_depth);
+        break;
     }
 }
 
 /* ===========================================================================
  * DC 预测: 取左侧和上方参考样本均值, 广播填充
  * mode 高 8 位 = b_top, 低 8 位 = b_left (与 intra_pred_dc_c 一致)
+ * SSE4 实现, 移植自 libudavs2 xPredIntraDCAdi_sse128_10bit
  * =========================================================================== */
-static void intra_pred_dc_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
+static void intra_pred_dc_sse4(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
                                int bsx, int bsy, int bit_depth)
 {
     pel_t *src = (pel_t *)(void *)src_u8;
@@ -226,53 +266,67 @@ static void intra_pred_dc_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int 
     if (dc_value < 0) dc_value = 0;
     if (dc_value > max_val) dc_value = max_val;
 
-    if (bsx >= 16) {
-        __m256i v = _mm256_set1_epi16((short)dc_value);
-        int head = (int)((-(uintptr_t)dst) & 31) >> 1;
+    switch (bsx) {
+    case 4: {
+        i64u_t v64 = 0x0001000100010001ULL * dc_value;
         for (y = 0; y < bsy; y++) {
-            int x = 0;
-            /* 头部未对齐部分 */
-            for (; x + 8 <= head; x += 8) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storeu_si128((__m128i*)(dst + x), v128);
-            }
-            for (; x + 4 <= head; x += 4) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storel_epi64((__m128i*)(dst + x), v128);
-            }
-            /* 对齐主体: 256-bit 对齐存储 */
-            for (; x + 16 <= bsx; x += 16) {
-                _mm256_store_si256((__m256i*)(dst + x), v);
-            }
-            /* 尾部未对齐部分 */
-            for (; x + 8 <= bsx; x += 8) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storeu_si128((__m128i*)(dst + x), v128);
-            }
-            for (; x + 4 <= bsx; x += 4) {
-                __m128i v128 = _mm256_castsi256_si128(v);
-                _mm_storel_epi64((__m128i*)(dst + x), v128);
-            }
+            M64(dst) = v64;
             dst += i_dst;
         }
-    } else if (bsx == 8) {
-        __m128i v = _mm_set1_epi16((short)dc_value);
+        break;
+    }
+    case 8: {
+        __m128i t = _mm_set1_epi16((short)dc_value);
         for (y = 0; y < bsy; y++) {
-            _mm_storeu_si128((__m128i*)dst, v);
+            _mm_storeu_si128((__m128i*)dst, t);
             dst += i_dst;
         }
-    } else {
-        /* bsx == 4 */
-        __m128i v = _mm_set1_epi16((short)dc_value);
+        break;
+    }
+    case 16: {
+        __m128i t = _mm_set1_epi16((short)dc_value);
         for (y = 0; y < bsy; y++) {
-            _mm_storel_epi64((__m128i*)dst, v);
+            _mm_storeu_si128((__m128i*)(dst + 0), t);
+            _mm_storeu_si128((__m128i*)(dst + 8), t);
             dst += i_dst;
         }
+        break;
+    }
+    case 32: {
+        __m128i t = _mm_set1_epi16((short)dc_value);
+        for (y = 0; y < bsy; y++) {
+            _mm_storeu_si128((__m128i*)(dst + 0),  t);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t);
+            _mm_storeu_si128((__m128i*)(dst + 16), t);
+            _mm_storeu_si128((__m128i*)(dst + 24), t);
+            dst += i_dst;
+        }
+        break;
+    }
+    case 64: {
+        __m128i t = _mm_set1_epi16((short)dc_value);
+        for (y = 0; y < bsy; y++) {
+            _mm_storeu_si128((__m128i*)(dst + 0),  t);
+            _mm_storeu_si128((__m128i*)(dst + 8),  t);
+            _mm_storeu_si128((__m128i*)(dst + 16), t);
+            _mm_storeu_si128((__m128i*)(dst + 24), t);
+            _mm_storeu_si128((__m128i*)(dst + 32), t);
+            _mm_storeu_si128((__m128i*)(dst + 40), t);
+            _mm_storeu_si128((__m128i*)(dst + 48), t);
+            _mm_storeu_si128((__m128i*)(dst + 56), t);
+            dst += i_dst;
+        }
+        break;
+    }
+    default:
+        intra_pred_dc_c(src_u8, dst_u8, i_dst, mode, bsx, bsy, bit_depth);
+        break;
     }
 }
 
 /* ===========================================================================
- * Plane 预测 AVX2: 内层循环用 8x int32 累加 + 限幅 + 打包
+ * Plane 预测 SSE4: 4x int32 累加 + packus + min_epu16 限幅
+ * 移植自 libudavs2 xPredIntraPlaneAdi_sse128_10bit
  * =========================================================================== */
 static inline int intra_log2_sz(int sz)
 {
@@ -284,7 +338,7 @@ static inline int intra_clip3(int low, int high, int v)
     return v < low ? low : (v > high ? high : v);
 }
 
-static void intra_pred_plane_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
+static void intra_pred_plane_sse4(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, int mode,
                                   int bsx, int bsy, int bit_depth)
 {
     static const int ib_mult[5]  = { 13, 17,  5, 11, 23 };
@@ -302,9 +356,11 @@ static void intra_pred_plane_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, i
     int iH = 0, iV = 0;
     int iA, iB, iC;
     int x, y;
-    int iTmp, iTmp2;
+    int iTmp;
     int max_val = (1 << bit_depth) - 1;
     pel_t *p_src;
+    __m128i v_max = _mm_set1_epi16((short)max_val);
+    __m128i v_ta, v_tb, v_tc, v_start;
 
     UNUSED_PARAMETER(mode);
 
@@ -326,53 +382,44 @@ static void intra_pred_plane_avx2(uint8_t *src_u8, uint8_t *dst_u8, int i_dst, i
 
     iTmp = iA - (iH2 - 1) * iC - (iW2 - 1) * iB + 16;
 
-    if (bsx >= 8) {
-        __m256i v_max = _mm256_set1_epi32(max_val);
-        __m256i v_zero = _mm256_setzero_si256();
-        /* bsx >= 16: 128-bit 对齐存储; bsx == 8: 不保证对齐, 保持 storeu */
-        int use_aligned = (bsx >= 16);
-        int head = use_aligned ? (int)((-(uintptr_t)dst) & 15) >> 1 : 0;
-        for (y = 0; y < bsy; y++) {
-            iTmp2 = iTmp;
-            x = 0;
-            /* 头部未对齐: 标量处理 */
-            for (; x < head; x++) {
-                dst[x] = (pel_t)intra_clip3(0, max_val, iTmp2 >> 5);
-                iTmp2 += iB;
-            }
-            /* 初始化 8 通道: iTmp2, iTmp2+iB, ..., iTmp2+7*iB */
-            __m256i v_val = _mm256_setr_epi32(
-                iTmp2,        iTmp2 + iB,  iTmp2 + 2*iB, iTmp2 + 3*iB,
-                iTmp2 + 4*iB, iTmp2 + 5*iB, iTmp2 + 6*iB, iTmp2 + 7*iB);
-            __m256i v_step8 = _mm256_set1_epi32(iB * 8);
+    v_ta = _mm_set1_epi32(iTmp);
+    v_tb = _mm_set1_epi32(iB);
+    v_tc = _mm_set1_epi32(iC);
 
-            /* 主体: 8 像素一组 */
-            for (; x + 7 < bsx; x += 8) {
-                __m256i v_s = _mm256_srai_epi32(v_val, 5);
-                v_s = _mm256_max_epi32(v_s, v_zero);
-                v_s = _mm256_min_epi32(v_s, v_max);
-                /* packus: 8x int32 -> 8x uint16, permute 消除 lane 交错 */
-                __m256i v_pk = _mm256_packus_epi32(v_s, v_s);
-                v_pk = _mm256_permute4x64_epi64(v_pk, 0xD8);
-                if (use_aligned) {
-                    _mm_store_si128((__m128i *)(dst + x), _mm256_castsi256_si128(v_pk));
-                } else {
-                    _mm_storeu_si128((__m128i *)(dst + x), _mm256_castsi256_si128(v_pk));
-                }
-                v_val = _mm256_add_epi32(v_val, v_step8);
-            }
-            /* 尾部标量 */
-            iTmp2 = iTmp + x * iB;
-            for (; x < bsx; x++) {
-                dst[x] = (pel_t)intra_clip3(0, max_val, iTmp2 >> 5);
-                iTmp2 += iB;
-            }
+    /* v_start = [0, iB, 2*iB, 3*iB] + iTmp */
+    v_start = _mm_set_epi32(3, 2, 1, 0);
+    v_start = _mm_mullo_epi32(v_tb, v_start);
+    v_start = _mm_add_epi32(v_start, v_ta);
+
+    /* 后续每次迭代 iB * 4 */
+    v_tb = _mm_slli_epi32(v_tb, 2);
+
+    if (bsx <= 4) {
+        /* 4 像素: 单次 4-lane */
+        for (y = 0; y < bsy; y++) {
+            __m128i d = _mm_srai_epi32(v_start, 5);
+            d = _mm_packus_epi32(d, d);
+            d = _mm_min_epu16(d, v_max);
+            _mm_storel_epi64((__m128i*)dst, d);
+            v_start = _mm_add_epi32(v_start, v_tc);
             dst += i_dst;
-            iTmp += iC;
         }
     } else {
-        /* 小块: 回退到 C */
-        intra_pred_plane_c(src_u8, dst_u8, i_dst, mode, bsx, bsy, bit_depth);
+        /* 8 像素一组: 两个 4-lane chunk */
+        for (y = 0; y < bsy; y++) {
+            __m128i t = v_start;
+            for (x = 0; x < bsx; x += 8) {
+                __m128i d0 = _mm_srai_epi32(t, 5);
+                t = _mm_add_epi32(t, v_tb);
+                __m128i d1 = _mm_srai_epi32(t, 5);
+                t = _mm_add_epi32(t, v_tb);
+                d0 = _mm_packus_epi32(d0, d1);
+                d0 = _mm_min_epu16(d0, v_max);
+                _mm_storeu_si128((__m128i*)(dst + x), d0);
+            }
+            v_start = _mm_add_epi32(v_start, v_tc);
+            dst += i_dst;
+        }
     }
 }
 
@@ -460,11 +507,11 @@ static void intra_pred_ang_x_sse41(uint8_t *src_u8, uint8_t *dst_u8, int i_dst,
 
                 res_lo = _mm_add_epi32(_mm_add_epi32(r0, r2), v_off);
                 res_hi = _mm_add_epi32(_mm_add_epi32(r1, r3), v_off);
-                res_lo = _mm_srli_epi32(res_lo, 7);
-                res_hi = _mm_srli_epi32(res_hi, 7);
+                res_lo = _mm_srai_epi32(res_lo, 7);
+                res_hi = _mm_srai_epi32(res_hi, 7);
 
                 {
-                    __m128i packed = _mm_packus_epi32(res_lo, res_hi);
+                    __m128i packed = _mm_packs_epi32(res_lo, res_hi);
                     _mm_storeu_si128((__m128i *)(dst + i), packed);
                 }
             }
@@ -558,9 +605,9 @@ static void intra_pred_ang_y_sse41(uint8_t *src_u8, uint8_t *dst_u8, int i_dst,
 
             res_lo = _mm_add_epi32(_mm_add_epi32(r0, r2), v_off);
             res_hi = _mm_add_epi32(_mm_add_epi32(r1, r3), v_off);
-            res_lo = _mm_srli_epi32(res_lo, 7);
-            res_hi = _mm_srli_epi32(res_hi, 7);
-            res = _mm_packus_epi32(res_lo, res_hi);
+            res_lo = _mm_srai_epi32(res_lo, 7);
+            res_hi = _mm_srai_epi32(res_hi, 7);
+            res = _mm_packs_epi32(res_lo, res_hi);
             _mm_storeu_si128((__m128i *)(dst + i2), res);
         }
 
@@ -663,13 +710,16 @@ static void intra_pred_bilinear_sse41(uint8_t *src_u8, uint8_t *dst_u8, int i_ds
                 __m128i v_col = _mm_add_epi32(v_base, _mm_set1_epi32(x2));
                 __m128i v_xp1 = _mm_add_epi32(v_col, _mm_set1_epi32(1));
                 __m128i v_predx, v_wxy, v_res, v_pk;
-                __m128i v_top_new;
 
                 /* predx = p_left[y] + (col+1) * p_l[y] */
                 v_predx = _mm_add_epi32(_mm_set1_epi32(predx_base),
                                         _mm_mullo_epi32(v_xp1, _mm_set1_epi32(pl)));
                 /* wxy = col * wy[y] */
                 v_wxy = _mm_mullo_epi32(v_col, _mm_set1_epi32(wy_y));
+
+                /* 先更新 p_top: p_top[x] += p_t[x] (与 C 参考一致, 更新后再用) */
+                v_top = _mm_add_epi32(v_top, v_pt);
+                _mm_storeu_si128((__m128i *)(p_top + x2), v_top);
 
                 /* result = ((predx<<iy) + (p_top<<ix) + wxy + offset) >> ixy */
                 v_res = _mm_add_epi32(_mm_slli_epi32(v_predx, ishift_y),
@@ -683,10 +733,6 @@ static void intra_pred_bilinear_sse41(uint8_t *src_u8, uint8_t *dst_u8, int i_ds
                 /* 打包 4x int32 -> 4x uint16 并存储 */
                 v_pk = _mm_packus_epi32(v_res, v_res);
                 _mm_storel_epi64((__m128i *)(dst + x2), v_pk);
-
-                /* 更新 p_top: p_top[x] += p_t[x] */
-                v_top_new = _mm_add_epi32(v_top, v_pt);
-                _mm_storeu_si128((__m128i *)(p_top + x2), v_top_new);
             }
 
             /* 标量尾部: 从 SIMD 停止处继续累加 */
@@ -710,17 +756,14 @@ static void intra_pred_bilinear_sse41(uint8_t *src_u8, uint8_t *dst_u8, int i_ds
  * 注册函数
  * =========================================================================== */
 
-/* SSE4.1: 角度预测 - 水平方向 (模式 3..11) 4 抽头滤波, 8/10-bit 共用 */
-void avs2_ipred_init_sse41(const avs2_cpu_flags *flags) { (void)flags; }
-
-/* AVX2: 注册垂直/水平/DC/Plane 预测 (8/10-bit 共用 256-bit 路径) */
-void avs2_ipred_init_avx2(const avs2_cpu_flags *flags)
+/* SSE4: 注册全部帧内预测函数 (8/10-bit 共用 128-bit 路径) */
+void avs2_ipred_init_sse41(const avs2_cpu_flags *flags)
 {
     (void)flags;
-    avs2_dsp_table.ipred_mode[DC_PRED]    = intra_pred_dc_avx2;
-    avs2_dsp_table.ipred_mode[VERT_PRED]  = intra_pred_ver_avx2;
-    avs2_dsp_table.ipred_mode[HOR_PRED]   = intra_pred_hor_avx2;
-    avs2_dsp_table.ipred_mode[PLANE_PRED] = intra_pred_plane_avx2;
+    avs2_dsp_table.ipred_mode[DC_PRED]    = intra_pred_dc_sse4;
+    avs2_dsp_table.ipred_mode[VERT_PRED]  = intra_pred_ver_sse4;
+    avs2_dsp_table.ipred_mode[HOR_PRED]   = intra_pred_hor_sse4;
+    avs2_dsp_table.ipred_mode[PLANE_PRED] = intra_pred_plane_sse4;
 
     /* 角度预测 - 水平方向 (模式 3..11): SSE4.1 4 抽头滤波 */
     avs2_dsp_table.ipred_mode[INTRA_ANG_X_3]  = intra_pred_ang_x_sse41;
@@ -752,6 +795,9 @@ void avs2_ipred_init_avx2(const avs2_cpu_flags *flags)
     /* Bilinear 预测 (模式 2): SSE4.1 int32 向量化 */
     avs2_dsp_table.ipred_mode[BI_PRED] = intra_pred_bilinear_sse41;
 }
+
+/* AVX2: 已统一到 SSE4 路径, 不再覆盖注册 */
+void avs2_ipred_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 
 /* AVX512 预留 */
 void avs2_ipred_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
