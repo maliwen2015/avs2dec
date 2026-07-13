@@ -33,7 +33,10 @@ int avs2_output_write_yuv(avs2_output *out, const avs2_picture *pic)
                     /* 舍入右移: (v + 2) >> 2, 10-bit → 8-bit */
                     row8[x] = (uint8_t)((src[x] + 2) >> 2);
                 }
-                fwrite(row8, 1, w, out->fp);
+                if (fwrite(row8, 1, w, out->fp) != (size_t)w) {
+                    free(row8);
+                    return -1;
+                }
             }
         }
         free(row8);
@@ -47,7 +50,8 @@ int avs2_output_write_yuv(avs2_output *out, const avs2_picture *pic)
         int w = pic->width[pl], h = pic->height[pl];
         size_t row_bytes = (size_t)w * bps;
         for (int y = 0; y < h; y++)
-            fwrite(d + y * s, 1, row_bytes, out->fp);
+            if (fwrite(d + y * s, 1, row_bytes, out->fp) != row_bytes)
+                return -1;
     }
     return 0;
 }

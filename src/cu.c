@@ -455,11 +455,20 @@ static void derive_skip_mv(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y,
             if (spu_y >= h_spu) spu_y = h_spu - 1;
 
             if (col_pic && col_pic->mvbuf) {
-                /* davs2 mvbuf 做 16x16 子采样, 取中心位置 MV */
-                int col_idx = mvbuf_subsample_idx(spu_x, spu_y, w_spu, h_spu);
+                /* davs2 mvbuf 做 16x16 子采样, 取中心位置 MV.
+                 * 注意: 使用 col_pic 自身的尺寸计算索引, 防止序列内
+                 * 分辨率切换时当前帧尺寸大于参考帧导致越界读. */
+                int col_w_spu = col_pic->w8 * 2;
+                int col_h_spu = col_pic->h8 * 2;
+                int cspu_x = spu_x, cspu_y = spu_y;
+                if (cspu_x >= col_w_spu) cspu_x = col_w_spu - 1;
+                if (cspu_y >= col_h_spu) cspu_y = col_h_spu - 1;
+                if (cspu_x < 0) cspu_x = 0;
+                if (cspu_y < 0) cspu_y = 0;
+                int col_idx = mvbuf_subsample_idx(cspu_x, cspu_y, col_w_spu, col_h_spu);
                 /* 行级 AEC 依赖: 等待 col_pic 对应行的 AEC (含 store_mv_to_buf) 完成.
-                 * col_idx 对应 SPU y = col_idx / w_spu, LCU 行 = SPU y >> (lcu_log2 - spu_log2) */
-                int accessed_spu_y = col_idx / w_spu;
+                 * col_idx 对应 SPU y = col_idx / col_w_spu, LCU 行 = SPU y >> (lcu_log2 - spu_log2) */
+                int accessed_spu_y = col_idx / col_w_spu;
                 int required_row = accessed_spu_y >> (fc->lcu_size - MIN_PU_SIZE_IN_BIT);
                 if (required_row < 0) required_row = 0;
                 if (required_row >= col_pic->h_lcu) required_row = col_pic->h_lcu - 1;
@@ -522,11 +531,20 @@ static void derive_skip_mv(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y,
             if (spu_y >= h_spu) spu_y = h_spu - 1;
 
             if (col_pic && col_pic->mvbuf) {
-                /* davs2 mvbuf 做 16x16 子采样, 取中心位置 MV */
-                int col_idx = mvbuf_subsample_idx(spu_x, spu_y, w_spu, h_spu);
+                /* davs2 mvbuf 做 16x16 子采样, 取中心位置 MV.
+                 * 注意: 使用 col_pic 自身的尺寸计算索引, 防止序列内
+                 * 分辨率切换时当前帧尺寸大于参考帧导致越界读. */
+                int col_w_spu = col_pic->w8 * 2;
+                int col_h_spu = col_pic->h8 * 2;
+                int cspu_x = spu_x, cspu_y = spu_y;
+                if (cspu_x >= col_w_spu) cspu_x = col_w_spu - 1;
+                if (cspu_y >= col_h_spu) cspu_y = col_h_spu - 1;
+                if (cspu_x < 0) cspu_x = 0;
+                if (cspu_y < 0) cspu_y = 0;
+                int col_idx = mvbuf_subsample_idx(cspu_x, cspu_y, col_w_spu, col_h_spu);
                 /* 行级 AEC 依赖: 等待 col_pic 对应行的 AEC (含 store_mv_to_buf) 完成.
-                 * col_idx 对应 SPU y = col_idx / w_spu, LCU 行 = SPU y >> (lcu_log2 - spu_log2) */
-                int accessed_spu_y = col_idx / w_spu;
+                 * col_idx 对应 SPU y = col_idx / col_w_spu, LCU 行 = SPU y >> (lcu_log2 - spu_log2) */
+                int accessed_spu_y = col_idx / col_w_spu;
                 int required_row = accessed_spu_y >> (fc->lcu_size - MIN_PU_SIZE_IN_BIT);
                 if (required_row < 0) required_row = 0;
                 if (required_row >= col_pic->h_lcu) required_row = col_pic->h_lcu - 1;

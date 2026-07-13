@@ -16,6 +16,7 @@
 #include "quant.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>  /* memset */
 
 /* 辅助宏 (本文件局部使用) */
 #ifndef AVS2_MIN

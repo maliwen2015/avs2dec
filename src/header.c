@@ -157,6 +157,12 @@ static void parse_alf_param(struct avs2_internal *c, avs2_bs *bs)
     /* Y 分量: 先读 filter_number, 再读每组滤波器系数 */
     if (p->alf_pic_flag_y) {
         unsigned filter_number = avs2_bs_get_ue(bs);
+        /* AVS2 规范中 filters_per_group <= 16, 超出视为码流错误, 防止 CPU 耗尽 DoS.
+         * parse_alf_param 返回 void, 通过设置 bs->error 让调用方返回 AVS2_ERR_INVALID. */
+        if (filter_number > 15 || bs->error) {
+            bs->error = 1;
+            return;
+        }
         unsigned filters_per_group = filter_number + 1;
         unsigned f;
 
@@ -221,6 +227,17 @@ int avs2_parse_sequence_header(struct avs2_internal *c, avs2_bs *bs)
 
     if (s->horizontal_size < 16 || s->vertical_size < 16) {
         return AVS2_ERR_INVALID;
+    }
+    /* 上界检查: 防止恶意码流通过极大尺寸触发 OOM.
+     * 实际上限由 h_lcu <= AVS2_MAX_H_LCU (256) 与 LCU <= 64 约束,
+     * 即 16384 像素. 此处用 frame_size_limit (若用户设置) 或 16384 做硬上限. */
+    {
+        unsigned max_dim = c->frame_size_limit ? c->frame_size_limit : 16384u;
+        if ((unsigned)s->horizontal_size > max_dim || (unsigned)s->vertical_size > max_dim) {
+            avs2_error(c, "Frame size %dx%d exceeds limit %u\n",
+                       s->horizontal_size, s->vertical_size, max_dim);
+            return AVS2_ERR_INVALID;
+        }
     }
 
     s->chroma_format = avs2_bs_get(bs, 2);
@@ -819,11 +836,12 @@ int avs2_parse_slice_header(struct avs2_internal *c, avs2_bs *bs, int start_code
     fc->chroma_quant_param_delta_cb = p->chroma_quant_param_delta_cb;
     fc->chroma_quant_param_delta_cr = p->chroma_quant_param_delta_cr;
 
-    /* QP 校验 */
+    /* QP 校验: 越界 QP 会流入量化路径用作表索引, 必须拒绝而非仅警告 */
     {
         int i_qp = fc->slice_qp;
         if (!is_valid_qp(c, i_qp)) {
             avs2_error(c, "Invalid Slice QP: %d\n", i_qp);
+            return AVS2_ERR_INVALID;
         }
     }
 
@@ -841,6 +859,18 @@ int avs2_parse_slice_header(struct avs2_internal *c, avs2_bs *bs, int start_code
     /* 保存条带位置 */
     fc->lcu_x = slice_horizontal_position;
     fc->lcu_y = mb_row;
+
+    /* 校验条带起始位置在帧范围内, 防止 lcu_y 越界用作行数组索引 */
+    {
+        int h_lcu = ((int)s->enc_height + lcu_size - 1) >> s->log2_lcu_size;
+        int w_lcu = ((int)s->enc_width  + lcu_size - 1) >> s->log2_lcu_size;
+        if (fc->lcu_y < 0 || fc->lcu_y >= h_lcu ||
+            fc->lcu_x < 0 || fc->lcu_x >= w_lcu) {
+            avs2_error(c, "Slice position (%d,%d) out of range (h_lcu=%d w_lcu=%d)\n",
+                       fc->lcu_x, fc->lcu_y, w_lcu, h_lcu);
+            return AVS2_ERR_INVALID;
+        }
+    }
 
     return bs->error ? AVS2_ERR_INVALID : AVS2_OK;
 }

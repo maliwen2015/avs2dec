@@ -48,8 +48,8 @@ typedef struct avs2_settings {
     int n_threads;       /* 0 = auto (logical cores) */
     int max_frame_delay; /* 1 = low-latency; 0 = auto */
     int log_level;       /* avs2_log_level_e */
-    unsigned frame_size_limit; /* 0 = unlimited */
-    avs2_picture_alloc allocator;
+    unsigned frame_size_limit; /* 0 = 默认上限 16384; 否则为单边最大像素数 */
+    avs2_picture_alloc allocator; /* 自定义帧分配器 (当前未实现, 保留) */
     avs2_logger logger;
     int strict_std_compliance;
     int skip_loop_filter;   /* 1 = skip all in-loop filters */
@@ -75,9 +75,11 @@ AVS2DEC_API void avs2_close(avs2_ctx **ctx);
 
 /*
  * Push compressed AVS2 bitstream data (Annex B start-code format).
- * Returns AVS2_OK on success, AVS2_ERR_INVALID on error.
- * The data is fully consumed before returning; callers may free it
- * immediately after.
+ * Returns AVS2_OK on success (可能已解码若干帧, 调用 avs2_get_picture 取走),
+ * AVS2_ERR_NOMEM 表示 DPB 满 (调用 avs2_get_picture 输出帧后重试),
+ * AVS2_ERR_INVALID 表示码流错误或参数无效.
+ * 传入 data==NULL 表示 flush 信号 (排空解码器).
+ * 数据在返回前被完全消费 (调用者可立即释放), 但 NOMEM 时当前帧未消费.
  */
 AVS2DEC_API int avs2_send_data(avs2_ctx *ctx, avs2_data *data);
 

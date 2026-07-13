@@ -199,11 +199,14 @@ int main(int argc, char *argv[])
 
     /* flush: 交替输出帧和解码剩余缓冲区.
      * DPB 满时 avs2_send_data 会返回, 需要先 avs2_get_picture 输出帧释放 DPB 空间,
-     * 再调 avs2_send_data(NULL) 重试解码. */
+     * 再调 avs2_send_data(NULL) 重试解码.
+     * 多线程模式下 worker 可能仍在解码, avs2_get_picture 返回 AGAIN 时需重试. */
     avs2_flush(ctx);
+    int no_progress_count = 0;
     for (;;) {
         if (max_frames > 0 && n_frames >= max_frames) break;
-        /* 先输出所有可用帧 */
+        int produced = 0;
+        /* 输出所有可用帧 */
         for (;;) {
             if (max_frames > 0 && n_frames >= max_frames) break;
             avs2_picture pic; avs2_seq_header seq;
@@ -224,34 +227,22 @@ int main(int argc, char *argv[])
                 }
                 n_frames++;
                 avs2_picture_unref(ctx, &pic);
+                produced = 1;
             } else break;
         }
-        /* 尝试解码更多帧 (从剩余缓冲区) */
-        int r = avs2_send_data(ctx, NULL);
-        if (r != AVS2_OK) break;
-        /* 检查是否还有未解码的数据: 若 avs2_get_picture 返回 EOF 且
-         * avs2_send_data 没有新进展, 退出. */
-        avs2_picture pic; avs2_seq_header seq;
-        int ck = avs2_get_picture(ctx, &pic, &seq);
-        if (ck == AVS2_OK) {
-            if (frame_hash) {
-                uint64_t h = fnv1a_frame_hash(&pic);
-                fprintf(stderr, "FRAME %d POC %d HASH %016llx\n", n_frames, pic.poc, (unsigned long long)h);
-            }
-            if (has_output) {
-                if (is_y4m) {
-                    extern int avs2_output_write_y4m(avs2_output *, const avs2_picture *, const avs2_seq_header *);
-                    avs2_output_write_y4m(&out, &pic, &seq);
-                } else {
-                    extern int avs2_output_write_yuv(avs2_output *, const avs2_picture *);
-                    avs2_output_write_yuv(&out, &pic);
-                }
-            }
-            n_frames++;
-            avs2_picture_unref(ctx, &pic);
+        /* 若已输出帧, DPB 可能有空间, 尝试解码更多.
+         * 若未输出帧, 检查是否还有未解码数据 (send_data NULL 会尝试解码剩余缓冲).
+         * 连续两次无进展 (无输出且 send_data 无新帧) 则退出. */
+        if (produced) {
+            no_progress_count = 0;
         } else {
-            break;  /* 没有更多帧可输出或解码 */
+            no_progress_count++;
+            if (no_progress_count >= 2) break;
         }
+        /* 尝试解码剩余缓冲区中的数据 */
+        int r = avs2_send_data(ctx, NULL);
+        if (r == AVS2_ERR_EOF) break;
+        /* r == AVS2_OK 或 NOMEM 或 INVALID 都继续循环 (再试 get_picture) */
     }
 
     double t_end = get_time_ms();

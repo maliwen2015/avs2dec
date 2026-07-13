@@ -322,11 +322,13 @@ struct avs2_internal {
     /* frame contexts */
     avs2_frame_ctx *fc;
     int n_fc;
+    int fc_inited;         /* fc[0..fc_inited-1].lock 已初始化 (失败路径精确销毁) */
     avs2_frame_ctx *cur_fc;  /* 当前 header 解析所用的 fc (替代 &c->fc[0]) */
 
     /* DPB (容量需 >= n_fc + 参考帧数, 帧级并行时 n_fc=n_threads) */
     avs2_frame *dpb[AVS2_MAX_FRAME_DELAY];
     int n_dpb;
+    int sync_inited;       /* task_lock/out_lock/cond 已初始化 (失败路径精确销毁) */
 
     /* pending output queue (ring) */
     avs2_frame *out_queue[AVS2_MAX_FRAME_DELAY];

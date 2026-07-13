@@ -1097,7 +1097,7 @@ static void intra_pred_ang_x_11_c(uint8_t *src_u8, uint8_t *dst_u8, int i_dst,
             dst5[i] = (pel_t)((3 * src[0] + 11 * src[1] + 13 * src[2] + 5 * src[3] + 16) >> 5);
             dst6[i] = (pel_t)((    src[0] +  5 * src[1] +  7 * src[2] + 3 * src[3] +  8) >> 4);
             dst7[i] = (pel_t)((    src[0] +  9 * src[1] + 15 * src[2] + 7 * src[3] + 16) >> 5);
-            dst8[i] = (pel_t)((    src[1] +  2 * src[2] +      src[3] +            +  2) >> 2);
+            dst8[i] = (pel_t)((    src[1] +  2 * src[2] +      src[3] + 0 * src[4] +  2) >> 2);
         }
     } else {
         for (i = 0; i < bsx; i++, src++) {

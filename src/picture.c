@@ -83,11 +83,11 @@ int avs2_frame_alloc(avs2_frame *f, struct avs2_internal *c)
         f->pts = 0;
         f->dts = 0;
         f->done = 0;
-        f->p2_started = 0;
-        f->lf_row_done_count = 0;
+        avs2_atomic_store(&f->p2_started, 0);
+        avs2_atomic_store(&f->lf_row_done_count, 0);
         for (int i = 0; i < AVS2_MAX_H_LCU; i++) {
-            f->lf_row_done[i] = 0;
-            f->aec_row_done[i] = 0;
+            avs2_atomic_store(&f->lf_row_done[i], 0);
+            avs2_atomic_store(&f->aec_row_done[i], 0);
         }
         f->used = 1;
         f->ref_cnt = 1;
@@ -163,13 +163,13 @@ int avs2_frame_alloc(avs2_frame *f, struct avs2_internal *c)
             return AVS2_ERR_NOMEM;
         }
         uint8_t *p = f->aux_buf;
-        f->refbuf           = p;  p += sz_refbuf;
+        f->refbuf           = (int8_t *)p;  p += sz_refbuf;
         f->deblock_flags[0] = p;  p += sz_dbf0;
         f->deblock_flags[1] = p;  p += sz_dbf1;
         f->intra_border[0]  = p;  p += sz_ib0;
         f->intra_border[1]  = p;  p += sz_ib1;
         f->intra_border[2]  = p;  p += sz_ib2;
-        f->ipredmode_base   = p;  p += sz_ipm;
+        f->ipredmode_base   = (int8_t *)p;  p += sz_ipm;
         /* offset to first real position (skip top row + left column) */
         f->ipredmode = f->ipredmode_base + f->ipredmode_stride + 1;
 
@@ -184,8 +184,8 @@ int avs2_frame_alloc(avs2_frame *f, struct avs2_internal *c)
     f->mvbuf = avs2_mem_allocz(sizeof(avs2_mv) * (size_t)f->w8 * f->h8 * 4);
     f->sao_params = avs2_mem_allocz(sizeof(avs2_sao_param) * (size_t)f->w_lcu * f->h_lcu * 3);
     f->alf_params = avs2_mem_allocz(sizeof(avs2_alf_param) * (size_t)f->w_lcu * f->h_lcu);
-    /* 行级 LF 完成跟踪数组 (静态数组, 无需分配) */
-    f->lf_row_done_count = 0;
+    /* 行级 LF 完成跟踪数组 (静态数组, 无需分配; 此处为首次分配, 无并发读者) */
+    avs2_atomic_store(&f->lf_row_done_count, 0);
     if (!f->cu_grid || !f->mvbuf || !f->sao_params || !f->alf_params) {
         avs2_frame_free_buffers(f);
         return AVS2_ERR_NOMEM;
@@ -267,18 +267,24 @@ avs2_frame *avs2_dpb_get_free(struct avs2_internal *c)
             return f;
         }
     }
-    /* 3. grow DPB */
+    /* 3. grow DPB. 失败时不前进 n_dpb (避免永久浪费槽位). */
     if (c->n_dpb < AVS2_MAX_FRAME_DELAY) {
-        c->dpb[c->n_dpb] = avs2_mem_allocz(sizeof(avs2_frame));
-        return c->dpb[c->n_dpb++];
+        avs2_frame *nf = avs2_mem_allocz(sizeof(avs2_frame));
+        if (nf) {
+            c->dpb[c->n_dpb] = nf;
+            c->n_dpb++;
+        }
+        return nf;
     }
-    /* 4. 最后手段: 释放不被参考且无用户引用的最老帧 (即使未输出) */
+    /* 4. 最后手段: 释放不被参考且无 worker/user 引用的最老帧 (即使未输出).
+     * 注: 修正原逻辑 — 注释说"即使未输出"但条件仍要求 f->output, 矛盾.
+     * 此处真正移除 f->output 要求, 用于低延迟模式前几帧全未输出时的回收. */
     {
         int oldest_coi = 0x7fffffff;
         avs2_frame *oldest = NULL;
         for (int i = 0; i < c->n_dpb; i++) {
             avs2_frame *f = c->dpb[i];
-            if (f && f->used && !f->referenced && f->output && f->ref_cnt <= 1 && f->coi < oldest_coi) {
+            if (f && f->used && !f->referenced && f->ref_cnt <= 1 && f->coi < oldest_coi) {
                 oldest_coi = f->coi;
                 oldest = f;
             }
@@ -354,9 +360,12 @@ void avs2_pad_line_lcu(avs2_frame *f, int lcu_y, int lcu_size_log2)
         uint8_t *pix;
         int j;
 
-        /* 重叠 4 行 (对应 davs2 SAO/ALF 边界处理) */
-        if (lcu_y > 0) start -= 4;
-        if (lcu_y < f->h_lcu - 1) end -= 4;
+        /* LCU 边界重叠: 亮度去块半径 3 行 (P 侧 L0/L1/L2), 留 1 行余量 = 4 行;
+         * 色度去块半径 2 行 (P 侧 L0/L1), 留 1 行余量 = 3 行, 但保持 4 行更稳妥.
+         * 对色度按 chroma_shift 缩放重叠量, 与去块半径对齐, 避免色度重叠过大. */
+        int overlap = 4 >> chroma_shift;  /* 亮度 4, 色度 2 */
+        if (lcu_y > 0) start -= overlap;
+        if (lcu_y < f->h_lcu - 1) end -= overlap;
 
         /* 裁剪到有效范围 */
         if (start < 0) start = 0;

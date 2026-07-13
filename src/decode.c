@@ -44,13 +44,20 @@ static int ensure_row_parallel_buffers(avs2_frame_ctx *fc, avs2_frame *f, int lc
     /* per-LCU 系数缓冲区: 按实际 LCU 大小分配, 避免浪费 */
     if (fc->coeff_lcu_w_lcu != w_lcu || fc->coeff_lcu_h_lcu != h_lcu ||
         fc->coeff_lcu_log2 != lcu_log2) {
-        avs2_mem_free(fc->coeff_lcu_y);
-        avs2_mem_free(fc->coeff_lcu_u);
-        avs2_mem_free(fc->coeff_lcu_v);
+        avs2_mem_free(fc->coeff_lcu_y);  fc->coeff_lcu_y = NULL;
+        avs2_mem_free(fc->coeff_lcu_u);  fc->coeff_lcu_u = NULL;
+        avs2_mem_free(fc->coeff_lcu_v);  fc->coeff_lcu_v = NULL;
         fc->coeff_lcu_y = avs2_mem_allocz(sizeof(int16_t) * (size_t)n_lcu * lcu_dim * lcu_dim);
         fc->coeff_lcu_u = avs2_mem_allocz(sizeof(int16_t) * (size_t)n_lcu * c_dim * c_dim);
         fc->coeff_lcu_v = avs2_mem_allocz(sizeof(int16_t) * (size_t)n_lcu * c_dim * c_dim);
         if (!fc->coeff_lcu_y || !fc->coeff_lcu_u || !fc->coeff_lcu_v) {
+            /* 失败时清理已分配的缓冲区, 避免悬空指针和内存泄漏.
+             * 下次进入此函数会因尺寸不匹配而重新分配. */
+            avs2_mem_free(fc->coeff_lcu_y); fc->coeff_lcu_y = NULL;
+            avs2_mem_free(fc->coeff_lcu_u); fc->coeff_lcu_u = NULL;
+            avs2_mem_free(fc->coeff_lcu_v); fc->coeff_lcu_v = NULL;
+            fc->coeff_lcu_w_lcu = 0;
+            fc->coeff_lcu_h_lcu = 0;
             return AVS2_ERR_NOMEM;
         }
         fc->coeff_lcu_w_lcu = w_lcu;
@@ -75,11 +82,11 @@ static int avs2_decode_frame_fc_row(struct avs2_internal *c, avs2_frame_ctx *fc)
 
     if (!f) {
         avs2_warn(c, "no frame allocated\n");
-        return AVS2_OK;
+        return AVS2_ERR_INVALID;
     }
     if (!fc->bs.buf) {
         avs2_warn(c, "no slice data (bs.buf is NULL)\n");
-        return AVS2_OK;
+        return AVS2_ERR_INVALID;
     }
 
     /* 分配 per-LCU 系数缓冲区和 per-row 进度数组 */
@@ -304,11 +311,11 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
 
     if (!f) {
         avs2_warn(c, "no frame allocated\n");
-        return AVS2_OK;
+        return AVS2_ERR_INVALID;
     }
     if (!fc->bs.buf) {
         avs2_warn(c, "no slice data (bs.buf is NULL)\n");
-        return AVS2_OK;
+        return AVS2_ERR_INVALID;
     }
 
     /* 分配 per-LCU 系数缓冲区 */
@@ -336,7 +343,7 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
      * aec_started 在 AEC 初始化后立即设置, 允许依赖此帧的 B 帧 AEC 启动;
      * derive_skip_mv 中按行轮询 col_pic->aec_row_done 保证 mvbuf 可用. */
 
-    if (c->shutdown) return AVS2_OK;
+    if (avs2_atomic_load(&c->shutdown)) return AVS2_OK;
     {
         avs2_aec *aec = fc->aec_pool;
         avs2_aec_init_contexts(aec, fc->slice_type);
@@ -457,14 +464,14 @@ static void p2_do_row(avs2_frame_ctx *fc, struct avs2_internal *c, int lcu_y,
     avs2_frame *f = fc->fdec;
 
     /* 跨帧 LF 依赖: inter 帧需等待参考帧 LF 完成 */
-    if (is_inter && fc->mv_row_range) {
+    if (is_inter) {
         int required_row = lcu_y + fc->mv_row_range[lcu_y];
         int spin_cnt = 0;
         for (;;) {
             int all_ready = 1;
             for (int j = 0; j < fc->n_refs; j++) {
                 avs2_frame *ref = fc->fref[j];
-                if (!ref || !ref->lf_row_done) continue;
+                if (!ref) continue;
                 int rr = required_row;
                 if (rr >= ref->h_lcu) rr = ref->h_lcu - 1;
                 if (!avs2_atomic_load(&ref->lf_row_done[rr])) {
@@ -473,7 +480,7 @@ static void p2_do_row(avs2_frame_ctx *fc, struct avs2_internal *c, int lcu_y,
                 }
             }
             if (all_ready) break;
-            if ((++spin_cnt & 0x3ff) == 0 && c->shutdown) break;
+            if ((++spin_cnt & 0x3ff) == 0 && avs2_atomic_load(&c->shutdown)) break;
             avs2_cpu_relax();
         }
     }
@@ -500,7 +507,7 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
     avs2_frame *f = fc->fdec;
 
     if (!f) {
-        return AVS2_OK;
+        return AVS2_ERR_INVALID;
     }
 
     avs2_atomic_store(&f->p2_started, 1);

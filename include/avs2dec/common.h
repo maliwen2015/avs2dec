@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,9 +70,12 @@ enum avs2_error_e {
     AVS2_ERR_UNSUPPORTED = -5,
 };
 
+/* avs2_logger 回调使用 va_list (stdarg.h 已在文件头引入) */
 typedef struct avs2_logger {
     void *cookie;
-    void (*callback)(void *cookie, int level, const char *fmt, ...);
+    /* 回调签名采用 va_list 风格 (与 vfprintf 一致), 便于正确转发可变参数.
+     * 回调实现可用 vfprintf/vsnprintf 等处理 ap. */
+    void (*callback)(void *cookie, int level, const char *fmt, va_list ap);
 } avs2_logger;
 
 #ifdef __cplusplus

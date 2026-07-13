@@ -840,6 +840,12 @@ static int aec_read_mvd(avs2_aec *p_aec, aec_ctx *p_ctx)
             int l = biari_decode_symbol_eq_prob(p_aec);
             AEC_RETURN_ON_ERROR(0);
             if (l == 0) {
+                /* 限制 golomb_order 上界, 防止 >=31 时有符号左移 UB.
+                 * MV 幅度有实际物理上限, golomb_order >= 30 已远超合理范围. */
+                if (golomb_order >= 30) {
+                    p_aec->b_bit_error = 1;
+                    AEC_RETURN_ON_ERROR(0);
+                }
                 act_sym += (1 << golomb_order);
                 golomb_order++;
             } else {
@@ -2254,6 +2260,11 @@ int aec_read_run_level(avs2_aec *p_aec, aec_cu_t *p_cu, int num_cg, int b_luma, 
                         AEC_RETURN_ON_ERROR(-1);
                         if (l) {
                             break;
+                        }
+                        /* 限制 golomb_order 上界, 防止 >=31 时有符号左移 UB */
+                        if (golomb_order >= 30) {
+                            p_aec->b_bit_error = 1;
+                            AEC_RETURN_ON_ERROR(-1);
                         }
                         Level += (1 << golomb_order);
                         golomb_order++;

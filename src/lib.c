@@ -141,14 +141,14 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
                     got_task = 1;
 
                     /* 跨帧 LF 依赖: inter 帧需等待参考帧 LF 行完成 */
-                    if (is_inter && fc->mv_row_range) {
+                    if (is_inter) {
                         int required_row = row + fc->mv_row_range[row];
                         int spin_cnt = 0;
                         for (;;) {
                             int all_ready = 1;
                             for (int j = 0; j < fc->n_refs; j++) {
                                 avs2_frame *ref = fc->fref[j];
-                                if (!ref || !ref->lf_row_done) continue;
+                                if (!ref) continue;
                                 int rr = required_row;
                                 if (rr >= ref->h_lcu) rr = ref->h_lcu - 1;
                                 if (!avs2_atomic_load(&ref->lf_row_done[rr])) {
@@ -163,7 +163,7 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
                                      fc->n_refs > 0 && fc->fref[0] ? fc->fref[0]->done : -1,
                                      fc->n_refs > 0 && fc->fref[0] ?
                                      (int)avs2_atomic_load(&fc->fref[0]->lf_row_done_count) : -1);
-                                if (c->shutdown ||
+                                if (avs2_atomic_load(&c->shutdown) ||
                                     avs2_atomic_load(&fc->row_recon_completed))
                                     break;
                             }
@@ -234,7 +234,7 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
         if (got_task) continue;
 
         /* 无可用任务 */
-        if (c->shutdown) {
+        if (avs2_atomic_load(&c->shutdown)) {
             avs2_set_thread_scratch(NULL, NULL, NULL);
             return 1;
         }
@@ -317,7 +317,7 @@ void avs2_lf_helper(struct avs2_internal *c, avs2_frame_ctx *fc)
         /* spin-wait: 等待可用 LF 行 (lock-free 快速检查 + lock 领取) */
         for (;;) {
             if (fc->row_lf_done_count >= h_lcu) goto done;
-            if (c->shutdown) goto done;
+            if (avs2_atomic_load(&c->shutdown)) goto done;
 
             /* lock-free 快速检查 (racy read 用于进度判断, 领取时再加锁) */
             int next = fc->row_lf_next;
@@ -342,7 +342,7 @@ void avs2_lf_helper(struct avs2_internal *c, avs2_frame_ctx *fc)
                 avs2_mutex_unlock(&c->task_lock);
             }
 
-            if ((++spin_cnt & 0x3ff) == 0 && c->shutdown) goto done;
+            if ((++spin_cnt & 0x3ff) == 0 && avs2_atomic_load(&c->shutdown)) goto done;
             avs2_cpu_relax();
         }
 
@@ -645,10 +645,21 @@ static void *worker_thread(void *arg)
                         int refs_ready = 1;
                         for (int j = 0; j < cand->n_refs; j++) {
                             avs2_frame *ref = cand->fref[j];
-                            if (ref && !ref->done &&
-                                avs2_atomic_load(&ref->lf_row_done_count) < 2) {
-                                refs_ready = 0;
-                                break;
+                            if (ref && !ref->done) {
+                                /* 检查 p2_started: 若参考帧尚未开始 Phase 2,
+                                 * 当前帧的 Phase 2 会因行级 LF 依赖阻塞等待.
+                                 * 跳过此候选, 让 worker 先去做参考帧的 Phase 2
+                                 * (避免活锁: 所有 worker 都在依赖帧上 spin-wait
+                                 * 而无 worker 推进参考帧 P2). */
+                                if (!avs2_atomic_load(&ref->p2_started) &&
+                                    avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                                    refs_ready = 0;
+                                    break;
+                                }
+                                if (avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                                    refs_ready = 0;
+                                    break;
+                                }
                             }
                         }
                         if (refs_ready) {
@@ -947,8 +958,34 @@ avs2_ctx *avs2_open(const avs2_settings *s)
 
     c->fc = avs2_mem_allocz(sizeof(avs2_frame_ctx) * (size_t)c->n_fc);
     if (!c->fc) { avs2_mem_free(c); return NULL; }
+
+    /* 先初始化线程池同步原语, 确保 avs2_close 失败路径能安全销毁. */
+    avs2_mutex_init(&c->out_lock);
+    avs2_mutex_init(&c->task_lock);
+    avs2_cond_init(&c->task_cond);
+    avs2_cond_init(&c->done_cond);
+    avs2_cond_init(&c->recon_cond);
+    c->task_q_head = c->task_q_tail = 0;
+    c->phase2_q_head = c->phase2_q_tail = 0;
+    c->n_pending = 0;
+    avs2_atomic_store(&c->shutdown, 0);
+    c->n_waiters_task = 0;
+    c->n_waiters_done = 0;
+    c->n_waiters_recon = 0;
+    c->n_p2_active = 0;
+    c->n_threads_active = 0;
+    c->threads = NULL;
+    c->aec_threads = NULL;
+    c->recon_threads = NULL;
+    c->n_aec_threads = 0;
+    c->n_recon_threads = 0;
+    c->row_task_fc = NULL;
+    c->fc_inited = 0;  /* 标记 fc[i].lock 尚未初始化的数量上限 */
+    c->sync_inited = 1;  /* 同步原语已初始化, avs2_close 失败路径可安全销毁 */
+
     for (int i = 0; i < c->n_fc; i++) {
         avs2_mutex_init(&c->fc[i].lock);
+        c->fc_inited = i + 1;  /* 记录已初始化的 fc 数量, 便于失败路径精确销毁 */
         /* coeff_scratch_y/u/v 为静态数组, 无需分配 */
         c->fc[i].task_state = 0;  /* idle */
         /* 预分配 AEC 上下文 (避免每帧 create/destroy 堆操作) */
@@ -958,21 +995,6 @@ avs2_ctx *avs2_open(const avs2_settings *s)
             return NULL;
         }
     }
-    avs2_mutex_init(&c->out_lock);
-
-    /* 初始化线程池同步原语 */
-    avs2_mutex_init(&c->task_lock);
-    avs2_cond_init(&c->task_cond);
-    avs2_cond_init(&c->done_cond);
-    avs2_cond_init(&c->recon_cond);
-    c->task_q_head = c->task_q_tail = 0;
-    c->phase2_q_head = c->phase2_q_tail = 0;
-    c->n_pending = 0;
-    c->shutdown = 0;
-    c->n_waiters_task = 0;
-    c->n_waiters_done = 0;
-    c->n_waiters_recon = 0;
-    c->n_p2_active = 0;
     /* P2 并发上限: 防止 P2 优先调度导致 P1 (AEC) 饥饿.
      * ROW 模式: P2 用行级并行, 多 worker 可同时帮助一个帧的 P2,
      *   p2_cap = n_workers 允许所有 worker 同时做 P2, 行级 helper 机制
@@ -985,13 +1007,6 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->p2_cap = 1;
     }
     if (c->p2_cap < 1) c->p2_cap = 1;
-    c->n_threads_active = 0;
-    c->threads = NULL;
-    c->aec_threads = NULL;
-    c->recon_threads = NULL;
-    c->n_aec_threads = 0;
-    c->n_recon_threads = 0;
-    c->row_task_fc = NULL;     /* 行级并行: 当前无 fc 在 WPP */
 
     /* 创建 worker 线程 (n_threads > 1 时).
      * n_threads=1: n_threads_active=0, 走同步路径.
@@ -1108,9 +1123,18 @@ threads_created:;
         if (dpb_cap > AVS2_MAX_FRAME_DELAY) dpb_cap = AVS2_MAX_FRAME_DELAY;
         for (int i = 0; i < dpb_cap; i++) {
             c->dpb[i] = avs2_mem_allocz(sizeof(avs2_frame));
-            if (!c->dpb[i]) { avs2_close((avs2_ctx **)&c); return NULL; }
+            if (!c->dpb[i]) {
+                /* 失败: 手动释放已分配的 dpb[0..i-1], 避免泄漏
+                 * (此时 c->n_dpb 仍为 0, avs2_close 不会释放它们) */
+                for (int j = 0; j < i; j++) {
+                    avs2_mem_free(c->dpb[j]);
+                    c->dpb[j] = NULL;
+                }
+                avs2_close((avs2_ctx **)&c);
+                return NULL;
+            }
+            c->n_dpb = i + 1;  /* 实时更新, 确保 avs2_close 能正确释放 */
         }
-        c->n_dpb = dpb_cap;
     }
 
     avs2_info(c, "avs2dec %s opened (%d threads, %d frame contexts, %d workers)\n",
@@ -1123,8 +1147,9 @@ void avs2_close(avs2_ctx **ctx)
     if (!ctx || !*ctx) return;
     struct avs2_internal *c = (struct avs2_internal *)*ctx;
 
-    /* 关闭线程池: 设置 shutdown, 唤醒所有 worker, join */
-    if (c->n_threads_active > 0) {
+    /* 关闭线程池: 设置 shutdown, 唤醒所有 worker, join.
+     * 仅当同步原语已初始化时才进行 (avs2_open 失败路径可能未初始化). */
+    if (c->sync_inited && c->n_threads_active > 0) {
         avs2_mutex_lock(&c->task_lock);
         c->shutdown = 1;
         avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
@@ -1140,7 +1165,7 @@ void avs2_close(avs2_ctx **ctx)
                 avs2_thread_join(&c->recon_threads[i], NULL);
             avs2_mem_free(c->aec_threads); c->aec_threads = NULL;
             avs2_mem_free(c->recon_threads); c->recon_threads = NULL;
-        } else {
+        } else if (c->threads) {
             /* 通用 worker 模式 */
             for (int i = 0; i < c->n_threads_active; i++) {
                 if (c->threads[i]) {
@@ -1153,17 +1178,22 @@ void avs2_close(avs2_ctx **ctx)
         c->n_threads_active = 0;
     }
 
-    /* 销毁线程池同步原语 */
-    avs2_mutex_destroy(&c->task_lock);
-    avs2_cond_destroy(&c->task_cond);
-    avs2_cond_destroy(&c->done_cond);
-    avs2_cond_destroy(&c->recon_cond);
+    /* 销毁线程池同步原语 (仅当已初始化) */
+    if (c->sync_inited) {
+        avs2_mutex_destroy(&c->task_lock);
+        avs2_cond_destroy(&c->task_cond);
+        avs2_cond_destroy(&c->done_cond);
+        avs2_cond_destroy(&c->recon_cond);
+    }
 
     avs2_dpb_clear(c);
     for (int i = 0; i < c->n_dpb; i++)
         avs2_mem_free(c->dpb[i]);
 
-    for (int i = 0; i < c->n_fc; i++) {
+    /* 仅销毁已初始化的 fc[i].lock, 避免销毁未初始化互斥锁 (UB) */
+    int n_fc_to_destroy = c->fc_inited;
+    if (n_fc_to_destroy > c->n_fc) n_fc_to_destroy = c->n_fc;
+    for (int i = 0; i < n_fc_to_destroy; i++) {
         avs2_mutex_destroy(&c->fc[i].lock);
         /* coeff_scratch_y/u/v, row_aec_done/recon_done/lf_done, mv_row_range 为静态数组, 无需释放 */
         avs2_mem_free(c->fc[i].slice_buf);
@@ -1180,7 +1210,7 @@ void avs2_close(avs2_ctx **ctx)
     avs2_mem_free(c->seq);
     avs2_mem_free(c->pic);
     avs2_mem_free(c->in_buf);
-    avs2_mutex_destroy(&c->out_lock);
+    if (c->sync_inited) avs2_mutex_destroy(&c->out_lock);
     avs2_mem_free(c);
     *ctx = NULL;
 }
@@ -1193,13 +1223,24 @@ void avs2_close(avs2_ctx **ctx)
  */
 static int append_input(struct avs2_internal *c, const avs2_data *data)
 {
-    if ((size_t)c->in_buf_sz + data->sz > (size_t)c->in_buf_cap) {
-        int ncap = c->in_buf_cap ? c->in_buf_cap * 2 : 65536;
-        while (ncap < c->in_buf_sz + (int)data->sz) ncap *= 2;
-        uint8_t *nb = avs2_mem_realloc(c->in_buf, (size_t)ncap);
+    /* in_buf_sz/in_buf_cap 字段为 int, 校验 data->sz 不超过 int 范围,
+     * 避免 (int)data->sz 截断和后续累加溢出 (UB). */
+    if (data->sz > (size_t)INT32_MAX) return AVS2_ERR_INVALID;
+
+    size_t need = (size_t)c->in_buf_sz + data->sz;
+    if (need > (size_t)c->in_buf_cap) {
+        /* 使用 size_t 计算 ncap, 避免 int 乘以 2 溢出.
+         * 超过 INT32_MAX/2 时停止翻倍, 直接采用 need (若 need 仍合法). */
+        size_t ncap = c->in_buf_cap ? (size_t)c->in_buf_cap * 2 : 65536;
+        while (ncap < need) {
+            if (ncap > (size_t)INT32_MAX / 2) { ncap = need; break; }
+            ncap *= 2;
+        }
+        if (ncap > (size_t)INT32_MAX) return AVS2_ERR_INVALID;
+        uint8_t *nb = avs2_mem_realloc(c->in_buf, ncap);
         if (!nb) return AVS2_ERR_NOMEM;
         c->in_buf = nb;
-        c->in_buf_cap = ncap;
+        c->in_buf_cap = (int)ncap;
     }
     memcpy(c->in_buf + c->in_buf_sz, data->data, data->sz);
     c->in_buf_sz += (int)data->sz;
@@ -1227,11 +1268,13 @@ static int find_next_picture(struct avs2_internal *c, int offset)
 int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
 {
     struct avs2_internal *c = (struct avs2_internal *)ctx;
+    if (!ctx) return AVS2_ERR_INVALID;
     if (!data) {
         /* flush signal: 设置 flushing 标志, 然后处理缓冲区中剩余的帧.
          * 不在此处解码 — 落入下面的通用帧提取循环处理. */
         c->flushing = 1;
     } else {
+        if (!data->data && data->sz > 0) return AVS2_ERR_INVALID;
         int r = append_input(c, data);
         if (r) return r;
         if (data->free_cb) data->free_cb(data->data, data->ref);
@@ -1239,6 +1282,7 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
 
     /* Try to extract and decode complete frames. */
     int scan = 0;
+    int last_err = AVS2_OK;
     for (;;) {
         int p = find_next_picture(c, scan);
         if (p < 0) break;
@@ -1278,10 +1322,16 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
                 }
                 avs2_mutex_unlock(&c->task_lock);
             }
-            return AVS2_OK;
+            /* NOMEM 是可恢复的 (调用者输出帧后可重试), 返回 OK 让调用者继续.
+             * 但记录到 last_err 以便在无更多数据时通知调用者. */
+            if (last_err == AVS2_OK) last_err = AVS2_ERR_NOMEM;
+            break;
         }
         if (r2 < 0) {
             avs2_warn(c, "decode error: %d\n", r2);
+            /* 记录错误但继续消费数据 (避免错误帧卡住解码管线).
+             * 调用者可通过返回码感知解码失败. */
+            if (last_err == AVS2_OK) last_err = r2;
         }
         /* shift remaining bytes */
         int remain = c->in_buf_sz - q;
@@ -1290,7 +1340,7 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
         c->in_buf_sz = remain;
         scan = 0;
     }
-    return AVS2_OK;
+    return last_err;
 }
 
 int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
@@ -1447,10 +1497,26 @@ void avs2_picture_unref(avs2_ctx *ctx, avs2_picture *pic)
 void avs2_flush(avs2_ctx *ctx)
 {
     struct avs2_internal *c = (struct avs2_internal *)ctx;
+    if (!ctx) return;
     /* 设置 flushing 标志, 解码剩余数据, 但不清 DPB —
      * 用户需要通过 avs2_get_picture 取走剩余帧.
      * DPB 和输出状态在 avs2_close 中清理. */
+    avs2_mutex_lock(&c->task_lock);
     c->flushing = 1;
+    avs2_mutex_unlock(&c->task_lock);
     avs2_send_data(ctx, NULL);
     /* flushing 保持为 1, 让 avs2_get_picture 知道可以输出所有剩余帧 */
+
+    /* 重置解码状态, 使 flush 也可用于 seek 后重新开始解码.
+     * 注意: 不清空 DPB (用户可能仍在 get_picture 取帧), 但重置 POC 排序
+     * 起点和 COI 回绕计数, 使下一个序列从全新状态开始. */
+    avs2_mutex_lock(&c->out_lock);
+    c->out_initialized = 0;
+    c->out_next_poc = 0;
+    avs2_mutex_unlock(&c->out_lock);
+    avs2_mutex_lock(&c->task_lock);
+    c->i_prev_coi = -1;
+    c->i_tr_wrap_cnt = 0;
+    c->seq_logged = 0;
+    avs2_mutex_unlock(&c->task_lock);
 }

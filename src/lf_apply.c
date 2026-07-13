@@ -112,7 +112,9 @@ static avs2_frame *ensure_lf_tmp(avs2_frame_ctx *fc, const avs2_frame *src)
 
 /* --------------------------------------------------------------------------
  * 只拷贝当前 LCU 行 + 边界扩展区域的数据 (src -> dst)
- * SAO/ALF 滤波半径为 4 像素, 只需拷贝 [lcu_y*lcu - 4, lcu_y*lcu + lcu + 4) 行
+ * SAO/ALF 滤波半径为 4 像素. 行级并行模式下, 下一 LCU 行的重建可能正在
+ * 并发写入其顶部 4 行, 故底部边界不读取 (仅顶部读取上一行已完成的数据).
+ * 底部 4 行将保留 dst 中上一轮的拷贝或零, 影响可忽略 (边界上下文轻微不准).
  * -------------------------------------------------------------------------- */
 static void lf_copy_lcu_row(avs2_frame *dst, const avs2_frame *src,
                             int lcu_y, int lcu_size)
@@ -121,11 +123,12 @@ static void lf_copy_lcu_row(avs2_frame *dst, const avs2_frame *src,
     const int border = LF_SAO_SHIFT_PIX;  /* 4 像素边界 */
     int pl;
 
-    /* 亮度行范围 */
+    /* 亮度行范围: 顶部边界读取上一行 (已完成), 底部边界不读取下一行
+     * (避免与下一行重建线程的数据竞争). */
     int y_start = lcu_y * lcu_size;
     int y_end   = y_start + lcu_size;
     if (y_start > 0) y_start -= border;
-    if (y_end < src->height) y_end += border;
+    /* 注: 不再扩展 y_end += border, 防止读取下一 LCU 行正在重建的像素 */
     if (y_start < 0) y_start = 0;
     if (y_end > src->height) y_end = src->height;
 

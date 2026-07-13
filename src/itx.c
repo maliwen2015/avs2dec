@@ -450,8 +450,9 @@ static void idct_64x64_c(const int16_t *src, int16_t *dst, int i_dst, int bit_de
 
     /* 步骤 1: 竖直方向 LOT 滤波 */
     for (x = 0; x < n0; x++) {
-        /* 拷贝 */
-        for (y = 0, offset = 0; y < n1; y++, offset += 32) {
+        /* 拷贝: offset 按 i_dst (=64) 步进, 读取 32x32 IDCT 输出的 32 行.
+         * 原 offset += 32 是步长错误 (i_dst 的一半), 会读到列错位的数据. */
+        for (y = 0, offset = 0; y < n1; y++, offset += n0) {
             p_ext[y << 1] = dst[x + offset];
         }
 

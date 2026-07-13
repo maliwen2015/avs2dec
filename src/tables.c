@@ -1,6 +1,7 @@
 #include "tables.h"
 #include "levels.h"
 #include <math.h>
+#include <stddef.h>  /* NULL */
 
 /* Frame rate id -> fps */
 const float avs2_tab_frame_rate[13] = {
