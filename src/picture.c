@@ -272,22 +272,13 @@ avs2_frame *avs2_dpb_get_free(struct avs2_internal *c)
         c->dpb[c->n_dpb] = avs2_mem_allocz(sizeof(avs2_frame));
         return c->dpb[c->n_dpb++];
     }
-    /* 4. 最后手段: 释放已完成、不被参考且无 worker/user 引用的最老帧 (即使未输出).
-     * 此路径仅在 DPB 已达上限 (AVS2_MAX_FRAME_DELAY) 时触发, 属于极端内存压力
-     * 下的损失性回收: 丢弃一帧以避免 NOMEM 停摆 (帧并行模式下显示顺序与解码顺序
-     * 不同, 未输出但已不被参考的帧会在 DPB 中堆积, 输出停滞时可能涨至上限).
-     *
-     * 必须检查 f->done: ref_cnt<=1 仅表示无正在解码的帧引用此帧, 但帧自身可能
-     * 仍在解码中 (refered_by_others=0 的帧解码期间 ref_cnt 保持 1). 回收未完成
-     * 的帧会导致 worker 写入被 avs2_frame_alloc 复用/memset 的缓冲区. 原代码靠
-     * f->output 隐式保证 done (MT 下 output=1 蕴含 done=1), 移除 output 条件后
-     * 必须显式检查 done. */
+    /* 4. 最后手段: 释放不被参考且无用户引用的最老帧 (即使未输出) */
     {
         int oldest_coi = 0x7fffffff;
         avs2_frame *oldest = NULL;
         for (int i = 0; i < c->n_dpb; i++) {
             avs2_frame *f = c->dpb[i];
-            if (f && f->used && f->done && !f->referenced && f->ref_cnt <= 1 && f->coi < oldest_coi) {
+            if (f && f->used && !f->referenced && f->output && f->ref_cnt <= 1 && f->coi < oldest_coi) {
                 oldest_coi = f->coi;
                 oldest = f;
             }
