@@ -10,6 +10,7 @@ typedef struct {
     int avx2;
     int avx512;
     int neon;
+    int dotprod;  /* ARM NEON dot product (SDOT/USDOT) */
 } avs2_cpu_flags;
 
 void avs2_cpu_detect(avs2_cpu_flags *flags);

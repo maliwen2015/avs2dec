@@ -354,27 +354,16 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
         f->coi = (int)fc->pic_local.coding_order;
 
         /* 通知依赖此帧 AEC 的后续帧: Phase 1 已开始.
-         * 通用模式 (多 worker): aec_started 信号立即递减 n_aec_deps, 允许 B 帧
-         *   AEC 与此帧 AEC 在不同 worker 并行 (derive_skip_mv 按行 spin-wait).
-         * 行级流水线模式 (单 AEC 线程): 不在此递减, 等 Phase 1 完成 (aec_done)
-         *   时递减. 否则 AEC 线程在 B 帧 derive_skip_mv spin-wait col_pic AEC
-         *   行, 但 col_pic AEC 尚未开始 (串行), 死锁. */
+         * 所有模式统一在 Phase 1 完成 (aec_done) 时递减 n_aec_deps:
+         *   通用模式曾在 aec_started 时立即递减以允许 B 帧 AEC 与 col_pic AEC
+         *   并行, 但 derive_skip_mv 在 AEC 内部按行 spin-wait col_pic 的
+         *   aec_row_done, 当多个 worker 各自陷入 derive_skip_mv 的链式等待
+         *   (帧 N 等 col_pic N-1, N-1 又等 N-2, ...) 且无空闲 worker 推进
+         *   链首帧时形成活锁 (threads 2~8 时实测 0.09~0.5 fps).
+         *   改为 aec_done 递减后 AEC 串行, derive_skip_mv 的 spin 变为
+         *   防御性检查 (col_pic AEC 已完成, 立即通过). */
         avs2_mutex_lock(&c->task_lock);
         fc->aec_started = 1;
-        if (c->n_aec_threads == 0) {
-            for (int i = 0; i < c->n_fc; i++) {
-                avs2_frame_ctx *other = &c->fc[i];
-                if (other != fc && (other->task_state == 1 || other->task_state == 2 ||
-                                    other->task_state == 5 || other->task_state == 6) &&
-                    other->n_refs > 0 && other->fref[0] == fc->fdec &&
-                    !IS_INTRA(other->slice_type)) {
-                    other->n_aec_deps--;
-                    if (other->n_aec_deps == 0 && other->task_state == 1) {
-                        avs2_cond_signal(&c->task_cond);
-                    }
-                }
-            }
-        }
         avs2_mutex_unlock(&c->task_lock);
 
         for (int lcu_y = 0; lcu_y < f->h_lcu; lcu_y++) {
@@ -426,13 +415,12 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
         fc->aec = NULL;
     }
 
-    /* ---- Phase 1 完成: 设置 aec_done ----
-     * 通用模式: n_aec_deps 已在 Phase 1 开始时 (aec_started 信号) 递减.
-     * 行级流水线模式: n_aec_deps 在此 (aec_done 信号) 递减, 确保 AEC 线程
-     *   串行处理时 B 帧 AEC 不会在 col_pic AEC 完成前启动. */
+    /* ---- Phase 1 完成: 设置 aec_done, 统一在此递减 n_aec_deps ----
+     * 所有模式: 等 col_pic 的 AEC 完全完成后才启动依赖帧的 AEC (P1 串行),
+     * 消除 derive_skip_mv 跨线程行级 spin-wait 的活锁风险. */
     avs2_mutex_lock(&c->task_lock);
     fc->aec_done = 1;
-    if (c->n_aec_threads > 0) {
+    {
         for (int i = 0; i < c->n_fc; i++) {
             avs2_frame_ctx *other = &c->fc[i];
             if (other != fc && (other->task_state == 1 || other->task_state == 2 ||

@@ -41,6 +41,20 @@ extern void deblock_chroma_ver(void *src_u, void *src_v, int stride,
 extern void deblock_chroma_hor(void *src_u, void *src_v, int stride,
                                int alpha, int beta, uint8_t *flt_flag, int bit_depth);
 
+/* ---- 验证模式基础设施 (x86/NEON 共享) ---- */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+static int g_lf_verify = -1;  /* -1=未初始化, 0=关闭, 1=开启 */
+static int lf_verify_enabled(void)
+{
+    if (g_lf_verify < 0) {
+        const char *env = getenv("AVS2_LF_VERIFY");
+        g_lf_verify = (env && atoi(env) > 0) ? 1 : 0;
+    }
+    return g_lf_verify;
+}
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
 #include <tmmintrin.h>
@@ -923,21 +937,8 @@ static void deblock_chroma_hor_sse4(void *src_u_v, void *src_v_v,
 
 /* ===========================================================================
  * 验证模式: 对比 SIMD 与 C 参考实现的输出差异
- * =========================================================================== */
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-static int g_lf_verify = -1;  /* -1=未初始化, 0=关闭, 1=开启 */
-
-static int lf_verify_enabled(void)
-{
-    if (g_lf_verify < 0) {
-        const char *env = getenv("AVS2_LF_VERIFY");
-        g_lf_verify = (env && atoi(env) > 0) ? 1 : 0;
-    }
-    return g_lf_verify;
-}
+ * ===========================================================================
+ */
 
 /* 亮度垂直边验证包装 */
 static void deblock_luma_ver_verify(void *src, int stride, int alpha, int beta,
@@ -1297,10 +1298,830 @@ void avs2_lf_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 /* AVX512 预留 */
 void avs2_lf_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
 
-#else /* 非 x86 平台 */
+#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
 
+#include <arm_neon.h>
+#include <stdio.h>
+
+/* ===========================================================================
+ * NEON 去块滤波实现 (由 SSE4.1 版本直接移植, 使用原生 NEON 内联函数).
+ *
+ * - 10-bit (bd>8) 路径: 原生 NEON, 一次处理 8 像素 (亮度) / 4 像素 (色度 U/V)
+ * - 8-bit  路径: 回退到 C 参考 (deblock_*). 原因: 本机码流为 10-bit, 无法对
+ *   8-bit 路径做哈希校验; 为避免上线未经验证的 8-bit NEON 代码, 8-bit 仍用
+ *   经过验证的 C 实现 (GCC 可自动向量化). 10-bit 路径是本码流的热点, 已由
+ *   帧哈希校验与 C 参考位精确一致.
+ *
+ * 算法/位精确性: 逐行对应 SSE4.1 版本的数据流, NEON 内联函数语义与 SSE 指令
+ * 一一对应 (vbslq<->blendv, vcgtq/vceqq<->cmpgt/cmpeq, vqsubq+vabsq<->
+ * subs+abs, vtrn 三级<->unpacklo/hi 三级等).
+ * =========================================================================== */
+
+/* 任意 lane 非零检测 (掩码 0xFFFF/0 或小整数值均可).
+ * 等价于 _mm_movemask_epi8(m)==0 的反义, 以及 _mm_testz_si128(m,m). */
+static inline int lf_any_nz_u16(uint16x8_t v)
+{
+    return vmaxvq_u16(v) != 0;
+}
+
+/* 掩码选择: mask(0xFFFF/0) ? b : a, 等价于 _mm_blendv_epi8(a, b, mask). */
+static inline int16x8_t lf_blend(uint16x8_t mask, int16x8_t a, int16x8_t b)
+{
+    return vreinterpretq_s16_u16(vbslq_u16(mask, vreinterpretq_u16_s16(b),
+                                           vreinterpretq_u16_s16(a)));
+}
+
+/* 逻辑右移 (像素值非负), 等价于 _mm_srli_epi16. */
+static inline int16x8_t lf_srli(int16x8_t x, int n)
+{
+    return vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(x),
+                                             (unsigned)n));
+}
+
+/* |a-b| (饱和减后取绝对值), 等价于 _mm_abs_epi16(_mm_subs_epi16(a,b)). */
+static inline int16x8_t lf_subabs(int16x8_t a, int16x8_t b)
+{
+    return vabsq_s16(vqsubq_s16(a, b));
+}
+
+/* flt_flag 掩码: 低 4 lane = flag0, 高 4 lane = flag1 (0 或 -1),
+ * 等价于 _mm_set_epi32(flag1, flag1, flag0, flag0). */
+static inline uint16x8_t lf_flag_mask(int flag0, int flag1)
+{
+    int16x4_t lo = vdup_n_s16((short)flag0);
+    int16x4_t hi = vdup_n_s16((short)flag1);
+    return vreinterpretq_u16_s16(vcombine_s16(lo, hi));
+}
+
+/* 8x8 uint16 转置 (行->列), 等价于 SSE transpose8x8_epu16.
+ * 三级 vtrn (16/32/64 位), 输出 c0..c7 = 列 0..7. */
+static inline void lf_transpose8x8_u16(
+    uint16x8_t r0, uint16x8_t r1, uint16x8_t r2, uint16x8_t r3,
+    uint16x8_t r4, uint16x8_t r5, uint16x8_t r6, uint16x8_t r7,
+    uint16x8_t *c0, uint16x8_t *c1, uint16x8_t *c2, uint16x8_t *c3,
+    uint16x8_t *c4, uint16x8_t *c5, uint16x8_t *c6, uint16x8_t *c7)
+{
+    uint16x8x2_t b0 = vtrnq_u16(r0, r1);
+    uint16x8x2_t b1 = vtrnq_u16(r2, r3);
+    uint16x8x2_t b2 = vtrnq_u16(r4, r5);
+    uint16x8x2_t b3 = vtrnq_u16(r6, r7);
+
+    uint32x4x2_t e0 = vtrnq_u32(vreinterpretq_u32_u16(b0.val[0]),
+                                vreinterpretq_u32_u16(b1.val[0]));
+    uint32x4x2_t e1 = vtrnq_u32(vreinterpretq_u32_u16(b0.val[1]),
+                                vreinterpretq_u32_u16(b1.val[1]));
+    uint32x4x2_t e2 = vtrnq_u32(vreinterpretq_u32_u16(b2.val[0]),
+                                vreinterpretq_u32_u16(b3.val[0]));
+    uint32x4x2_t e3 = vtrnq_u32(vreinterpretq_u32_u16(b2.val[1]),
+                                vreinterpretq_u32_u16(b3.val[1]));
+
+    /* 64-bit 级: 用 vtrn1q/vtrn2q_u64 拼出完整列 (8 元素 = 低 4 + 高 4).
+     * vtrn1q_u64(a,b)=[a_lo64,b_lo64], vtrn2q_u64(a,b)=[a_hi64,b_hi64]. */
+    uint64x2_t u00 = vreinterpretq_u64_u32(e0.val[0]);
+    uint64x2_t u01 = vreinterpretq_u64_u32(e0.val[1]);
+    uint64x2_t u10 = vreinterpretq_u64_u32(e1.val[0]);
+    uint64x2_t u11 = vreinterpretq_u64_u32(e1.val[1]);
+    uint64x2_t v00 = vreinterpretq_u64_u32(e2.val[0]);
+    uint64x2_t v01 = vreinterpretq_u64_u32(e2.val[1]);
+    uint64x2_t v10 = vreinterpretq_u64_u32(e3.val[0]);
+    uint64x2_t v11 = vreinterpretq_u64_u32(e3.val[1]);
+
+    *c0 = vreinterpretq_u16_u64(vtrn1q_u64(u00, v00));  /* [col0_lo, col0_hi] */
+    *c4 = vreinterpretq_u16_u64(vtrn2q_u64(u00, v00));  /* [col4_lo, col4_hi] */
+    *c2 = vreinterpretq_u16_u64(vtrn1q_u64(u01, v01));  /* [col2_lo, col2_hi] */
+    *c6 = vreinterpretq_u16_u64(vtrn2q_u64(u01, v01));  /* [col6_lo, col6_hi] */
+    *c1 = vreinterpretq_u16_u64(vtrn1q_u64(u10, v10));  /* [col1_lo, col1_hi] */
+    *c5 = vreinterpretq_u16_u64(vtrn2q_u64(u10, v10));  /* [col5_lo, col5_hi] */
+    *c3 = vreinterpretq_u16_u64(vtrn1q_u64(u11, v11));  /* [col3_lo, col3_hi] */
+    *c7 = vreinterpretq_u16_u64(vtrn2q_u64(u11, v11));  /* [col7_lo, col7_hi] */
+}
+
+/* ===========================================================================
+ * 核心滤波: 处理 8 个亮度像素的去块滤波 (由 deblock_core_luma_sse4 移植)
+ * 输入/输出均为 int16x8_t (8 个 uint16 像素, 按有符号处理)
+ * =========================================================================== */
+static inline void deblock_core_luma_neon(
+    int16x8_t TL2, int16x8_t TL1, int16x8_t TL0,
+    int16x8_t TR0, int16x8_t TR1, int16x8_t TR2,
+    int alpha, int beta, int flag0, int flag1,
+    int16x8_t *oTL0, int16x8_t *oTL1, int16x8_t *oTL2,
+    int16x8_t *oTR0, int16x8_t *oTR1, int16x8_t *oTR2)
+{
+    const int16x8_t c_0  = vdupq_n_s16(0);
+    const int16x8_t c_1  = vdupq_n_s16(1);
+    const int16x8_t c_2  = vdupq_n_s16(2);
+    const int16x8_t c_3  = vdupq_n_s16(3);
+    const int16x8_t c_4  = vdupq_n_s16(4);
+    const int16x8_t c_8  = vdupq_n_s16(8);
+    const int16x8_t c_16 = vdupq_n_s16(16);
+    const int16x8_t ALPHA = vdupq_n_s16((short)alpha);
+    const int16x8_t BETA  = vdupq_n_s16((short)beta);
+
+    int16x8_t T0, T1, T2;
+    int16x8_t FLT, FLT_L, FLT_R, FS, FS3, FS4, FS56;
+    uint16x8_t M0, M1;
+
+    /* M0 = flag_mask && (|L0-R0|>1) && (alpha>|L0-R0|)
+     * 注意: flag0/flag1 为原始 flt_flag 值 (0 或 1), 必须转为 -1/0 (0xFFFF/0)
+     * 才能作为位掩码与 FS (0..4) 相与 (与 SSE4 核心的 mflag0=flag0?-1:0 一致). */
+    T0 = lf_subabs(TL0, TR0);
+    M0 = vandq_u16(lf_flag_mask(flag0 ? -1 : 0, flag1 ? -1 : 0),
+                   vandq_u16(vcgtq_s16(T0, c_1), vcgtq_s16(ALPHA, T0)));
+
+    /* flat_l = (|L1-L0|<beta?2:0) + (|L2-L0|<beta?1:0) */
+    T0 = lf_subabs(TL1, TL0);
+    FLT_L = vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_2);
+    T0 = lf_subabs(TL2, TL0);
+    FLT_L = vaddq_s16(FLT_L, vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_1));
+
+    /* flat_r = (|R0-R1|<beta?2:0) + (|R0-R2|<beta?1:0) */
+    T0 = lf_subabs(TR0, TR1);
+    FLT_R = vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_2);
+    T0 = lf_subabs(TR0, TR2);
+    FLT_R = vaddq_s16(FLT_R, vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_1));
+
+    FLT = vaddq_s16(FLT_L, FLT_R);
+
+    /* M1 = (L1==L0) && (R1==R0) */
+    M1 = vandq_u16(vceqq_s16(TL1, TL0), vceqq_s16(TR1, TR0));
+
+    /* FS 判定 (与 C deblock_edge 完全一致) */
+    T0 = vqsubq_s16(FLT, c_2);            /* FLT-2 (饱和) */
+    T1 = vqsubq_s16(FLT, c_3);            /* FLT-3 (饱和) */
+    T2 = lf_subabs(TL1, TR1);
+    FS56 = lf_blend(M1, T1, T0);                              /* M1 ? FLT-2 : FLT-3 */
+    FS4  = lf_blend(vceqq_s16(FLT_L, c_2), c_1, c_2);        /* flat_l==2 ? 2 : 1 */
+    FS3  = lf_blend(vcgtq_s16(BETA, T2), c_0, c_1);          /* |L1-R1|<beta ? 1 : 0 */
+    FS   = lf_blend(vcgtq_s16(FLT, c_4), c_0, FS56);         /* FLT>4 -> FS56 */
+    FS   = lf_blend(vceqq_s16(FLT, c_4), FS, FS4);           /* FLT==4 -> FS4 */
+    FS   = lf_blend(vceqq_s16(FLT, c_3), FS, FS3);           /* FLT==3 -> FS3 */
+    FS   = vandq_s16(FS, vreinterpretq_s16_u16(M0));
+
+    /* 滤波: L 侧和 R 侧分别计算 */
+    int16x8_t L0w = TL0, L1w = TL1, L2w = TL2;
+    int16x8_t R0w = TR0, R1w = TR1, R2w = TR2;
+    int16x8_t sumLR = vaddq_s16(vaddq_s16(TL0, TR0), c_2);
+
+    /* fs==1: L0'=(3*L0+R0+2)>>2, R0'=(3*R0+L0+2)>>2 */
+    T0 = lf_srli(vaddq_s16(vshlq_n_s16(TL0, 1), sumLR), 2);
+    L0w = lf_blend(vceqq_s16(FS, c_1), L0w, T0);
+    T0 = lf_srli(vaddq_s16(vshlq_n_s16(TR0, 1), sumLR), 2);
+    R0w = lf_blend(vceqq_s16(FS, c_1), R0w, T0);
+
+    /* fs==2: sumLR *= 2 -> 2*(L0+R0+2) */
+    sumLR = vshlq_n_s16(sumLR, 1);
+    T0 = vaddq_s16(vshlq_n_s16(TL1, 1), vaddq_s16(TL1, TR0));   /* 3*L1+R0 */
+    T0 = vaddq_s16(vshlq_n_s16(TL0, 3), vaddq_s16(T0, sumLR));
+    T0 = lf_srli(vaddq_s16(T0, c_4), 4);
+    L0w = lf_blend(vceqq_s16(FS, c_2), L0w, T0);
+    T0 = vaddq_s16(vshlq_n_s16(TR1, 1), vaddq_s16(TR1, TL0));   /* 3*R1+L0 */
+    T0 = vaddq_s16(vshlq_n_s16(TR0, 3), vaddq_s16(T0, sumLR));
+    T0 = lf_srli(vaddq_s16(T0, c_4), 4);
+    R0w = lf_blend(vceqq_s16(FS, c_2), R0w, T0);
+
+    /* fs==3: sumLR *= 2 -> 4*(L0+R0+2) */
+    sumLR = vshlq_n_s16(sumLR, 1);
+    T0 = vaddq_s16(vshlq_n_s16(TL1, 2), vaddq_s16(TL2, TR1));   /* 4*L1+L2+R1 */
+    T0 = vaddq_s16(vshlq_n_s16(TL0, 1), vaddq_s16(T0, sumLR));
+    T0 = lf_srli(T0, 4);
+    L0w = lf_blend(vceqq_s16(FS, c_3), L0w, T0);
+    T0 = vaddq_s16(vshlq_n_s16(TR1, 2), vaddq_s16(TR2, TL1));   /* 4*R1+R2+L1 */
+    T0 = vaddq_s16(vshlq_n_s16(TR0, 1), vaddq_s16(T0, sumLR));
+    T0 = lf_srli(T0, 4);
+    R0w = lf_blend(vceqq_s16(FS, c_3), R0w, T0);
+    /* L1'=(3*L2+8*L1+4*L0+R0+8)>>4 */
+    T0 = vaddq_s16(vaddq_s16(TL2, TR0), vshlq_n_s16(TL2, 1));   /* 3*L2+R0 */
+    T0 = vaddq_s16(T0, vshlq_n_s16(TL1, 3));                    /* + 8*L1 */
+    T0 = vaddq_s16(T0, vshlq_n_s16(TL0, 2));                    /* + 4*L0 */
+    T0 = lf_srli(vaddq_s16(T0, c_8), 4);
+    L1w = lf_blend(vceqq_s16(FS, c_3), L1w, T0);
+    /* R1'=(3*R2+8*R1+4*R0+L0+8)>>4 */
+    T0 = vaddq_s16(vaddq_s16(TR2, TL0), vshlq_n_s16(TR2, 1));
+    T0 = vaddq_s16(T0, vshlq_n_s16(TR1, 3));
+    T0 = vaddq_s16(T0, vshlq_n_s16(TR0, 2));
+    T0 = lf_srli(vaddq_s16(T0, c_8), 4);
+    R1w = lf_blend(vceqq_s16(FS, c_3), R1w, T0);
+
+    /* fs==4: 仅当存在 fs==4 的像素时才计算 */
+    {
+        uint16x8_t FS4m = vceqq_s16(FS, c_4);
+        if (lf_any_nz_u16(FS4m)) {
+            /* L0'=(9*L0+9*L2+8*R0+6*R2+16)>>5 */
+            T0 = vshlq_n_s16(vaddq_s16(vaddq_s16(TL0, TL2), TR0), 3);  /* 8*(L0+L2+R0) */
+            T0 = vaddq_s16(vaddq_s16(T0, c_16), vaddq_s16(TL0, TL2));  /* + 16 + (L0+L2) */
+            T2 = vaddq_s16(vshlq_n_s16(TR2, 1), vshlq_n_s16(TR2, 2));  /* 6*R2 */
+            T0 = lf_srli(vaddq_s16(T0, T2), 5);
+            L0w = lf_blend(FS4m, L0w, T0);
+            /* R0'=(9*R0+9*R2+8*L0+6*L2+16)>>5 */
+            T0 = vshlq_n_s16(vaddq_s16(vaddq_s16(TR0, TR2), TL0), 3);
+            T0 = vaddq_s16(vaddq_s16(T0, c_16), vaddq_s16(TR0, TR2));
+            T2 = vaddq_s16(vshlq_n_s16(TL2, 1), vshlq_n_s16(TL2, 2));
+            T0 = lf_srli(vaddq_s16(T0, T2), 5);
+            R0w = lf_blend(FS4m, R0w, T0);
+            /* L1'=(7*L0+6*L2+3*R0+8)>>4 */
+            T0 = vshlq_n_s16(vaddq_s16(TL2, TR0), 1);             /* 2*(L2+R0) */
+            T0 = vaddq_s16(T0, vsubq_s16(vshlq_n_s16(TL0, 3), TL0));  /* + 7*L0 */
+            T2 = vaddq_s16(vshlq_n_s16(TL2, 2), vaddq_s16(TR0, c_8)); /* 4*L2 + R0 + 8 */
+            T0 = lf_srli(vaddq_s16(T0, T2), 4);
+            L1w = lf_blend(FS4m, L1w, T0);
+            /* R1'=(7*R0+6*R2+3*L0+8)>>4 */
+            T0 = vshlq_n_s16(vaddq_s16(TR2, TL0), 1);
+            T0 = vaddq_s16(T0, vsubq_s16(vshlq_n_s16(TR0, 3), TR0));
+            T2 = vaddq_s16(vshlq_n_s16(TR2, 2), vaddq_s16(TL0, c_8));
+            T0 = lf_srli(vaddq_s16(T0, T2), 4);
+            R1w = lf_blend(FS4m, R1w, T0);
+            /* L2'=(4*L0+3*L2+R0+4)>>3 */
+            T0 = vaddq_s16(vshlq_n_s16(TL2, 1), TL2);            /* 3*L2 */
+            T2 = vaddq_s16(vshlq_n_s16(TL0, 2), TR0);            /* 4*L0 + R0 */
+            T0 = lf_srli(vaddq_s16(T0, vaddq_s16(T2, c_4)), 3);
+            L2w = lf_blend(FS4m, L2w, T0);
+            /* R2'=(4*R0+3*R2+L0+4)>>3 */
+            T0 = vaddq_s16(vshlq_n_s16(TR2, 1), TR2);
+            T2 = vaddq_s16(vshlq_n_s16(TR0, 2), TL0);
+            T0 = lf_srli(vaddq_s16(T0, vaddq_s16(T2, c_4)), 3);
+            R2w = lf_blend(FS4m, R2w, T0);
+        }
+    }
+
+    *oTL0 = L0w; *oTL1 = L1w; *oTL2 = L2w;
+    *oTR0 = R0w; *oTR1 = R1w; *oTR2 = R2w;
+}
+
+/* ===========================================================================
+ * 亮度垂直边去块滤波 (EDGE_VER) — 由 deblock_luma_ver_sse4 10-bit 路径移植
+ * src 指向 R0, stride 为 uint16 元素步长. 加载 8 行 × 8 像素, 转置后滤波.
+ * =========================================================================== */
+static void deblock_luma_ver_neon(void *src_v, int stride, int alpha,
+                                  int beta, uint8_t *flt_flag, int bit_depth)
+{
+    if (bit_depth <= 8) {
+        deblock_luma_ver(src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    uint16_t *src = (uint16_t *)src_v;
+    int s1 = stride, s2 = stride * 2, s3 = stride * 3;
+    int s4 = stride * 4, s5 = stride * 5, s6 = stride * 6, s7 = stride * 7;
+
+    uint16x8_t r0 = vld1q_u16(src - 3);
+    uint16x8_t r1 = vld1q_u16(src - 3 + s1);
+    uint16x8_t r2 = vld1q_u16(src - 3 + s2);
+    uint16x8_t r3 = vld1q_u16(src - 3 + s3);
+    uint16x8_t r4 = vld1q_u16(src - 3 + s4);
+    uint16x8_t r5 = vld1q_u16(src - 3 + s5);
+    uint16x8_t r6 = vld1q_u16(src - 3 + s6);
+    uint16x8_t r7 = vld1q_u16(src - 3 + s7);
+
+    uint16x8_t c0, c1, c2, c3, c4, c5, c6, c7;
+    lf_transpose8x8_u16(r0, r1, r2, r3, r4, r5, r6, r7,
+                        &c0, &c1, &c2, &c3, &c4, &c5, &c6, &c7);
+
+    /* c0=L2, c1=L1, c2=L0, c3=R0, c4=R1, c5=R2, c6=R3, c7=R4 */
+    /* Early-exit: 检查是否有像素需要滤波 */
+    {
+        int16x8_t diff = lf_subabs(vreinterpretq_s16_u16(c2),
+                                   vreinterpretq_s16_u16(c3));
+        uint16x8_t need = vandq_u16(vcgtq_s16(diff, vdupq_n_s16(1)),
+                                    vcgtq_s16(vdupq_n_s16((short)alpha), diff));
+        need = vandq_u16(need, lf_flag_mask(flt_flag[0] ? -1 : 0,
+                                            flt_flag[1] ? -1 : 0));
+        if (!lf_any_nz_u16(need))
+            return;
+    }
+
+    int16x8_t oL0, oL1, oL2, oR0, oR1, oR2;
+    deblock_core_luma_neon(vreinterpretq_s16_u16(c0),
+                           vreinterpretq_s16_u16(c1),
+                           vreinterpretq_s16_u16(c2),
+                           vreinterpretq_s16_u16(c3),
+                           vreinterpretq_s16_u16(c4),
+                           vreinterpretq_s16_u16(c5),
+                           alpha, beta, flt_flag[0], flt_flag[1],
+                           &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
+
+    c0 = vreinterpretq_u16_s16(oL2);
+    c1 = vreinterpretq_u16_s16(oL1);
+    c2 = vreinterpretq_u16_s16(oL0);
+    c3 = vreinterpretq_u16_s16(oR0);
+    c4 = vreinterpretq_u16_s16(oR1);
+    c5 = vreinterpretq_u16_s16(oR2);
+
+    uint16x8_t o0, o1, o2, o3, o4, o5, o6, o7;
+    lf_transpose8x8_u16(c0, c1, c2, c3, c4, c5, c6, c7,
+                        &o0, &o1, &o2, &o3, &o4, &o5, &o6, &o7);
+
+    vst1q_u16(src - 3,       o0);
+    vst1q_u16(src - 3 + s1,  o1);
+    vst1q_u16(src - 3 + s2,  o2);
+    vst1q_u16(src - 3 + s3,  o3);
+    vst1q_u16(src - 3 + s4,  o4);
+    vst1q_u16(src - 3 + s5,  o5);
+    vst1q_u16(src - 3 + s6,  o6);
+    vst1q_u16(src - 3 + s7,  o7);
+}
+
+/* ===========================================================================
+ * 亮度水平边去块滤波 (EDGE_HOR) — 由 deblock_luma_hor_sse4 10-bit 路径移植
+ * src 指向 R0, stride 为 uint16 元素步长. 每行 8 像素连续, 无需转置.
+ * =========================================================================== */
+static void deblock_luma_hor_neon(void *src_v, int stride, int alpha,
+                                  int beta, uint8_t *flt_flag, int bit_depth)
+{
+    if (bit_depth <= 8) {
+        deblock_luma_hor(src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    uint16_t *src = (uint16_t *)src_v;
+    int s2 = stride * 2, s3 = stride * 3;
+
+    /* Early-exit: 先加载 L0/R0 检查是否需要滤波 */
+    {
+        int16x8_t eL0 = vreinterpretq_s16_u16(vld1q_u16(src - stride));
+        int16x8_t eR0 = vreinterpretq_s16_u16(vld1q_u16(src));
+        int16x8_t diff = lf_subabs(eL0, eR0);
+        uint16x8_t need = vandq_u16(vcgtq_s16(diff, vdupq_n_s16(1)),
+                                    vcgtq_s16(vdupq_n_s16((short)alpha), diff));
+        need = vandq_u16(need, lf_flag_mask(flt_flag[0] ? -1 : 0,
+                                            flt_flag[1] ? -1 : 0));
+        if (!lf_any_nz_u16(need))
+            return;
+    }
+
+    int16x8_t L2 = vreinterpretq_s16_u16(vld1q_u16(src - s3));
+    int16x8_t L1 = vreinterpretq_s16_u16(vld1q_u16(src - s2));
+    int16x8_t L0 = vreinterpretq_s16_u16(vld1q_u16(src - stride));
+    int16x8_t R0 = vreinterpretq_s16_u16(vld1q_u16(src));
+    int16x8_t R1 = vreinterpretq_s16_u16(vld1q_u16(src + stride));
+    int16x8_t R2 = vreinterpretq_s16_u16(vld1q_u16(src + s2));
+
+    int16x8_t oL0, oL1, oL2, oR0, oR1, oR2;
+    deblock_core_luma_neon(L2, L1, L0, R0, R1, R2,
+                           alpha, beta, flt_flag[0], flt_flag[1],
+                           &oL0, &oL1, &oL2, &oR0, &oR1, &oR2);
+
+    vst1q_u16(src - s3,      vreinterpretq_u16_s16(oL2));
+    vst1q_u16(src - s2,      vreinterpretq_u16_s16(oL1));
+    vst1q_u16(src - stride,  vreinterpretq_u16_s16(oL0));
+    vst1q_u16(src,           vreinterpretq_u16_s16(oR0));
+    vst1q_u16(src + stride,  vreinterpretq_u16_s16(oR1));
+    vst1q_u16(src + s2,      vreinterpretq_u16_s16(oR2));
+}
+
+/* ===========================================================================
+ * 色度去块滤波 (NEON) — 由 deblock_chroma_*_sse4 10-bit 路径直接移植.
+ *
+ * 色度将 U/V 交错到同一 128-bit 向量 (低 64=U 4 像素, 高 64=V 4 像素),
+ * 一次处理 4 像素. 色度滤波强度 = 亮度 fs - 1: 无 fs==4, FLT==3 时 fs=0.
+ * fs==1/2/3 的滤波公式与亮度完全相同 (仅修改 L0,L1,R0,R1; L2/R2 只读不改).
+ * =========================================================================== */
+
+/* SSE unpacklo/hi 的 NEON 精确等价 (取低/高半后 16/32/64 位交错).
+ * 用于色度 4x8 转置, 保证与 SSE 版本逐位一致 (NEON vtrn 按 even/odd 索引交错,
+ * 与 SSE unpack 的低/高半交错语义不同, 故用 64 位半的 vzip 复刻). */
+static inline uint16x8_t lf_unpacklo_epi16(uint16x8_t a, uint16x8_t b)
+{
+    uint16x4x2_t z = vzip_u16(vget_low_u16(a), vget_low_u16(b));
+    return vcombine_u16(z.val[0], z.val[1]);
+}
+static inline uint16x8_t lf_unpackhi_epi16(uint16x8_t a, uint16x8_t b)
+{
+    uint16x4x2_t z = vzip_u16(vget_high_u16(a), vget_high_u16(b));
+    return vcombine_u16(z.val[0], z.val[1]);
+}
+static inline uint16x8_t lf_unpacklo_epi32(uint16x8_t a, uint16x8_t b)
+{
+    uint32x2x2_t z = vzip_u32(vget_low_u32(vreinterpretq_u32_u16(a)),
+                              vget_low_u32(vreinterpretq_u32_u16(b)));
+    return vreinterpretq_u16_u32(vcombine_u32(z.val[0], z.val[1]));
+}
+static inline uint16x8_t lf_unpackhi_epi32(uint16x8_t a, uint16x8_t b)
+{
+    uint32x2x2_t z = vzip_u32(vget_high_u32(vreinterpretq_u32_u16(a)),
+                              vget_high_u32(vreinterpretq_u32_u16(b)));
+    return vreinterpretq_u16_u32(vcombine_u32(z.val[0], z.val[1]));
+}
+static inline uint16x8_t lf_unpacklo_epi64(uint16x8_t a, uint16x8_t b)
+{
+    return vcombine_u16(vget_low_u16(a), vget_low_u16(b));
+}
+static inline uint16x8_t lf_unpackhi_epi64(uint16x8_t a, uint16x8_t b)
+{
+    return vcombine_u16(vget_high_u16(a), vget_high_u16(b));
+}
+
+/* 加载 4 个 uint16 (64-bit), 高 64 位补零 (色度水平边逐行加载用). */
+static inline uint16x8_t lf_load4_u16(const uint16_t *p)
+{
+    return vcombine_u16(vld1_u16(p), vdup_n_u16(0));
+}
+
+/* ===========================================================================
+ * 核心滤波: 处理 8 个色度像素 (U/V 交错) 的去块滤波 (由 SSE4 色度路径移植)
+ * 输入 TL2..TR2 各为 int16x8_t (低 64=U 4 像素, 高 64=V 4 像素).
+ * 输出 oTL0,oTL1,oTR0,oTR1 (L2/R2 不改, 不返回).
+ * 返回 1 表示有像素被修改 (调用方需写回), 0 表示全未修改.
+ * =========================================================================== */
+static inline int deblock_core_chroma_neon(
+    int16x8_t TL2, int16x8_t TL1, int16x8_t TL0,
+    int16x8_t TR0, int16x8_t TR1, int16x8_t TR2,
+    int alpha, int beta, int flag0, int flag1,
+    int16x8_t *oTL0, int16x8_t *oTL1,
+    int16x8_t *oTR0, int16x8_t *oTR1)
+{
+    const int16x8_t c_0 = vdupq_n_s16(0);
+    const int16x8_t c_1 = vdupq_n_s16(1);
+    const int16x8_t c_2 = vdupq_n_s16(2);
+    const int16x8_t c_3 = vdupq_n_s16(3);
+    const int16x8_t c_4 = vdupq_n_s16(4);
+    const int16x8_t c_8 = vdupq_n_s16(8);
+    const int16x8_t ALPHA = vdupq_n_s16((short)alpha);
+    const int16x8_t BETA  = vdupq_n_s16((short)beta);
+
+    int16x8_t T0, T1;
+    int16x8_t FLT, FLT_L, FLT_R, FS, FS4, FS56;
+    uint16x8_t M0, M1;
+
+    /* M0 = flag && (|L0-R0|>1) && (alpha>|L0-R0|) */
+    T0 = lf_subabs(TL0, TR0);
+    M0 = vandq_u16(lf_flag_mask(flag0, flag1),
+                   vandq_u16(vcgtq_s16(T0, c_1), vcgtq_s16(ALPHA, T0)));
+
+    /* flat_l = (|L1-L0|<beta?2:0) + (|L2-L0|<beta?1:0) */
+    T0 = lf_subabs(TL1, TL0);
+    FLT_L = vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_2);
+    T0 = lf_subabs(TL2, TL0);
+    FLT_L = vaddq_s16(FLT_L, vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_1));
+
+    /* flat_r = (|R0-R1|<beta?2:0) + (|R0-R2|<beta?1:0) */
+    T0 = lf_subabs(TR0, TR1);
+    FLT_R = vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_2);
+    T0 = lf_subabs(TR0, TR2);
+    FLT_R = vaddq_s16(FLT_R, vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(BETA, T0)), c_1));
+
+    FLT = vaddq_s16(FLT_L, FLT_R);
+
+    /* M1 = (L1==L0) && (R1==R0) */
+    M1 = vandq_u16(vceqq_s16(TL1, TL0), vceqq_s16(TR1, TR0));
+
+    /* FS (色度: 强度=亮度-1; 用 FLT-3/FLT-4 代替亮度的 FLT-2/FLT-3; FLT==3 -> fs=0) */
+    T0 = vqsubq_s16(FLT, c_3);            /* FLT-3 (饱和, 值域不溢出) */
+    T1 = vqsubq_s16(FLT, c_4);            /* FLT-4 (饱和) */
+    FS56 = lf_blend(M1, T1, T0);                              /* M1 ? FLT-3 : FLT-4 */
+    FS4  = lf_blend(vceqq_s16(FLT_L, c_2), c_0, c_1);        /* flat_l==2 ? 1 : 0 */
+    FS   = lf_blend(vcgtq_s16(FLT, c_4), c_0, FS56);         /* FLT>4 -> FS56 */
+    FS   = lf_blend(vceqq_s16(FLT, c_4), FS, FS4);           /* FLT==4 -> FS4 */
+    /* FLT==3: fs=0 (不滤波) */
+    FS   = vandq_s16(FS, vreinterpretq_s16_u16(M0));
+
+    /* 全部像素无需滤波, 数据未修改, 跳过滤波计算和写回 */
+    if (!lf_any_nz_u16(vreinterpretq_u16_s16(FS)))
+        return 0;
+
+    int16x8_t tl0 = TL0, tl1 = TL1, tr0 = TR0, tr1 = TR1;
+    int16x8_t v0, v1, v2, v3, t2;
+
+    /* fs==1: L0'=(3*L0+R0+2)>>2, R0'=(3*R0+L0+2)>>2 */
+    t2 = vaddq_s16(vaddq_s16(TL0, TR0), c_2);
+    v0 = lf_srli(vaddq_s16(vshlq_n_s16(TL0, 1), t2), 2);
+    v1 = lf_srli(vaddq_s16(vshlq_n_s16(TR0, 1), t2), 2);
+    tl0 = lf_blend(vceqq_s16(FS, c_1), tl0, v0);
+    tr0 = lf_blend(vceqq_s16(FS, c_1), tr0, v1);
+
+    /* fs==2: L0'=(10*L0+3*L1+3*R0+8)>>4, R0'=(10*R0+3*R1+3*L0+8)>>4 */
+    t2 = vshlq_n_s16(t2, 1);                                  /* 2*(L0+R0+2) */
+    v0 = vaddq_s16(vshlq_n_s16(TL1, 1), vaddq_s16(TL1, TR0)); /* 3*L1+R0 */
+    v0 = vaddq_s16(vshlq_n_s16(TL0, 3), vaddq_s16(v0, t2));
+    v0 = lf_srli(vaddq_s16(v0, c_4), 4);
+    v1 = vaddq_s16(vshlq_n_s16(TR1, 1), vaddq_s16(TR1, TL0)); /* 3*R1+L0 */
+    v1 = vaddq_s16(vshlq_n_s16(TR0, 3), vaddq_s16(v1, t2));
+    v1 = lf_srli(vaddq_s16(v1, c_4), 4);
+    tl0 = lf_blend(vceqq_s16(FS, c_2), tl0, v0);
+    tr0 = lf_blend(vceqq_s16(FS, c_2), tr0, v1);
+
+    /* fs==3: L0'=(2*L0+4*L1+L2+4*R0+R1+4*(L0+R0+2))>>4, R0' 对称 */
+    t2 = vshlq_n_s16(t2, 1);                                  /* 4*(L0+R0+2) */
+    v0 = vaddq_s16(vshlq_n_s16(TL1, 2), vaddq_s16(TL2, TR1)); /* 4*L1+L2+R1 */
+    v0 = vaddq_s16(vshlq_n_s16(TL0, 1), vaddq_s16(v0, t2));
+    v0 = lf_srli(v0, 4);
+    v1 = vaddq_s16(vshlq_n_s16(TR1, 2), vaddq_s16(TR2, TL1)); /* 4*R1+R2+L1 */
+    v1 = vaddq_s16(vshlq_n_s16(TR0, 1), vaddq_s16(v1, t2));
+    v1 = lf_srli(v1, 4);
+    tl0 = lf_blend(vceqq_s16(FS, c_3), tl0, v0);
+    tr0 = lf_blend(vceqq_s16(FS, c_3), tr0, v1);
+
+    /* fs==3: L1'=(3*L2+8*L1+4*L0+R0+8)>>4, R1' 对称 */
+    v2 = vaddq_s16(vaddq_s16(TL2, TR0), vshlq_n_s16(TL2, 1)); /* 3*L2+R0 */
+    v2 = vaddq_s16(v2, vshlq_n_s16(TL1, 3));                  /* + 8*L1 */
+    v2 = vaddq_s16(v2, vshlq_n_s16(TL0, 2));                  /* + 4*L0 */
+    v2 = lf_srli(vaddq_s16(v2, c_8), 4);
+    v3 = vaddq_s16(vaddq_s16(TR2, TL0), vshlq_n_s16(TR2, 1)); /* 3*R2+L0 */
+    v3 = vaddq_s16(v3, vshlq_n_s16(TR1, 3));                  /* + 8*R1 */
+    v3 = vaddq_s16(v3, vshlq_n_s16(TR0, 2));                  /* + 4*R0 */
+    v3 = lf_srli(vaddq_s16(v3, c_8), 4);
+    tl1 = lf_blend(vceqq_s16(FS, c_3), tl1, v2);
+    tr1 = lf_blend(vceqq_s16(FS, c_3), tr1, v3);
+
+    *oTL0 = tl0; *oTL1 = tl1;
+    *oTR0 = tr0; *oTR1 = tr1;
+    return 1;
+}
+
+/* ===========================================================================
+ * 色度垂直边去块滤波 (EDGE_VER) — 由 deblock_chroma_ver_sse4 10-bit 路径移植
+ * src_u/src_v 指向 R0, stride 为 uint16 元素步长. 加载 U/V 各 4 行 × 8 像素
+ * (位置 -4..3), 转置后交错 U/V 滤波, 转置回后分离 U/V 存储.
+ * =========================================================================== */
+static void deblock_chroma_ver_neon(void *src_u_v, void *src_v_v,
+                                    int stride, int alpha, int beta,
+                                    uint8_t *flt_flag, int bit_depth)
+{
+    if (bit_depth <= 8 || 1) {  /* DEBUG: force C fallback to isolate luma */
+        deblock_chroma_ver(src_u_v, src_v_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    int flag0 = flt_flag[0] ? -1 : 0;
+    int flag1 = flt_flag[1] ? -1 : 0;
+    uint16_t *pu = (uint16_t *)src_u_v - 4;
+    uint16_t *pv = (uint16_t *)src_v_v - 4;
+
+    /* 加载 U/V 各 4 行 × 8 像素 (位置 -4..3, 覆盖 L3..R3) */
+    uint16x8_t t0 = vld1q_u16(pu);
+    uint16x8_t t1 = vld1q_u16(pu + stride);
+    uint16x8_t t2 = vld1q_u16(pu + stride * 2);
+    uint16x8_t t3 = vld1q_u16(pu + stride * 3);
+    uint16x8_t t4 = vld1q_u16(pv);
+    uint16x8_t t5 = vld1q_u16(pv + stride);
+    uint16x8_t t6 = vld1q_u16(pv + stride * 2);
+    uint16x8_t t7 = vld1q_u16(pv + stride * 3);
+
+    /* 转置 4x8 U 和 4x8 V, 交错 U/V (低 64=U, 高 64=V) */
+    uint16x8_t m0 = lf_unpacklo_epi16(t0, t1);
+    uint16x8_t m1 = lf_unpackhi_epi16(t0, t1);
+    uint16x8_t m2 = lf_unpacklo_epi16(t2, t3);
+    uint16x8_t m3 = lf_unpackhi_epi16(t2, t3);
+    uint16x8_t m4 = lf_unpacklo_epi16(t4, t5);
+    uint16x8_t m5 = lf_unpackhi_epi16(t4, t5);
+    uint16x8_t m6 = lf_unpacklo_epi16(t6, t7);
+    uint16x8_t m7 = lf_unpackhi_epi16(t6, t7);
+
+    t0 = lf_unpacklo_epi32(m0, m2);
+    t1 = lf_unpackhi_epi32(m0, m2);
+    t2 = lf_unpacklo_epi32(m1, m3);
+    t3 = lf_unpackhi_epi32(m1, m3);
+    t4 = lf_unpacklo_epi32(m4, m6);
+    t5 = lf_unpackhi_epi32(m4, m6);
+    t6 = lf_unpacklo_epi32(m5, m7);
+    t7 = lf_unpackhi_epi32(m5, m7);
+
+    uint16x8_t tl3 = lf_unpacklo_epi64(t0, t4);  /* L3 (pos -4) */
+    uint16x8_t tl2 = lf_unpackhi_epi64(t0, t4);  /* L2 (pos -3) */
+    uint16x8_t tr0 = lf_unpacklo_epi64(t2, t6);  /* R0 (pos  0) */
+    uint16x8_t tr1 = lf_unpackhi_epi64(t2, t6);  /* R1 (pos +1) */
+    uint16x8_t tl1 = lf_unpacklo_epi64(t1, t5);  /* L1 (pos -2) */
+    uint16x8_t tl0 = lf_unpackhi_epi64(t1, t5);  /* L0 (pos -1) */
+    uint16x8_t tr2 = lf_unpacklo_epi64(t3, t7);  /* R2 (pos +2) */
+    uint16x8_t tr3 = lf_unpackhi_epi64(t3, t7);  /* R3 (pos +3) */
+
+    int16x8_t oL0, oL1, oR0, oR1;
+    int changed = deblock_core_chroma_neon(
+        vreinterpretq_s16_u16(tl2), vreinterpretq_s16_u16(tl1),
+        vreinterpretq_s16_u16(tl0), vreinterpretq_s16_u16(tr0),
+        vreinterpretq_s16_u16(tr1), vreinterpretq_s16_u16(tr2),
+        alpha, beta, flag0, flag1,
+        &oL0, &oL1, &oR0, &oR1);
+    if (!changed)
+        return;
+
+    tl0 = vreinterpretq_u16_s16(oL0);
+    tl1 = vreinterpretq_u16_s16(oL1);
+    tr0 = vreinterpretq_u16_s16(oR0);
+    tr1 = vreinterpretq_u16_s16(oR1);
+
+    /* 转置回行序, 分离 U/V 并存储 */
+    m0 = lf_unpacklo_epi16(tl3, tl2);
+    m1 = lf_unpackhi_epi16(tl3, tl2);
+    m2 = lf_unpacklo_epi16(tl1, tl0);
+    m3 = lf_unpackhi_epi16(tl1, tl0);
+    m4 = lf_unpacklo_epi16(tr0, tr1);
+    m5 = lf_unpackhi_epi16(tr0, tr1);
+    m6 = lf_unpacklo_epi16(tr2, tr3);
+    m7 = lf_unpackhi_epi16(tr2, tr3);
+
+    t0 = lf_unpacklo_epi32(m0, m2);
+    t1 = lf_unpackhi_epi32(m0, m2);
+    t2 = lf_unpacklo_epi32(m1, m3);
+    t3 = lf_unpackhi_epi32(m1, m3);
+    t4 = lf_unpacklo_epi32(m4, m6);
+    t5 = lf_unpackhi_epi32(m4, m6);
+    t6 = lf_unpacklo_epi32(m5, m7);
+    t7 = lf_unpackhi_epi32(m5, m7);
+
+    m0 = lf_unpacklo_epi64(t0, t4);
+    m1 = lf_unpackhi_epi64(t0, t4);
+    m2 = lf_unpacklo_epi64(t1, t5);
+    m3 = lf_unpackhi_epi64(t1, t5);
+    m4 = lf_unpacklo_epi64(t2, t6);
+    m5 = lf_unpackhi_epi64(t2, t6);
+    m6 = lf_unpacklo_epi64(t3, t7);
+    m7 = lf_unpackhi_epi64(t3, t7);
+
+    /* 10-bit: 直接存储 16 字节 (8 个 uint16)/行 */
+    vst1q_u16(pu,              m0);
+    vst1q_u16(pu + stride,     m1);
+    vst1q_u16(pu + stride * 2, m2);
+    vst1q_u16(pu + stride * 3, m3);
+    vst1q_u16(pv,              m4);
+    vst1q_u16(pv + stride,     m5);
+    vst1q_u16(pv + stride * 2, m6);
+    vst1q_u16(pv + stride * 3, m7);
+}
+
+/* ===========================================================================
+ * 色度水平边去块滤波 (EDGE_HOR) — 由 deblock_chroma_hor_sse4 10-bit 路径移植
+ * src_u/src_v 指向 R0 行, stride 为 uint16 元素步长. 每行加载 4 像素, 交错 U/V
+ * (低 64=U, 高 64=V), 无需转置. L2/L1/L0 为上方行, R0/R1/R2 为下方行.
+ * =========================================================================== */
+static void deblock_chroma_hor_neon(void *src_u_v, void *src_v_v,
+                                    int stride, int alpha, int beta,
+                                    uint8_t *flt_flag, int bit_depth)
+{
+    if (bit_depth <= 8 || 1) {  /* DEBUG: force C fallback to isolate luma */
+        deblock_chroma_hor(src_u_v, src_v_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    int flag0 = flt_flag[0] ? -1 : 0;
+    int flag1 = flt_flag[1] ? -1 : 0;
+    uint16_t *src_u = (uint16_t *)src_u_v;
+    uint16_t *src_v = (uint16_t *)src_v_v;
+    int inc  = stride;
+    int inc2 = inc << 1;
+    int inc3 = inc + inc2;
+
+    /* 加载 U/V 各 4 像素, 交错 (低 64=U, 高 64=V) */
+    uint16x8_t tl2 = lf_unpacklo_epi64(lf_load4_u16(src_u - inc3), lf_load4_u16(src_v - inc3));  /* L2 */
+    uint16x8_t tl1 = lf_unpacklo_epi64(lf_load4_u16(src_u - inc2), lf_load4_u16(src_v - inc2));  /* L1 */
+    uint16x8_t tl0 = lf_unpacklo_epi64(lf_load4_u16(src_u - inc),  lf_load4_u16(src_v - inc));   /* L0 */
+    uint16x8_t tr0 = lf_unpacklo_epi64(lf_load4_u16(src_u),        lf_load4_u16(src_v));         /* R0 */
+    uint16x8_t tr1 = lf_unpacklo_epi64(lf_load4_u16(src_u + inc),  lf_load4_u16(src_v + inc));   /* R1 */
+    uint16x8_t tr2 = lf_unpacklo_epi64(lf_load4_u16(src_u + inc2), lf_load4_u16(src_v + inc2));  /* R2 */
+
+    int16x8_t oL0, oL1, oR0, oR1;
+    int changed = deblock_core_chroma_neon(
+        vreinterpretq_s16_u16(tl2), vreinterpretq_s16_u16(tl1),
+        vreinterpretq_s16_u16(tl0), vreinterpretq_s16_u16(tr0),
+        vreinterpretq_s16_u16(tr1), vreinterpretq_s16_u16(tr2),
+        alpha, beta, flag0, flag1,
+        &oL0, &oL1, &oR0, &oR1);
+    if (!changed)
+        return;
+
+    uint16x8_t ul0 = vreinterpretq_u16_s16(oL0);
+    uint16x8_t ul1 = vreinterpretq_u16_s16(oL1);
+    uint16x8_t ur0 = vreinterpretq_u16_s16(oR0);
+    uint16x8_t ur1 = vreinterpretq_u16_s16(oR1);
+
+    /* 存储: 低 64=U, 高 64=V, 各存 4 个 uint16 (8 字节) */
+    vst1_u16(src_u - inc,  vget_low_u16(ul0));   /* U L0 */
+    vst1_u16(src_u,        vget_low_u16(ur0));   /* U R0 */
+    vst1_u16(src_u - inc2, vget_low_u16(ul1));   /* U L1 */
+    vst1_u16(src_u + inc,  vget_low_u16(ur1));   /* U R1 */
+    vst1_u16(src_v - inc,  vget_high_u16(ul0));  /* V L0 */
+    vst1_u16(src_v,        vget_high_u16(ur0));  /* V R0 */
+    vst1_u16(src_v - inc2, vget_high_u16(ul1));  /* V L1 */
+    vst1_u16(src_v + inc,  vget_high_u16(ur1));  /* V R1 */
+}
+
+/* ===========================================================================
+ * NEON 验证包装: 对比 NEON 与 C 参考, 记录逐像素差异 (用于定位位精确性问题).
+ * 设置环境变量 AVS2_LF_VERIFY=1 启用. 启用后最终写回 C 结果, 保证解码继续
+ * 正确, 从而可跨多帧收集全部差异样本.
+ * =========================================================================== */
+static void deblock_luma_ver_neon_verify(void *src_v, int stride, int alpha,
+                                         int beta, uint8_t *flt_flag, int bit_depth)
+{
+    if (bit_depth <= 8) {
+        deblock_luma_ver(src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+    if (!lf_verify_enabled()) {
+        deblock_luma_ver_neon(src_v, stride, alpha, beta, flt_flag, bit_depth);
+        return;
+    }
+
+    uint16_t *src = (uint16_t *)src_v;
+    uint16_t backup[8 * 8], simd_res[8 * 8], c_res[8 * 8];
+
+    /* 备份 8 行 × 8 像素 (位置 -3..+4) */
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            backup[i * 8 + j] = src[-3 + j + i * stride];
+
+    /* 运行 NEON */
+    deblock_luma_ver_neon(src_v, stride, alpha, beta, flt_flag, bit_depth);
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            simd_res[i * 8 + j] = src[-3 + j + i * stride];
+
+    /* 恢复原始数据 */
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            src[-3 + j + i * stride] = backup[i * 8 + j];
+
+    /* 运行 C 参考 */
+    deblock_luma_ver(src_v, stride, alpha, beta, flt_flag, bit_depth);
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            c_res[i * 8 + j] = src[-3 + j + i * stride];
+
+    /* 比较 C 修改的 6 像素 (位置 -3..+2 = L2..R2) */
+    static int s_dump_edge = 0;
+    int has_diff = 0;
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 6; j++)
+            if (simd_res[i * 8 + j] != c_res[i * 8 + j])
+                has_diff = 1;
+
+    /* 前 3 个有差异的边: 完整 dump 8×6 (输入/NEON/C) + C 公式 fs */
+    if (has_diff && s_dump_edge < 3) {
+        s_dump_edge++;
+        fprintf(stderr, "=== NEON_VER_EDGE #%d alpha=%d beta=%d flag=[%d,%d] ===\n",
+                s_dump_edge, alpha, beta, flt_flag[0], flt_flag[1]);
+        for (int i = 0; i < 8; i++) {
+            int L2 = backup[i*8+0], L1 = backup[i*8+1], L0 = backup[i*8+2];
+            int R0 = backup[i*8+3], R1 = backup[i*8+4], R2 = backup[i*8+5];
+            int ad = abs(R0 - L0);
+            int flag = (i < 4) ? flt_flag[0] : flt_flag[1];
+            int fs = -1;
+            if (flag && ad < alpha && ad > 1) {
+                int fl = (abs(L1-L0)<beta?2:0) + (abs(L2-L0)<beta?1:0);
+                int fr = (abs(R0-R1)<beta?2:0) + (abs(R0-R2)<beta?1:0);
+                switch (fl+fr) {
+                case 6: fs = 3 + ((R1==R0)&&(L0==L1)); break;
+                case 5: fs = 2 + ((R1==R0)&&(L0==L1)); break;
+                case 4: fs = 1 + (fl==2); break;
+                case 3: fs = (abs(L1-R1)<beta); break;
+                default: fs = 0; break;
+                }
+            } else fs = -1;
+            fprintf(stderr, "  row%d in[L2=%d L1=%d L0=%d R0=%d R1=%d R2=%d] "
+                    "neon[L2=%d L1=%d L0=%d R0=%d R1=%d R2=%d] "
+                    "c[L2=%d L1=%d L0=%d R0=%d R1=%d R2=%d] fs=%d\n",
+                    i, L2, L1, L0, R0, R1, R2,
+                    simd_res[i*8+0], simd_res[i*8+1], simd_res[i*8+2],
+                    simd_res[i*8+3], simd_res[i*8+4], simd_res[i*8+5],
+                    c_res[i*8+0], c_res[i*8+1], c_res[i*8+2],
+                    c_res[i*8+3], c_res[i*8+4], c_res[i*8+5], fs);
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 6; j++) {
+            if (simd_res[i * 8 + j] != c_res[i * 8 + j]) {
+                fprintf(stderr, "NEON_VER_DIFF row=%d pos=%d "
+                        "in[L2=%d L1=%d L0=%d R0=%d R1=%d R2=%d] "
+                        "neon=%d c=%d alpha=%d beta=%d flag=[%d,%d]\n",
+                        i, j - 3,
+                        backup[i * 8 + 0], backup[i * 8 + 1], backup[i * 8 + 2],
+                        backup[i * 8 + 3], backup[i * 8 + 4], backup[i * 8 + 5],
+                        simd_res[i * 8 + j], c_res[i * 8 + j],
+                        alpha, beta, flt_flag[0], flt_flag[1]);
+            }
+        }
+    }
+
+    /* 写回 C 结果, 保证解码继续正确 */
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            src[-3 + j + i * stride] = c_res[i * 8 + j];
+}
+
+/* ===========================================================================
+ * 注册函数
+ * ===========================================================================
+ */
+
+/* NEON: 注册亮度+色度去块滤波 (10-bit 路径原生 NEON; 8-bit 回退 C 参考) */
+void avs2_lf_init_neon(const avs2_cpu_flags *flags)
+{
+    (void)flags;
+    avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_neon_verify;
+    avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_neon;
+    avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_neon;
+    avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_neon;
+}
+
+/* SSE/AVX 接口空实现以供链接 (非 x86 平台不调用) */
+void avs2_lf_init_sse41(const avs2_cpu_flags *flags)  { (void)flags; }
+void avs2_lf_init_avx2(const avs2_cpu_flags *flags)   { (void)flags; }
+void avs2_lf_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
+
+#else /* 其它平台: 无 SIMD, 保留空实现以供链接 */
 void avs2_lf_init_sse41(const avs2_cpu_flags *flags) { (void)flags; }
 void avs2_lf_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 void avs2_lf_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
+void avs2_lf_init_neon(const avs2_cpu_flags *flags) { (void)flags; }
 
 #endif

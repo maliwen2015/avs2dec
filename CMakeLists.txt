@@ -84,6 +84,10 @@ target_include_directories(avs2dec
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(avs2dec PRIVATE Threads::Threads)
+# tables.c 使用 cos(); GCC/Clang 需链接 libm (MSVC 数学库在 UCRT 中)
+if(NOT MSVC)
+    target_link_libraries(avs2dec PRIVATE m)
+endif()
 
 # SIMD 源文件仅使用 SSE4.1/SSSE3 intrinsics (AVX2 代码已全部清除)
 # simd_init.c 不含 intrinsics, 不需要特殊标志
@@ -101,10 +105,19 @@ if(MSVC)
         COMPILE_OPTIONS "/arch:SSE4.1"
     )
 else()
-    # GCC/MinGW: 仅启用 SSE4.1 + SSSE3 (无 AVX2)
-    set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-msse4.1;-mssse3"
-    )
+    # GCC/MinGW/Clang: 按目标架构启用对应 SIMD 指令集.
+    # x86: 仅 SSE4.1 + SSSE3 (无 AVX2); aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
+        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-msse4.1;-mssse3"
+        )
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
+        # aarch64: NEON 为默认, 不需要额外编译标志
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|ARM)")
+        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-mfpu=neon"
+        )
+    endif()
 endif()
 
 if(AVS2DEC_BUILD_SHARED)

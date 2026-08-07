@@ -1926,10 +1926,2333 @@ void avs2_mc_init_avx512(const avs2_cpu_flags *flags)
     (void)flags;
 }
 
-#else /* non-x86 */
+#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
 
+#include <arm_neon.h>
+
+/* ---- 对齐宏 ---- */
+#define AVS2_ALIGN16(x) x __attribute__((aligned(16)))
+
+/* 10-bit 像素类型 (与 x86 段一致) */
+typedef uint16_t pel_t;
+
+/* 中间缓冲区步长 (覆盖最大块 64x64) */
+#define MC_TMP_STRIDE 64
+
+/* ---- C 回退函数声明 (在 mc.c 中定义, 供 8-bit 路径回退) ---- */
+extern void mc_luma_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                      ptrdiff_t dstride, int w, int h, int mx, int my,
+                      int bit_depth);
+extern void mc_chroma_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                        ptrdiff_t dstride, int w, int h, int mx, int my,
+                        int bit_depth);
+extern void mc_luma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                          ptrdiff_t dstride, int w, int h, int mx, int my,
+                          int bit_depth);
+extern void mc_chroma_avg_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                            ptrdiff_t dstride, int w, int h, int mx, int my,
+                            int bit_depth);
+extern void bi_avg_c(uint8_t *dst, ptrdiff_t dst_stride, const int16_t *pred2,
+                     int pred2_stride, int w, int h, int bit_depth);
+extern void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
+                          const int16_t *pred1, int pred1_stride,
+                          const int16_t *pred2, int pred2_stride,
+                          int w, int h, int bit_depth);
+extern void fill_block_c(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
+                         int fill_val, int bit_depth);
+
+/* ===========================================================================
+ * NEON 运动补偿实现 (由 SSE4.1 版本逐行移植).
+ *
+ * 策略 (与 lf_simd.c NEON 一致): 10-bit 路径 (bit_depth>8) 使用原生 NEON,
+ * 8-bit 路径回退到经过验证的 C 参考 (本机码流为 10-bit, 8-bit NEON 无法哈希
+ * 校验, 不引入未验证代码).
+ *
+ * 位精确性: 所有 SSE 内联函数均有对应的 NEON 等价:
+ *   _mm_madd_epi16    -> v_madd_epi16 (vmull_s16 + vpadd_s32)
+ *   _mm_hadd_epi32    -> v_hadd_epi32 (vpaddq_s32)
+ *   _mm_unpacklo/hi   -> v_unpacklo/hi_epi16 (vzip_s16)
+ *   _mm_packs_epi32   -> v_packs_epi32 (vqmovn_s32, 有符号饱和)
+ *   _mm_packus_epi32  -> v_packus_epi32 (vmax+ vqmovn_u32, 无符号饱和)
+ *   _mm_shuffle_epi8  -> vextq_u16 组合 (色度 4 抽头滑窗)
+ * =========================================================================== */
+
+/* 通用 128-bit 寄存器类型 (类比 __m128i), 内部按 int16x8 存储 */
+typedef int16x8_t v128_t;
+
+static inline int32x4_t v128_to_s32(v128_t a)            { return vreinterpretq_s32_s16(a); }
+static inline v128_t    v128_from_s32(int32x4_t a)       { return vreinterpretq_s16_s32(a); }
+
+/* _mm_madd_epi16: 8×int16 相乘, 相邻对相加 → 4×int32, 返回 v128 */
+static inline v128_t v_madd_epi16(v128_t a, v128_t b)
+{
+    int32x4_t lo = vmull_s16(vget_low_s16(a),  vget_low_s16(b));
+    int32x4_t hi = vmull_s16(vget_high_s16(a), vget_high_s16(b));
+    int32x2_t sl = vpadd_s32(vget_low_s32(lo),  vget_high_s32(lo));
+    int32x2_t sh = vpadd_s32(vget_low_s32(hi),  vget_high_s32(hi));
+    return v128_from_s32(vcombine_s32(sl, sh));
+}
+
+/* _mm_hadd_epi32: [a0+a1, a2+a3, b0+b1, b2+b3] */
+static inline v128_t v_hadd_epi32(v128_t a, v128_t b)
+{
+    return v128_from_s32(vpaddq_s32(v128_to_s32(a), v128_to_s32(b)));
+}
+
+/* _mm_unpacklo_epi16 / hi */
+static inline v128_t v_unpacklo_epi16(v128_t a, v128_t b)
+{
+    int16x4x2_t z = vzip_s16(vget_low_s16(a), vget_low_s16(b));
+    return vcombine_s16(z.val[0], z.val[1]);
+}
+static inline v128_t v_unpackhi_epi16(v128_t a, v128_t b)
+{
+    int16x4x2_t z = vzip_s16(vget_high_s16(a), vget_high_s16(b));
+    return vcombine_s16(z.val[0], z.val[1]);
+}
+
+/* _mm_packs_epi32: 2×(4 int32) 有符号饱和缩窄为 8 int16 */
+static inline v128_t v_packs_epi32(v128_t a, v128_t b)
+{
+    return vcombine_s16(vqmovn_s32(v128_to_s32(a)), vqmovn_s32(v128_to_s32(b)));
+}
+
+/* _mm_packus_epi32: 2×(4 int32) 无符号饱和缩窄为 8 uint16
+ * 负数饱和为 0, >65535 饱和为 65535 (先 max 到 0, 再无符号饱和窄化) */
+static inline v128_t v_packus_epi32(v128_t a, v128_t b)
+{
+    const int32x4_t zero = vdupq_n_s32(0);
+    uint16x4_t lo = vqmovn_u32((uint32x4_t)vmaxq_s32(v128_to_s32(a), zero));
+    uint16x4_t hi = vqmovn_u32((uint32x4_t)vmaxq_s32(v128_to_s32(b), zero));
+    return vreinterpretq_s16_u16(vcombine_u16(lo, hi));
+}
+
+/* int32 运算 */
+static inline v128_t v_add_epi32(v128_t a, v128_t b) { return v128_from_s32(vaddq_s32(v128_to_s32(a), v128_to_s32(b))); }
+static inline v128_t v_srai_epi32(v128_t a, int n)   { return v128_from_s32(vshrq_n_s32(v128_to_s32(a), n)); }
+
+/* int16 运算 */
+static inline v128_t v_add_epi16(v128_t a, v128_t b) { return vaddq_s16(a, b); }
+static inline v128_t v_srli_epi16(v128_t a, int n)   { return vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(a), (unsigned)n)); }
+static inline v128_t v_min_epu16(v128_t a, v128_t b) { return vreinterpretq_s16_u16(vminq_u16(vreinterpretq_u16_s16(a), vreinterpretq_u16_s16(b))); }
+
+/* 常量与访存 */
+static inline v128_t v_set1_epi16(int16_t x) { return vdupq_n_s16(x); }
+static inline v128_t v_set1_epi32(int32_t x) { return v128_from_s32(vdupq_n_s32(x)); }
+static inline v128_t v_load(const void *p)   { return vld1q_s16((const int16_t*)p); }
+static inline void   v_store(void *p, v128_t v) { vst1q_s16((int16_t*)p, v); }
+
+/* ===========================================================================
+ * 块拷贝 (10-bit NEON): 与 SSE4.1 相同的 8 像素/次 128-bit 循环
+ * =========================================================================== */
+static void block_copy_10bit_neon(pel_t *dst, int i_dst,
+                                  const pel_t *src, int i_src,
+                                  int width, int height)
+{
+    int y, x;
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x += 8) {
+            uint16x8_t v = vld1q_u16((const uint16_t*)(src + x));
+            vst1q_u16((uint16_t*)(dst + x), v);
+        }
+        for (; x < width; x++) {
+            dst[x] = src[x];
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* ===========================================================================
+ * 亮度 8 抽头水平插值 (10-bit NEON)
+ * =========================================================================== */
+static void ip_filter_luma_hor_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int j, i;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t offset = v_set1_epi32(32);
+    v128_t mCoef = vmovl_s8(vld1_s8(coeff));  /* 8 int8 系数 → 8 int16 */
+
+    src -= 3;
+
+    for (j = 0; j < height; j++) {
+        const pel_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load(p++);
+            T1 = v_load(p++);
+            T2 = v_load(p++);
+            T3 = v_load(p++);
+            T4 = v_load(p++);
+            T5 = v_load(p++);
+            T6 = v_load(p++);
+            T7 = v_load(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            B0 = v_add_epi32(B0, offset);
+            B1 = v_add_epi32(B1, offset);
+            B0 = v_srai_epi32(B0, 6);
+            B1 = v_srai_epi32(B1, 6);
+            B0 = v_packus_epi32(B0, B1);
+            B0 = v_min_epu16(B0, max_val1);
+            v_store(dst + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coeff[0] + src[i + 1] * coeff[1]
+                  + src[i + 2] * coeff[2] + src[i + 3] * coeff[3]
+                  + src[i + 4] * coeff[4] + src[i + 5] * coeff[5]
+                  + src[i + 6] * coeff[6] + src[i + 7] * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* ===========================================================================
+ * 亮度 8 抽头垂直插值 (10-bit NEON)
+ * =========================================================================== */
+static void ip_filter_luma_ver_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int i, j;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t mAddOffset = v_set1_epi32(32);
+
+    /* 每对相邻系数 (c0,c1)/(c2,c3)/(c4,c5)/(c6,c7) 重复 4 次, 与 SSE 一致 */
+    v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 0))));
+    v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 2))));
+    v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 4))));
+    v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 6))));
+
+    src -= 3 * i_src;
+
+    for (j = 0; j < height; j++) {
+        const pel_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+            v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+            v128_t sum_lo, sum_hi;
+
+            T0 = v_load(p);
+            T1 = v_load(p + i_src);
+            T2 = v_load(p + 2 * i_src);
+            T3 = v_load(p + 3 * i_src);
+            T4 = v_load(p + 4 * i_src);
+            T5 = v_load(p + 5 * i_src);
+            T6 = v_load(p + 6 * i_src);
+            T7 = v_load(p + 7 * i_src);
+
+            M0_lo = v_unpacklo_epi16(T0, T1);
+            M0_hi = v_unpackhi_epi16(T0, T1);
+            M1_lo = v_unpacklo_epi16(T2, T3);
+            M1_hi = v_unpackhi_epi16(T2, T3);
+            M2_lo = v_unpacklo_epi16(T4, T5);
+            M2_hi = v_unpackhi_epi16(T4, T5);
+            M3_lo = v_unpacklo_epi16(T6, T7);
+            M3_hi = v_unpackhi_epi16(T6, T7);
+
+            N0_lo = v_madd_epi16(M0_lo, coeff00);
+            N0_hi = v_madd_epi16(M0_hi, coeff00);
+            N1_lo = v_madd_epi16(M1_lo, coeff01);
+            N1_hi = v_madd_epi16(M1_hi, coeff01);
+            N2_lo = v_madd_epi16(M2_lo, coeff02);
+            N2_hi = v_madd_epi16(M2_hi, coeff02);
+            N3_lo = v_madd_epi16(M3_lo, coeff03);
+            N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+            sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+            sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, 6);
+            sum_hi = v_srai_epi32(sum_hi, 6);
+
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store(dst + i, sum_lo);
+
+            p += 8;
+        }
+        for (; i < width; i++) {
+            int v = src[i]              * coeff[0]
+                  + src[i + i_src]      * coeff[1]
+                  + src[i + 2 * i_src]  * coeff[2]
+                  + src[i + 3 * i_src]  * coeff[3]
+                  + src[i + 4 * i_src]  * coeff[4]
+                  + src[i + 5 * i_src]  * coeff[5]
+                  + src[i + 6 * i_src]  * coeff[6]
+                  + src[i + 7 * i_src]  * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* ===========================================================================
+ * 亮度 8 抽头双向插值 (10-bit NEON): 先水平 (shift1=2) 后垂直 (shift2=10)
+ * =========================================================================== */
+static void ip_filter_luma_ext_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN16(short tmp_res[(64 + 7) * 64]);
+    short *tmp = tmp_res;
+    const int i_tmp = MC_TMP_STRIDE;
+    int shift1, shift2, add1, add2;
+    int i, j;
+    v128_t offset;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t mCoef = vmovl_s8(vld1_s8(coef_x));
+
+    shift1 = 2;
+    shift2 = 10;
+    add1 = (1 << shift1) >> 1;
+    add2 = 1 << (shift2 - 1);
+
+    /* ---- 第一级: 水平滤波 ---- */
+    src += -3 * i_src - 3;
+    offset = v_set1_epi32(add1);
+
+    for (j = -3; j < height + 4; j++) {
+        const pel_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load(p++);
+            T1 = v_load(p++);
+            T2 = v_load(p++);
+            T3 = v_load(p++);
+            T4 = v_load(p++);
+            T5 = v_load(p++);
+            T6 = v_load(p++);
+            T7 = v_load(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            B0 = v_add_epi32(B0, offset);
+            B1 = v_add_epi32(B1, offset);
+            B0 = v_srai_epi32(B0, shift1);
+            B1 = v_srai_epi32(B1, shift1);
+            B0 = v_packs_epi32(B0, B1);   /* 有符号饱和 → int16 中间缓冲 */
+            v_store(tmp + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coef_x[0] + src[i + 1] * coef_x[1]
+                  + src[i + 2] * coef_x[2] + src[i + 3] * coef_x[3]
+                  + src[i + 4] * coef_x[4] + src[i + 5] * coef_x[5]
+                  + src[i + 6] * coef_x[6] + src[i + 7] * coef_x[7];
+            v = (v + add1) >> shift1;
+            tmp[i] = (short)v;
+        }
+        tmp += i_tmp;
+        src += i_src;
+    }
+
+    /* ---- 第二级: 垂直滤波 ---- */
+    offset = v_set1_epi32(add2);
+    tmp = tmp_res;
+
+    {
+        v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+        v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 4))));
+        v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 6))));
+
+        for (j = 0; j < height; j++) {
+            const short *p = tmp;
+            for (i = 0; i + 7 < width; i += 8) {
+                v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+                v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+                v128_t sum_lo, sum_hi;
+
+                T0 = v_load(p);
+                T1 = v_load(p + i_tmp);
+                T2 = v_load(p + 2 * i_tmp);
+                T3 = v_load(p + 3 * i_tmp);
+                T4 = v_load(p + 4 * i_tmp);
+                T5 = v_load(p + 5 * i_tmp);
+                T6 = v_load(p + 6 * i_tmp);
+                T7 = v_load(p + 7 * i_tmp);
+
+                M0_lo = v_unpacklo_epi16(T0, T1);
+                M0_hi = v_unpackhi_epi16(T0, T1);
+                M1_lo = v_unpacklo_epi16(T2, T3);
+                M1_hi = v_unpackhi_epi16(T2, T3);
+                M2_lo = v_unpacklo_epi16(T4, T5);
+                M2_hi = v_unpackhi_epi16(T4, T5);
+                M3_lo = v_unpacklo_epi16(T6, T7);
+                M3_hi = v_unpackhi_epi16(T6, T7);
+
+                N0_lo = v_madd_epi16(M0_lo, coeff00);
+                N0_hi = v_madd_epi16(M0_hi, coeff00);
+                N1_lo = v_madd_epi16(M1_lo, coeff01);
+                N1_hi = v_madd_epi16(M1_hi, coeff01);
+                N2_lo = v_madd_epi16(M2_lo, coeff02);
+                N2_hi = v_madd_epi16(M2_hi, coeff02);
+                N3_lo = v_madd_epi16(M3_lo, coeff03);
+                N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+                sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+                sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+                sum_lo = v_add_epi32(sum_lo, offset);
+                sum_hi = v_add_epi32(sum_hi, offset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+                v_store(dst + i, sum_lo);
+
+                p += 8;
+            }
+            for (; i < width; i++) {
+                int v = tmp[i]              * coef_y[0]
+                      + tmp[i + i_tmp]      * coef_y[1]
+                      + tmp[i + 2 * i_tmp]  * coef_y[2]
+                      + tmp[i + 3 * i_tmp]  * coef_y[3]
+                      + tmp[i + 4 * i_tmp]  * coef_y[4]
+                      + tmp[i + 5 * i_tmp]  * coef_y[5]
+                      + tmp[i + 6 * i_tmp]  * coef_y[6]
+                      + tmp[i + 7 * i_tmp]  * coef_y[7];
+                v = (v + add2) >> shift2;
+                dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* ---- 融合 MC+avg: 第二级垂直滤波后与 dst 平均 ---- */
+static void ip_filter_luma_ext_10bit_avg_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN16(short tmp_res[(64 + 7) * 64]);
+    short *tmp = tmp_res;
+    const int i_tmp = MC_TMP_STRIDE;
+    int shift1, shift2, add1, add2;
+    int i, j;
+    v128_t offset;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t one = v_set1_epi16(1);
+    v128_t mCoef = vmovl_s8(vld1_s8(coef_x));
+
+    shift1 = 2;
+    shift2 = 10;
+    add1 = (1 << shift1) >> 1;
+    add2 = 1 << (shift2 - 1);
+
+    /* ---- 第一级: 水平滤波 (与普通版相同) ---- */
+    src += -3 * i_src - 3;
+    offset = v_set1_epi32(add1);
+
+    for (j = -3; j < height + 4; j++) {
+        const pel_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load(p++);
+            T1 = v_load(p++);
+            T2 = v_load(p++);
+            T3 = v_load(p++);
+            T4 = v_load(p++);
+            T5 = v_load(p++);
+            T6 = v_load(p++);
+            T7 = v_load(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            B0 = v_add_epi32(B0, offset);
+            B1 = v_add_epi32(B1, offset);
+            B0 = v_srai_epi32(B0, shift1);
+            B1 = v_srai_epi32(B1, shift1);
+            B0 = v_packs_epi32(B0, B1);
+            v_store(tmp + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coef_x[0] + src[i + 1] * coef_x[1]
+                  + src[i + 2] * coef_x[2] + src[i + 3] * coef_x[3]
+                  + src[i + 4] * coef_x[4] + src[i + 5] * coef_x[5]
+                  + src[i + 6] * coef_x[6] + src[i + 7] * coef_x[7];
+            v = (v + add1) >> shift1;
+            tmp[i] = (short)v;
+        }
+        tmp += i_tmp;
+        src += i_src;
+    }
+
+    /* ---- 第二级: 垂直滤波 + 融合平均 ---- */
+    offset = v_set1_epi32(add2);
+    tmp = tmp_res;
+
+    {
+        v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+        v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 4))));
+        v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 6))));
+
+        for (j = 0; j < height; j++) {
+            const short *p = tmp;
+            for (i = 0; i + 7 < width; i += 8) {
+                v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+                v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+                v128_t sum_lo, sum_hi, vdst, vsum;
+
+                T0 = v_load(p);
+                T1 = v_load(p + i_tmp);
+                T2 = v_load(p + 2 * i_tmp);
+                T3 = v_load(p + 3 * i_tmp);
+                T4 = v_load(p + 4 * i_tmp);
+                T5 = v_load(p + 5 * i_tmp);
+                T6 = v_load(p + 6 * i_tmp);
+                T7 = v_load(p + 7 * i_tmp);
+
+                M0_lo = v_unpacklo_epi16(T0, T1);
+                M0_hi = v_unpackhi_epi16(T0, T1);
+                M1_lo = v_unpacklo_epi16(T2, T3);
+                M1_hi = v_unpackhi_epi16(T2, T3);
+                M2_lo = v_unpacklo_epi16(T4, T5);
+                M2_hi = v_unpackhi_epi16(T4, T5);
+                M3_lo = v_unpacklo_epi16(T6, T7);
+                M3_hi = v_unpackhi_epi16(T6, T7);
+
+                N0_lo = v_madd_epi16(M0_lo, coeff00);
+                N0_hi = v_madd_epi16(M0_hi, coeff00);
+                N1_lo = v_madd_epi16(M1_lo, coeff01);
+                N1_hi = v_madd_epi16(M1_hi, coeff01);
+                N2_lo = v_madd_epi16(M2_lo, coeff02);
+                N2_hi = v_madd_epi16(M2_hi, coeff02);
+                N3_lo = v_madd_epi16(M3_lo, coeff03);
+                N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+                sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+                sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+                sum_lo = v_add_epi32(sum_lo, offset);
+                sum_hi = v_add_epi32(sum_hi, offset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+
+                /* 融合平均: dst[i] = (dst[i] + result[i] + 1) >> 1 */
+                vdst = v_load(dst + i);
+                vsum = v_add_epi16(vdst, sum_lo);
+                vsum = v_add_epi16(vsum, one);
+                vsum = v_srli_epi16(vsum, 1);
+                v_store(dst + i, vsum);
+
+                p += 8;
+            }
+            for (; i < width; i++) {
+                int v = tmp[i]              * coef_y[0]
+                      + tmp[i + i_tmp]      * coef_y[1]
+                      + tmp[i + 2 * i_tmp]  * coef_y[2]
+                      + tmp[i + 3 * i_tmp]  * coef_y[3]
+                      + tmp[i + 4 * i_tmp]  * coef_y[4]
+                      + tmp[i + 5 * i_tmp]  * coef_y[5]
+                      + tmp[i + 6 * i_tmp]  * coef_y[6]
+                      + tmp[i + 7 * i_tmp]  * coef_y[7];
+                v = (v + add2) >> shift2;
+                v = v < 0 ? 0 : (v > max_val ? max_val : v);
+                dst[i] = (pel_t)((dst[i] + v + 1) >> 1);
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* ===========================================================================
+ * 色度 4 抽头水平插值 (10-bit NEON)
+ *
+ * SSE 用 shuffle_epi8 构造滑窗, NEON 用 vextq_u16 构造等价窗口:
+ *   s1 = [p0,p1,p2,p3, p1,p2,p3,p4], s2 = [p2,p3,p4,p5, p3,p4,p5,p6]
+ * =========================================================================== */
+static void ip_filter_chroma_hor_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+
+    /* 4 个 int8 系数 → [c0,c1,c2,c3, c0,c1,c2,c3] */
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coeff)));
+    v128_t mAddOffset = v_set1_epi32(offset_val);
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+
+    src -= 1;
+
+    for (row = 0; row < height; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            /* 前 4 输出: p[col..col+6] */
+            s = vld1q_u16(p + col);                  /* [p0..p7] */
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));  /* [p1,p2,p3,p4] */
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));  /* [p3,p4,p5,p6] */
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1)); /* [p0,p1,p2,p3, p1,p2,p3,p4] */
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2)); /* [p2,p3,p4,p5, p3,p4,p5,p6] */
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            /* 后 4 输出: p[col+4..col+10] */
+            s = vld1q_u16(p + col + 4);
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift);
+            sum_hi = v_srai_epi32(sum_hi, shift);
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store(dst + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coeff[0] + src[col + 1] * coeff[1]
+                  + src[col + 2] * coeff[2] + src[col + 3] * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* ===========================================================================
+ * 色度 4 抽头垂直插值 (10-bit NEON)
+ * =========================================================================== */
+static void ip_filter_chroma_ver_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+    v128_t mAddOffset = v_set1_epi32(offset_val);
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    const int i_src2 = i_src * 2;
+    const int i_src3 = i_src * 3;
+
+    v128_t coeff0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 0))));
+    v128_t coeff1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 2))));
+
+    src -= i_src;
+
+    for (row = 0; row < height; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            v128_t S0, S1, S2, S3;
+            v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+            v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+            v128_t sum_lo, sum_hi;
+
+            S0 = v_load(p + col);
+            S1 = v_load(p + col + i_src);
+            S2 = v_load(p + col + i_src2);
+            S3 = v_load(p + col + i_src3);
+
+            T0_lo = v_unpacklo_epi16(S0, S1);
+            T0_hi = v_unpackhi_epi16(S0, S1);
+            T1_lo = v_unpacklo_epi16(S2, S3);
+            T1_hi = v_unpackhi_epi16(S2, S3);
+
+            N0_lo = v_madd_epi16(T0_lo, coeff0);
+            N0_hi = v_madd_epi16(T0_hi, coeff0);
+            N1_lo = v_madd_epi16(T1_lo, coeff1);
+            N1_hi = v_madd_epi16(T1_hi, coeff1);
+
+            sum_lo = v_add_epi32(N0_lo, N1_lo);
+            sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift);
+            sum_hi = v_srai_epi32(sum_hi, shift);
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store(dst + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]             * coeff[0]
+                  + src[col + i_src]     * coeff[1]
+                  + src[col + i_src2]    * coeff[2]
+                  + src[col + i_src3]    * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* ===========================================================================
+ * 色度 4 抽头双向插值 (10-bit NEON): 先水平 (shift1=2) 后垂直 (shift2=10)
+ * =========================================================================== */
+static void ip_filter_chroma_ext_10bit_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN16(short tmp_res[(32 + 3) * 32]);
+    short *tmp = tmp_res;
+    const int i_tmp = 32;
+    int shift1, shift2, add1, add2;
+    int row, col;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t mAddOffset;
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coef_x)));
+
+    shift1 = 2;
+    shift2 = 10;
+    add1 = (1 << shift1) >> 1;
+    add2 = 1 << (shift2 - 1);
+
+    /* ---- 第一级: 水平滤波 ---- */
+    mAddOffset = v_set1_epi32(add1);
+    src = src - i_src - 1;
+
+    for (row = -1; row < height + 2; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            s = vld1q_u16(p + col);
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            s = vld1q_u16(p + col + 4);
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift1);
+            sum_hi = v_srai_epi32(sum_hi, shift1);
+            sum_lo = v_packs_epi32(sum_lo, sum_hi);
+            v_store(tmp + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coef_x[0] + src[col + 1] * coef_x[1]
+                  + src[col + 2] * coef_x[2] + src[col + 3] * coef_x[3];
+            v = (v + add1) >> shift1;
+            tmp[col] = (short)v;
+        }
+        src += i_src;
+        tmp += i_tmp;
+    }
+
+    /* ---- 第二级: 垂直滤波 ---- */
+    tmp = tmp_res;
+    mAddOffset = v_set1_epi32(add2);
+
+    {
+        v128_t coeffy0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeffy1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+
+        for (row = 0; row < height; row++) {
+            for (col = 0; col + 7 < width; col += 8) {
+                v128_t S0, S1, S2, S3;
+                v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+                v128_t sum_lo, sum_hi;
+
+                S0 = v_load(tmp + col);
+                S1 = v_load(tmp + col + i_tmp);
+                S2 = v_load(tmp + col + 2 * i_tmp);
+                S3 = v_load(tmp + col + 3 * i_tmp);
+
+                T0_lo = v_unpacklo_epi16(S0, S1);
+                T0_hi = v_unpackhi_epi16(S0, S1);
+                T1_lo = v_unpacklo_epi16(S2, S3);
+                T1_hi = v_unpackhi_epi16(S2, S3);
+
+                N0_lo = v_madd_epi16(T0_lo, coeffy0);
+                N0_hi = v_madd_epi16(T0_hi, coeffy0);
+                N1_lo = v_madd_epi16(T1_lo, coeffy1);
+                N1_hi = v_madd_epi16(T1_hi, coeffy1);
+
+                sum_lo = v_add_epi32(N0_lo, N1_lo);
+                sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+                sum_lo = v_add_epi32(sum_lo, mAddOffset);
+                sum_hi = v_add_epi32(sum_hi, mAddOffset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+                v_store(dst + col, sum_lo);
+            }
+            for (; col < width; col++) {
+                int v = tmp[col]             * coef_y[0]
+                      + tmp[col + i_tmp]     * coef_y[1]
+                      + tmp[col + 2 * i_tmp] * coef_y[2]
+                      + tmp[col + 3 * i_tmp] * coef_y[3];
+                v = (v + add2) >> shift2;
+                dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* ---- 融合 MC+avg: 色度双向预测第二路 ---- */
+static void ip_filter_chroma_ext_10bit_avg_neon(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN16(short tmp_res[(32 + 3) * 32]);
+    short *tmp = tmp_res;
+    const int i_tmp = 32;
+    int shift1, shift2, add1, add2;
+    int row, col;
+    v128_t max_val1 = v_set1_epi16((int16_t)max_val);
+    v128_t one16 = v_set1_epi16(1);
+    v128_t mAddOffset;
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coef_x)));
+
+    shift1 = 2;
+    shift2 = 10;
+    add1 = (1 << shift1) >> 1;
+    add2 = 1 << (shift2 - 1);
+
+    /* ---- 第一级: 水平滤波 (与普通版相同) ---- */
+    mAddOffset = v_set1_epi32(add1);
+    src = src - i_src - 1;
+
+    for (row = -1; row < height + 2; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            s = vld1q_u16(p + col);
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            s = vld1q_u16(p + col + 4);
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift1);
+            sum_hi = v_srai_epi32(sum_hi, shift1);
+            sum_lo = v_packs_epi32(sum_lo, sum_hi);
+            v_store(tmp + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coef_x[0] + src[col + 1] * coef_x[1]
+                  + src[col + 2] * coef_x[2] + src[col + 3] * coef_x[3];
+            v = (v + add1) >> shift1;
+            tmp[col] = (short)v;
+        }
+        src += i_src;
+        tmp += i_tmp;
+    }
+
+    /* ---- 第二级: 垂直滤波 + 融合平均 ---- */
+    tmp = tmp_res;
+    mAddOffset = v_set1_epi32(add2);
+
+    {
+        v128_t coeffy0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeffy1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+
+        for (row = 0; row < height; row++) {
+            for (col = 0; col + 7 < width; col += 8) {
+                v128_t S0, S1, S2, S3;
+                v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+                v128_t sum_lo, sum_hi, vdst, vsum;
+
+                S0 = v_load(tmp + col);
+                S1 = v_load(tmp + col + i_tmp);
+                S2 = v_load(tmp + col + 2 * i_tmp);
+                S3 = v_load(tmp + col + 3 * i_tmp);
+
+                T0_lo = v_unpacklo_epi16(S0, S1);
+                T0_hi = v_unpackhi_epi16(S0, S1);
+                T1_lo = v_unpacklo_epi16(S2, S3);
+                T1_hi = v_unpackhi_epi16(S2, S3);
+
+                N0_lo = v_madd_epi16(T0_lo, coeffy0);
+                N0_hi = v_madd_epi16(T0_hi, coeffy0);
+                N1_lo = v_madd_epi16(T1_lo, coeffy1);
+                N1_hi = v_madd_epi16(T1_hi, coeffy1);
+
+                sum_lo = v_add_epi32(N0_lo, N1_lo);
+                sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+                sum_lo = v_add_epi32(sum_lo, mAddOffset);
+                sum_hi = v_add_epi32(sum_hi, mAddOffset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+
+                /* 融合平均: dst[col] = (dst[col] + result[col] + 1) >> 1 */
+                vdst = v_load(dst + col);
+                vsum = v_add_epi16(vdst, sum_lo);
+                vsum = v_add_epi16(vsum, one16);
+                vsum = v_srli_epi16(vsum, 1);
+                v_store(dst + col, vsum);
+            }
+            for (; col < width; col++) {
+                int v = tmp[col]             * coef_y[0]
+                      + tmp[col + i_tmp]     * coef_y[1]
+                      + tmp[col + 2 * i_tmp] * coef_y[2]
+                      + tmp[col + 3 * i_tmp] * coef_y[3];
+                v = (v + add2) >> shift2;
+                v = v < 0 ? 0 : (v > max_val ? max_val : v);
+                dst[col] = (pel_t)((dst[col] + v + 1) >> 1);
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* ===========================================================================
+ * 整像素块平均 / 双向平均 / 块填充 (10-bit NEON)
+ * =========================================================================== */
+
+/* dst[i] = (dst[i] + src[i] + 1) >> 1 */
+static void block_avg_10bit_neon(pel_t *dst, int i_dst,
+                                 const pel_t *src, int i_src,
+                                 int width, int height)
+{
+    const uint16x8_t one = vdupq_n_u16(1);
+    int y, x;
+
+    for (y = 0; y < height; y++) {
+        pel_t *d = dst;
+        const pel_t *s = src;
+        x = 0;
+        for (; x + 7 < width; x += 8) {
+            uint16x8_t vd = vld1q_u16(d + x);
+            uint16x8_t vs = vld1q_u16(s + x);
+            uint16x8_t sum = vaddq_u16(vd, vs);
+            sum = vaddq_u16(sum, one);
+            sum = vshrq_n_u16(sum, 1);
+            vst1q_u16(d + x, sum);
+        }
+        for (; x < width; x++) {
+            int v = d[x] + s[x];
+            d[x] = (pel_t)((v + 1) >> 1);
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* 10-bit 双向平均: dst16[x] = (dst16[x] + pred2[x] + 1) >> 1 */
+static void bi_avg_10bit_neon(uint16_t *p16, int stride16,
+                              const int16_t *pred2, int pred2_stride,
+                              int w, int h)
+{
+    const uint16x8_t one = vdupq_n_u16(1);
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint16_t *d = p16 + y * stride16;
+        const int16_t *p = pred2 + y * pred2_stride;
+        x = 0;
+        for (; x + 7 < w; x += 8) {
+            uint16x8_t vd = vld1q_u16(d + x);
+            uint16x8_t vp = vreinterpretq_u16_s16(vld1q_s16(p + x));
+            vd = vaddq_u16(vd, vp);
+            vd = vaddq_u16(vd, one);
+            vd = vshrq_n_u16(vd, 1);
+            vst1q_u16(d + x, vd);
+        }
+        for (; x < w; x++) {
+            int v = d[x] + p[x];
+            d[x] = (uint16_t)((v + 1) >> 1);
+        }
+    }
+}
+
+/* 10-bit 双源双向平均: dst16[x] = (pred1[x] + pred2[x] + 1) >> 1 */
+static void bi_avg_2src_10bit_neon(uint16_t *p16, int stride16,
+                                   const int16_t *pred1, int pred1_stride,
+                                   const int16_t *pred2, int pred2_stride,
+                                   int w, int h)
+{
+    const uint16x8_t one = vdupq_n_u16(1);
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint16_t *d = p16 + y * stride16;
+        const int16_t *p1 = pred1 + y * pred1_stride;
+        const int16_t *p2 = pred2 + y * pred2_stride;
+        x = 0;
+        for (; x + 7 < w; x += 8) {
+            uint16x8_t v1 = vreinterpretq_u16_s16(vld1q_s16(p1 + x));
+            uint16x8_t v2 = vreinterpretq_u16_s16(vld1q_s16(p2 + x));
+            uint16x8_t sum = vaddq_u16(v1, v2);
+            sum = vaddq_u16(sum, one);
+            sum = vshrq_n_u16(sum, 1);
+            vst1q_u16(d + x, sum);
+        }
+        for (; x < w; x++) {
+            int v = p1[x] + p2[x];
+            d[x] = (uint16_t)((v + 1) >> 1);
+        }
+    }
+}
+
+/* 10-bit 块填充 */
+static void fill_block_10bit_neon(uint16_t *p16, int stride16,
+                                  int w, int h, int fill_val)
+{
+    const uint16x8_t vfill = vdupq_n_u16((uint16_t)fill_val);
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint16_t *d = p16 + y * stride16;
+        x = 0;
+        for (; x + 7 < w; x += 8) {
+            vst1q_u16(d + x, vfill);
+        }
+        for (; x < w; x++) {
+            d[x] = (uint16_t)fill_val;
+        }
+    }
+}
+
+/* ===========================================================================
+ * 8-bit NEON 运动补偿实现
+ *
+ * 策略: 将 uint8_t 像素加载后宽展为 int16 进行滤波运算 (与 10-bit 同构),
+ * 结果饱和缩窄回 uint8 存储. 所有移位/舍入与 C 参考一致:
+ *   - hor/ver: shift=6, offset=32, clip [0,255]
+ *   - ext: shift1=0, shift2=12, add1=0, add2=2048
+ *     (8-bit 时 shift1=bit_depth-8=0, 中间结果不移位, 范围 ±32640 fits int16)
+ * =========================================================================== */
+
+/* 加载 8 个 uint8 像素并宽展为 int16x8 (类比 10-bit 的 v_load) */
+static inline v128_t v_load_u8(const uint8_t *p) {
+    return vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p)));
+}
+
+/* 将 int16x8 饱和缩窄为 uint8x8 并存储 8 字节 */
+static inline void v_store_u8(uint8_t *p, v128_t v) {
+    vst1_u8(p, vqmovn_u16(vreinterpretq_u16_s16(v)));
+}
+
+/* 8-bit 块拷贝: 16 字节/次 */
+static void block_copy_8bit_neon(uint8_t *dst, int i_dst,
+                                  const uint8_t *src, int i_src,
+                                  int width, int height)
+{
+    int y, x;
+    for (y = 0; y < height; y++) {
+        for (x = 0; x + 15 < width; x += 16) {
+            vst1q_u8(dst + x, vld1q_u8(src + x));
+        }
+        for (; x + 7 < width; x += 8) {
+            vst1_u8(dst + x, vld1_u8(src + x));
+        }
+        for (; x < width; x++) {
+            dst[x] = src[x];
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 8-bit 亮度 8 抽头水平插值 */
+static void ip_filter_luma_hor_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height, const int8_t *coeff)
+{
+    int j, i;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t offset = v_set1_epi32(32);
+    v128_t mCoef = vmovl_s8(vld1_s8(coeff));
+
+    src -= 3;
+
+    for (j = 0; j < height; j++) {
+        const uint8_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load_u8(p++);
+            T1 = v_load_u8(p++);
+            T2 = v_load_u8(p++);
+            T3 = v_load_u8(p++);
+            T4 = v_load_u8(p++);
+            T5 = v_load_u8(p++);
+            T6 = v_load_u8(p++);
+            T7 = v_load_u8(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            B0 = v_add_epi32(B0, offset);
+            B1 = v_add_epi32(B1, offset);
+            B0 = v_srai_epi32(B0, 6);
+            B1 = v_srai_epi32(B1, 6);
+            B0 = v_packus_epi32(B0, B1);
+            B0 = v_min_epu16(B0, max_val1);
+            v_store_u8(dst + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coeff[0] + src[i + 1] * coeff[1]
+                  + src[i + 2] * coeff[2] + src[i + 3] * coeff[3]
+                  + src[i + 4] * coeff[4] + src[i + 5] * coeff[5]
+                  + src[i + 6] * coeff[6] + src[i + 7] * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* 8-bit 亮度 8 抽头垂直插值 */
+static void ip_filter_luma_ver_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height, const int8_t *coeff)
+{
+    int i, j;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t mAddOffset = v_set1_epi32(32);
+
+    v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 0))));
+    v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 2))));
+    v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 4))));
+    v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 6))));
+
+    src -= 3 * i_src;
+
+    for (j = 0; j < height; j++) {
+        const uint8_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+            v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+            v128_t sum_lo, sum_hi;
+
+            T0 = v_load_u8(p);
+            T1 = v_load_u8(p + i_src);
+            T2 = v_load_u8(p + 2 * i_src);
+            T3 = v_load_u8(p + 3 * i_src);
+            T4 = v_load_u8(p + 4 * i_src);
+            T5 = v_load_u8(p + 5 * i_src);
+            T6 = v_load_u8(p + 6 * i_src);
+            T7 = v_load_u8(p + 7 * i_src);
+
+            M0_lo = v_unpacklo_epi16(T0, T1);
+            M0_hi = v_unpackhi_epi16(T0, T1);
+            M1_lo = v_unpacklo_epi16(T2, T3);
+            M1_hi = v_unpackhi_epi16(T2, T3);
+            M2_lo = v_unpacklo_epi16(T4, T5);
+            M2_hi = v_unpackhi_epi16(T4, T5);
+            M3_lo = v_unpacklo_epi16(T6, T7);
+            M3_hi = v_unpackhi_epi16(T6, T7);
+
+            N0_lo = v_madd_epi16(M0_lo, coeff00);
+            N0_hi = v_madd_epi16(M0_hi, coeff00);
+            N1_lo = v_madd_epi16(M1_lo, coeff01);
+            N1_hi = v_madd_epi16(M1_hi, coeff01);
+            N2_lo = v_madd_epi16(M2_lo, coeff02);
+            N2_hi = v_madd_epi16(M2_hi, coeff02);
+            N3_lo = v_madd_epi16(M3_lo, coeff03);
+            N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+            sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+            sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, 6);
+            sum_hi = v_srai_epi32(sum_hi, 6);
+
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store_u8(dst + i, sum_lo);
+
+            p += 8;
+        }
+        for (; i < width; i++) {
+            int v = src[i]              * coeff[0]
+                  + src[i + i_src]      * coeff[1]
+                  + src[i + 2 * i_src]  * coeff[2]
+                  + src[i + 3 * i_src]  * coeff[3]
+                  + src[i + 4 * i_src]  * coeff[4]
+                  + src[i + 5 * i_src]  * coeff[5]
+                  + src[i + 6 * i_src]  * coeff[6]
+                  + src[i + 7 * i_src]  * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 8-bit 亮度 8 抽头双向插值: 先水平 (shift1=0) 后垂直 (shift2=12) */
+static void ip_filter_luma_ext_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y)
+{
+    AVS2_ALIGN16(short tmp_res[(64 + 7) * 64]);
+    short *tmp = tmp_res;
+    const int i_tmp = MC_TMP_STRIDE;
+    const int shift2 = 12;  /* 20 - bit_depth */
+    const int add2 = 1 << (shift2 - 1);
+    int i, j;
+    v128_t offset;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t mCoef = vmovl_s8(vld1_s8(coef_x));
+
+    /* ---- 第一级: 水平滤波 (shift1=0, 不移位, 中间结果存 int16) ---- */
+    src += -3 * i_src - 3;
+
+    for (j = -3; j < height + 4; j++) {
+        const uint8_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load_u8(p++);
+            T1 = v_load_u8(p++);
+            T2 = v_load_u8(p++);
+            T3 = v_load_u8(p++);
+            T4 = v_load_u8(p++);
+            T5 = v_load_u8(p++);
+            T6 = v_load_u8(p++);
+            T7 = v_load_u8(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            /* shift1=0: 仅加 add1=0, 不移位, 有符号饱和到 int16 */
+            B0 = v_packs_epi32(B0, B1);
+            v_store(tmp + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coef_x[0] + src[i + 1] * coef_x[1]
+                  + src[i + 2] * coef_x[2] + src[i + 3] * coef_x[3]
+                  + src[i + 4] * coef_x[4] + src[i + 5] * coef_x[5]
+                  + src[i + 6] * coef_x[6] + src[i + 7] * coef_x[7];
+            tmp[i] = (short)v;
+        }
+        tmp += i_tmp;
+        src += i_src;
+    }
+
+    /* ---- 第二级: 垂直滤波 ---- */
+    offset = v_set1_epi32(add2);
+    tmp = tmp_res;
+
+    {
+        v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+        v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 4))));
+        v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 6))));
+
+        for (j = 0; j < height; j++) {
+            const short *p = tmp;
+            for (i = 0; i + 7 < width; i += 8) {
+                v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+                v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+                v128_t sum_lo, sum_hi;
+
+                T0 = v_load(p);
+                T1 = v_load(p + i_tmp);
+                T2 = v_load(p + 2 * i_tmp);
+                T3 = v_load(p + 3 * i_tmp);
+                T4 = v_load(p + 4 * i_tmp);
+                T5 = v_load(p + 5 * i_tmp);
+                T6 = v_load(p + 6 * i_tmp);
+                T7 = v_load(p + 7 * i_tmp);
+
+                M0_lo = v_unpacklo_epi16(T0, T1);
+                M0_hi = v_unpackhi_epi16(T0, T1);
+                M1_lo = v_unpacklo_epi16(T2, T3);
+                M1_hi = v_unpackhi_epi16(T2, T3);
+                M2_lo = v_unpacklo_epi16(T4, T5);
+                M2_hi = v_unpackhi_epi16(T4, T5);
+                M3_lo = v_unpacklo_epi16(T6, T7);
+                M3_hi = v_unpackhi_epi16(T6, T7);
+
+                N0_lo = v_madd_epi16(M0_lo, coeff00);
+                N0_hi = v_madd_epi16(M0_hi, coeff00);
+                N1_lo = v_madd_epi16(M1_lo, coeff01);
+                N1_hi = v_madd_epi16(M1_hi, coeff01);
+                N2_lo = v_madd_epi16(M2_lo, coeff02);
+                N2_hi = v_madd_epi16(M2_hi, coeff02);
+                N3_lo = v_madd_epi16(M3_lo, coeff03);
+                N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+                sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+                sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+                sum_lo = v_add_epi32(sum_lo, offset);
+                sum_hi = v_add_epi32(sum_hi, offset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+                v_store_u8(dst + i, sum_lo);
+
+                p += 8;
+            }
+            for (; i < width; i++) {
+                int v = tmp[i]              * coef_y[0]
+                      + tmp[i + i_tmp]      * coef_y[1]
+                      + tmp[i + 2 * i_tmp]  * coef_y[2]
+                      + tmp[i + 3 * i_tmp]  * coef_y[3]
+                      + tmp[i + 4 * i_tmp]  * coef_y[4]
+                      + tmp[i + 5 * i_tmp]  * coef_y[5]
+                      + tmp[i + 6 * i_tmp]  * coef_y[6]
+                      + tmp[i + 7 * i_tmp]  * coef_y[7];
+                v = (v + add2) >> shift2;
+                dst[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* 8-bit 融合 MC+avg: 亮度双向第二路 (垂直滤波后与 dst 平均) */
+static void ip_filter_luma_ext_8bit_avg_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y)
+{
+    AVS2_ALIGN16(short tmp_res[(64 + 7) * 64]);
+    short *tmp = tmp_res;
+    const int i_tmp = MC_TMP_STRIDE;
+    const int shift2 = 12;
+    const int add2 = 1 << (shift2 - 1);
+    int i, j;
+    v128_t offset;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t one = v_set1_epi16(1);
+    v128_t mCoef = vmovl_s8(vld1_s8(coef_x));
+
+    /* ---- 第一级: 水平滤波 (shift1=0) ---- */
+    src += -3 * i_src - 3;
+    offset = v_set1_epi32(0);
+
+    for (j = -3; j < height + 4; j++) {
+        const uint8_t *p = src;
+        for (i = 0; i + 7 < width; i += 8) {
+            v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+            v128_t M0, M1, M2, M3, M4, M5, M6, M7;
+            v128_t A0, A1, A2, A3, B0, B1;
+
+            T0 = v_load_u8(p++);
+            T1 = v_load_u8(p++);
+            T2 = v_load_u8(p++);
+            T3 = v_load_u8(p++);
+            T4 = v_load_u8(p++);
+            T5 = v_load_u8(p++);
+            T6 = v_load_u8(p++);
+            T7 = v_load_u8(p++);
+
+            M0 = v_madd_epi16(T0, mCoef);
+            M1 = v_madd_epi16(T1, mCoef);
+            M2 = v_madd_epi16(T2, mCoef);
+            M3 = v_madd_epi16(T3, mCoef);
+            M4 = v_madd_epi16(T4, mCoef);
+            M5 = v_madd_epi16(T5, mCoef);
+            M6 = v_madd_epi16(T6, mCoef);
+            M7 = v_madd_epi16(T7, mCoef);
+
+            A0 = v_hadd_epi32(M0, M1);
+            A1 = v_hadd_epi32(M2, M3);
+            A2 = v_hadd_epi32(M4, M5);
+            A3 = v_hadd_epi32(M6, M7);
+
+            B0 = v_hadd_epi32(A0, A1);
+            B1 = v_hadd_epi32(A2, A3);
+
+            B0 = v_packs_epi32(B0, B1);
+            v_store(tmp + i, B0);
+        }
+        for (; i < width; i++) {
+            int v = src[i]     * coef_x[0] + src[i + 1] * coef_x[1]
+                  + src[i + 2] * coef_x[2] + src[i + 3] * coef_x[3]
+                  + src[i + 4] * coef_x[4] + src[i + 5] * coef_x[5]
+                  + src[i + 6] * coef_x[6] + src[i + 7] * coef_x[7];
+            tmp[i] = (short)v;
+        }
+        tmp += i_tmp;
+        src += i_src;
+    }
+
+    /* ---- 第二级: 垂直滤波 + 融合平均 ---- */
+    offset = v_set1_epi32(add2);
+    tmp = tmp_res;
+
+    {
+        v128_t coeff00 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeff01 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+        v128_t coeff02 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 4))));
+        v128_t coeff03 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 6))));
+
+        for (j = 0; j < height; j++) {
+            const short *p = tmp;
+            for (i = 0; i + 7 < width; i += 8) {
+                v128_t T0, T1, T2, T3, T4, T5, T6, T7;
+                v128_t M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+                v128_t sum_lo, sum_hi, vdst, vsum;
+
+                T0 = v_load(p);
+                T1 = v_load(p + i_tmp);
+                T2 = v_load(p + 2 * i_tmp);
+                T3 = v_load(p + 3 * i_tmp);
+                T4 = v_load(p + 4 * i_tmp);
+                T5 = v_load(p + 5 * i_tmp);
+                T6 = v_load(p + 6 * i_tmp);
+                T7 = v_load(p + 7 * i_tmp);
+
+                M0_lo = v_unpacklo_epi16(T0, T1);
+                M0_hi = v_unpackhi_epi16(T0, T1);
+                M1_lo = v_unpacklo_epi16(T2, T3);
+                M1_hi = v_unpackhi_epi16(T2, T3);
+                M2_lo = v_unpacklo_epi16(T4, T5);
+                M2_hi = v_unpackhi_epi16(T4, T5);
+                M3_lo = v_unpacklo_epi16(T6, T7);
+                M3_hi = v_unpackhi_epi16(T6, T7);
+
+                N0_lo = v_madd_epi16(M0_lo, coeff00);
+                N0_hi = v_madd_epi16(M0_hi, coeff00);
+                N1_lo = v_madd_epi16(M1_lo, coeff01);
+                N1_hi = v_madd_epi16(M1_hi, coeff01);
+                N2_lo = v_madd_epi16(M2_lo, coeff02);
+                N2_hi = v_madd_epi16(M2_hi, coeff02);
+                N3_lo = v_madd_epi16(M3_lo, coeff03);
+                N3_hi = v_madd_epi16(M3_hi, coeff03);
+
+                sum_lo = v_add_epi32(v_add_epi32(N0_lo, N1_lo), v_add_epi32(N2_lo, N3_lo));
+                sum_hi = v_add_epi32(v_add_epi32(N0_hi, N1_hi), v_add_epi32(N2_hi, N3_hi));
+
+                sum_lo = v_add_epi32(sum_lo, offset);
+                sum_hi = v_add_epi32(sum_hi, offset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+
+                /* 融合平均: dst[i] = (dst[i] + result[i] + 1) >> 1 */
+                vdst = v_load_u8(dst + i);
+                vsum = v_add_epi16(vdst, sum_lo);
+                vsum = v_add_epi16(vsum, one);
+                vsum = v_srli_epi16(vsum, 1);
+                v_store_u8(dst + i, vsum);
+
+                p += 8;
+            }
+            for (; i < width; i++) {
+                int v = tmp[i]              * coef_y[0]
+                      + tmp[i + i_tmp]      * coef_y[1]
+                      + tmp[i + 2 * i_tmp]  * coef_y[2]
+                      + tmp[i + 3 * i_tmp]  * coef_y[3]
+                      + tmp[i + 4 * i_tmp]  * coef_y[4]
+                      + tmp[i + 5 * i_tmp]  * coef_y[5]
+                      + tmp[i + 6 * i_tmp]  * coef_y[6]
+                      + tmp[i + 7 * i_tmp]  * coef_y[7];
+                v = (v + add2) >> shift2;
+                v = v < 0 ? 0 : (v > 255 ? 255 : v);
+                dst[i] = (uint8_t)((dst[i] + v + 1) >> 1);
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* 8-bit 色度 4 抽头水平插值 */
+static void ip_filter_chroma_hor_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height, const int8_t *coeff)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coeff)));
+    v128_t mAddOffset = v_set1_epi32(offset_val);
+    v128_t max_val1 = v_set1_epi16(255);
+
+    src -= 1;
+
+    for (row = 0; row < height; row++) {
+        const uint8_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            /* 加载 8 uint8 并宽展为 uint16x8 (与 10-bit vld1q_u16 等价) */
+            s = vmovl_u8(vld1_u8(p + col));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            s = vmovl_u8(vld1_u8(p + col + 4));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift);
+            sum_hi = v_srai_epi32(sum_hi, shift);
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store_u8(dst + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coeff[0] + src[col + 1] * coeff[1]
+                  + src[col + 2] * coeff[2] + src[col + 3] * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 8-bit 色度 4 抽头垂直插值 */
+static void ip_filter_chroma_ver_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height, const int8_t *coeff)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+    v128_t mAddOffset = v_set1_epi32(offset_val);
+    v128_t max_val1 = v_set1_epi16(255);
+    const int i_src2 = i_src * 2;
+    const int i_src3 = i_src * 3;
+
+    v128_t coeff0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 0))));
+    v128_t coeff1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coeff + 2))));
+
+    src -= i_src;
+
+    for (row = 0; row < height; row++) {
+        const uint8_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            v128_t S0, S1, S2, S3;
+            v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+            v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+            v128_t sum_lo, sum_hi;
+
+            S0 = v_load_u8(p + col);
+            S1 = v_load_u8(p + col + i_src);
+            S2 = v_load_u8(p + col + i_src2);
+            S3 = v_load_u8(p + col + i_src3);
+
+            T0_lo = v_unpacklo_epi16(S0, S1);
+            T0_hi = v_unpackhi_epi16(S0, S1);
+            T1_lo = v_unpacklo_epi16(S2, S3);
+            T1_hi = v_unpackhi_epi16(S2, S3);
+
+            N0_lo = v_madd_epi16(T0_lo, coeff0);
+            N0_hi = v_madd_epi16(T0_hi, coeff0);
+            N1_lo = v_madd_epi16(T1_lo, coeff1);
+            N1_hi = v_madd_epi16(T1_hi, coeff1);
+
+            sum_lo = v_add_epi32(N0_lo, N1_lo);
+            sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+            sum_lo = v_add_epi32(sum_lo, mAddOffset);
+            sum_hi = v_add_epi32(sum_hi, mAddOffset);
+            sum_lo = v_srai_epi32(sum_lo, shift);
+            sum_hi = v_srai_epi32(sum_hi, shift);
+            sum_lo = v_packus_epi32(sum_lo, sum_hi);
+            sum_lo = v_min_epu16(sum_lo, max_val1);
+            v_store_u8(dst + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]             * coeff[0]
+                  + src[col + i_src]     * coeff[1]
+                  + src[col + i_src2]    * coeff[2]
+                  + src[col + i_src3]    * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 8-bit 色度 4 抽头双向插值: 先水平 (shift1=0) 后垂直 (shift2=12) */
+static void ip_filter_chroma_ext_8bit_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y)
+{
+    AVS2_ALIGN16(short tmp_res[(32 + 3) * 32]);
+    short *tmp = tmp_res;
+    const int i_tmp = 32;
+    const int shift2 = 12;
+    const int add2 = 1 << (shift2 - 1);
+    int row, col;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t mAddOffset;
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coef_x)));
+
+    /* ---- 第一级: 水平滤波 (shift1=0) ---- */
+    src = src - i_src - 1;
+
+    for (row = -1; row < height + 2; row++) {
+        const uint8_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            s = vmovl_u8(vld1_u8(p + col));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            s = vmovl_u8(vld1_u8(p + col + 4));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_packs_epi32(sum_lo, sum_hi);
+            v_store(tmp + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coef_x[0] + src[col + 1] * coef_x[1]
+                  + src[col + 2] * coef_x[2] + src[col + 3] * coef_x[3];
+            tmp[col] = (short)v;
+        }
+        src += i_src;
+        tmp += i_tmp;
+    }
+
+    /* ---- 第二级: 垂直滤波 ---- */
+    tmp = tmp_res;
+    mAddOffset = v_set1_epi32(add2);
+
+    {
+        v128_t coeffy0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeffy1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+
+        for (row = 0; row < height; row++) {
+            for (col = 0; col + 7 < width; col += 8) {
+                v128_t S0, S1, S2, S3;
+                v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+                v128_t sum_lo, sum_hi;
+
+                S0 = v_load(tmp + col);
+                S1 = v_load(tmp + col + i_tmp);
+                S2 = v_load(tmp + col + 2 * i_tmp);
+                S3 = v_load(tmp + col + 3 * i_tmp);
+
+                T0_lo = v_unpacklo_epi16(S0, S1);
+                T0_hi = v_unpackhi_epi16(S0, S1);
+                T1_lo = v_unpacklo_epi16(S2, S3);
+                T1_hi = v_unpackhi_epi16(S2, S3);
+
+                N0_lo = v_madd_epi16(T0_lo, coeffy0);
+                N0_hi = v_madd_epi16(T0_hi, coeffy0);
+                N1_lo = v_madd_epi16(T1_lo, coeffy1);
+                N1_hi = v_madd_epi16(T1_hi, coeffy1);
+
+                sum_lo = v_add_epi32(N0_lo, N1_lo);
+                sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+                sum_lo = v_add_epi32(sum_lo, mAddOffset);
+                sum_hi = v_add_epi32(sum_hi, mAddOffset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+                v_store_u8(dst + col, sum_lo);
+            }
+            for (; col < width; col++) {
+                int v = tmp[col]             * coef_y[0]
+                      + tmp[col + i_tmp]     * coef_y[1]
+                      + tmp[col + 2 * i_tmp] * coef_y[2]
+                      + tmp[col + 3 * i_tmp] * coef_y[3];
+                v = (v + add2) >> shift2;
+                dst[col] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* 8-bit 融合 MC+avg: 色度双向第二路 */
+static void ip_filter_chroma_ext_8bit_avg_neon(
+        uint8_t *dst, int i_dst, const uint8_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y)
+{
+    AVS2_ALIGN16(short tmp_res[(32 + 3) * 32]);
+    short *tmp = tmp_res;
+    const int i_tmp = 32;
+    const int shift2 = 12;
+    const int add2 = 1 << (shift2 - 1);
+    int row, col;
+    v128_t max_val1 = v_set1_epi16(255);
+    v128_t one16 = v_set1_epi16(1);
+    v128_t mAddOffset;
+    v128_t mCoef = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(*(const int32_t*)coef_x)));
+
+    /* ---- 第一级: 水平滤波 (shift1=0) ---- */
+    src = src - i_src - 1;
+
+    for (row = -1; row < height + 2; row++) {
+        const uint8_t *p = src;
+        for (col = 0; col + 7 < width; col += 8) {
+            uint16x8_t s;
+            uint16x4_t lo1, lo2;
+            v128_t s1, s2, m1, m2, sum_lo;
+            v128_t s3, s4, m3, m4, sum_hi;
+
+            s = vmovl_u8(vld1_u8(p + col));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s1 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s2 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m1 = v_madd_epi16(s1, mCoef);
+            m2 = v_madd_epi16(s2, mCoef);
+            sum_lo = v_hadd_epi32(m1, m2);
+
+            s = vmovl_u8(vld1_u8(p + col + 4));
+            lo1 = vget_low_u16(vextq_u16(s, s, 1));
+            lo2 = vget_low_u16(vextq_u16(s, s, 3));
+            s3 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(s), lo1));
+            s4 = vreinterpretq_s16_u16(vcombine_u16(vget_low_u16(vextq_u16(s, s, 2)), lo2));
+            m3 = v_madd_epi16(s3, mCoef);
+            m4 = v_madd_epi16(s4, mCoef);
+            sum_hi = v_hadd_epi32(m3, m4);
+
+            sum_lo = v_packs_epi32(sum_lo, sum_hi);
+            v_store(tmp + col, sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coef_x[0] + src[col + 1] * coef_x[1]
+                  + src[col + 2] * coef_x[2] + src[col + 3] * coef_x[3];
+            tmp[col] = (short)v;
+        }
+        src += i_src;
+        tmp += i_tmp;
+    }
+
+    /* ---- 第二级: 垂直滤波 + 融合平均 ---- */
+    tmp = tmp_res;
+    mAddOffset = v_set1_epi32(add2);
+
+    {
+        v128_t coeffy0 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 0))));
+        v128_t coeffy1 = vmovl_s8(vreinterpret_s8_s16(vdup_n_s16(*(const int16_t*)(coef_y + 2))));
+
+        for (row = 0; row < height; row++) {
+            for (col = 0; col + 7 < width; col += 8) {
+                v128_t S0, S1, S2, S3;
+                v128_t T0_lo, T0_hi, T1_lo, T1_hi;
+                v128_t N0_lo, N0_hi, N1_lo, N1_hi;
+                v128_t sum_lo, sum_hi, vdst, vsum;
+
+                S0 = v_load(tmp + col);
+                S1 = v_load(tmp + col + i_tmp);
+                S2 = v_load(tmp + col + 2 * i_tmp);
+                S3 = v_load(tmp + col + 3 * i_tmp);
+
+                T0_lo = v_unpacklo_epi16(S0, S1);
+                T0_hi = v_unpackhi_epi16(S0, S1);
+                T1_lo = v_unpacklo_epi16(S2, S3);
+                T1_hi = v_unpackhi_epi16(S2, S3);
+
+                N0_lo = v_madd_epi16(T0_lo, coeffy0);
+                N0_hi = v_madd_epi16(T0_hi, coeffy0);
+                N1_lo = v_madd_epi16(T1_lo, coeffy1);
+                N1_hi = v_madd_epi16(T1_hi, coeffy1);
+
+                sum_lo = v_add_epi32(N0_lo, N1_lo);
+                sum_hi = v_add_epi32(N0_hi, N1_hi);
+
+                sum_lo = v_add_epi32(sum_lo, mAddOffset);
+                sum_hi = v_add_epi32(sum_hi, mAddOffset);
+                sum_lo = v_srai_epi32(sum_lo, shift2);
+                sum_hi = v_srai_epi32(sum_hi, shift2);
+                sum_lo = v_packus_epi32(sum_lo, sum_hi);
+                sum_lo = v_min_epu16(sum_lo, max_val1);
+
+                /* 融合平均: dst[col] = (dst[col] + result[col] + 1) >> 1 */
+                vdst = v_load_u8(dst + col);
+                vsum = v_add_epi16(vdst, sum_lo);
+                vsum = v_add_epi16(vsum, one16);
+                vsum = v_srli_epi16(vsum, 1);
+                v_store_u8(dst + col, vsum);
+            }
+            for (; col < width; col++) {
+                int v = tmp[col]             * coef_y[0]
+                      + tmp[col + i_tmp]     * coef_y[1]
+                      + tmp[col + 2 * i_tmp] * coef_y[2]
+                      + tmp[col + 3 * i_tmp] * coef_y[3];
+                v = (v + add2) >> shift2;
+                v = v < 0 ? 0 : (v > 255 ? 255 : v);
+                dst[col] = (uint8_t)((dst[col] + v + 1) >> 1);
+            }
+            dst += i_dst;
+            tmp += i_tmp;
+        }
+    }
+}
+
+/* 8-bit 整像素块平均: dst[i] = (dst[i] + src[i] + 1) >> 1 */
+static void block_avg_8bit_neon(uint8_t *dst, int i_dst,
+                                 const uint8_t *src, int i_src,
+                                 int width, int height)
+{
+    int y, x;
+    for (y = 0; y < height; y++) {
+        for (x = 0; x + 15 < width; x += 16) {
+            uint8x16_t vd = vld1q_u8(dst + x);
+            uint8x16_t vs = vld1q_u8(src + x);
+            vst1q_u8(dst + x, vrhaddq_u8(vd, vs));
+        }
+        for (; x + 7 < width; x += 8) {
+            uint8x8_t vd = vld1_u8(dst + x);
+            uint8x8_t vs = vld1_u8(src + x);
+            vst1_u8(dst + x, vrhadd_u8(vd, vs));
+        }
+        for (; x < width; x++) {
+            int v = dst[x] + src[x];
+            dst[x] = (uint8_t)((v + 1) >> 1);
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* 8-bit 双向平均: dst[x] = (dst[x] + pred2[x] + 1) >> 1
+ * pred2 为 int16_t[], 值域 [0,255], 取低字节与 dst 平均 */
+static void bi_avg_8bit_neon(uint8_t *dst, int dst_stride,
+                              const int16_t *pred2, int pred2_stride,
+                              int w, int h)
+{
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint8_t *d = dst + y * dst_stride;
+        const int16_t *p = pred2 + y * pred2_stride;
+        x = 0;
+        for (; x + 7 < w; x += 8) {
+            uint8x8_t vd = vld1_u8(d + x);
+            uint16x8_t vp16 = vreinterpretq_u16_s16(vld1q_s16(p + x));
+            uint8x8_t vp = vqmovn_u16(vp16);
+            vst1_u8(d + x, vrhadd_u8(vd, vp));
+        }
+        for (; x < w; x++) {
+            int v = d[x] + (uint8_t)p[x];
+            d[x] = (uint8_t)((v + 1) >> 1);
+        }
+    }
+}
+
+/* 8-bit 双源双向平均: dst[x] = (pred1[x] + pred2[x] + 1) >> 1
+ * pred1/pred2 为 int16_t[], 值域 [0,255], 按无符号求和平均后缩窄 */
+static void bi_avg_2src_8bit_neon(uint8_t *dst, int dst_stride,
+                                   const int16_t *pred1, int pred1_stride,
+                                   const int16_t *pred2, int pred2_stride,
+                                   int w, int h)
+{
+    const uint16x8_t one = vdupq_n_u16(1);
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint8_t *d = dst + y * dst_stride;
+        const int16_t *p1 = pred1 + y * pred1_stride;
+        const int16_t *p2 = pred2 + y * pred2_stride;
+        x = 0;
+        for (; x + 7 < w; x += 8) {
+            uint16x8_t v1 = vreinterpretq_u16_s16(vld1q_s16(p1 + x));
+            uint16x8_t v2 = vreinterpretq_u16_s16(vld1q_s16(p2 + x));
+            uint16x8_t sum = vaddq_u16(v1, v2);
+            sum = vaddq_u16(sum, one);
+            sum = vshrq_n_u16(sum, 1);
+            vst1_u8(d + x, vqmovn_u16(sum));
+        }
+        for (; x < w; x++) {
+            int v = p1[x] + p2[x];
+            d[x] = (uint8_t)((v + 1) >> 1);
+        }
+    }
+}
+
+/* 8-bit 块填充 */
+static void fill_block_8bit_neon(uint8_t *dst, int dst_stride,
+                                  int w, int h, int fill_val)
+{
+    const uint8x16_t vfill16 = vdupq_n_u8((uint8_t)fill_val);
+    const uint8x8_t vfill8 = vdup_n_u8((uint8_t)fill_val);
+    int y, x;
+    for (y = 0; y < h; y++) {
+        uint8_t *d = dst + y * dst_stride;
+        x = 0;
+        for (; x + 15 < w; x += 16) {
+            vst1q_u8(d + x, vfill16);
+        }
+        for (; x + 7 < w; x += 8) {
+            vst1_u8(d + x, vfill8);
+        }
+        for (; x < w; x++) {
+            d[x] = (uint8_t)fill_val;
+        }
+    }
+}
+
+/* ===========================================================================
+ * 入口函数 (NEON): 10-bit 和 8-bit 均使用原生 NEON
+ * =========================================================================== */
+static void mc_luma_neon(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                         ptrdiff_t dstride, int w, int h, int mx, int my,
+                         int bit_depth)
+{
+    if (bit_depth > 8) {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t*)(void *)dst;
+        const pel_t *src16 = (const pel_t*)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_copy_10bit_neon(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_luma_ver_10bit_neon(dst16, i_dst, src16, i_src,
+                                          w, h, avs2_intpl_filters[dy], max_val);
+        } else if (dy == 0) {
+            ip_filter_luma_hor_10bit_neon(dst16, i_dst, src16, i_src,
+                                          w, h, avs2_intpl_filters[dx], max_val);
+        } else {
+            ip_filter_luma_ext_10bit_neon(dst16, i_dst, src16, i_src,
+                                          w, h,
+                                          avs2_intpl_filters[dx],
+                                          avs2_intpl_filters[dy], max_val);
+        }
+    } else {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int i_dst = (int)dstride;
+        int i_src = (int)sstride;
+
+        if (dx == 0 && dy == 0) {
+            block_copy_8bit_neon(dst, i_dst, src, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_luma_ver_8bit_neon(dst, i_dst, src, i_src,
+                                         w, h, avs2_intpl_filters[dy]);
+        } else if (dy == 0) {
+            ip_filter_luma_hor_8bit_neon(dst, i_dst, src, i_src,
+                                         w, h, avs2_intpl_filters[dx]);
+        } else {
+            ip_filter_luma_ext_8bit_neon(dst, i_dst, src, i_src,
+                                         w, h,
+                                         avs2_intpl_filters[dx],
+                                         avs2_intpl_filters[dy]);
+        }
+    }
+}
+
+static void mc_chroma_neon(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                           ptrdiff_t dstride, int w, int h, int mx, int my,
+                           int bit_depth)
+{
+    if (bit_depth > 8) {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t*)(void *)dst;
+        const pel_t *src16 = (const pel_t*)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_copy_10bit_neon(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_chroma_ver_10bit_neon(dst16, i_dst, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dy], max_val);
+        } else if (dy == 0) {
+            ip_filter_chroma_hor_10bit_neon(dst16, i_dst, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dx], max_val);
+        } else {
+            ip_filter_chroma_ext_10bit_neon(dst16, i_dst, src16, i_src,
+                                            w, h,
+                                            avs2_intpl_filters_c[dx],
+                                            avs2_intpl_filters_c[dy], max_val);
+        }
+    } else {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int i_dst = (int)dstride;
+        int i_src = (int)sstride;
+
+        if (dx == 0 && dy == 0) {
+            block_copy_8bit_neon(dst, i_dst, src, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_chroma_ver_8bit_neon(dst, i_dst, src, i_src,
+                                           w, h, avs2_intpl_filters_c[dy]);
+        } else if (dy == 0) {
+            ip_filter_chroma_hor_8bit_neon(dst, i_dst, src, i_src,
+                                           w, h, avs2_intpl_filters_c[dx]);
+        } else {
+            ip_filter_chroma_ext_8bit_neon(dst, i_dst, src, i_src,
+                                           w, h,
+                                           avs2_intpl_filters_c[dx],
+                                           avs2_intpl_filters_c[dy]);
+        }
+    }
+}
+
+static void bi_avg_neon(uint8_t *dst, ptrdiff_t dst_stride, const int16_t *pred2,
+                        int pred2_stride, int w, int h, int bit_depth)
+{
+    if (bit_depth > 8) {
+        bi_avg_10bit_neon((uint16_t*)(void *)dst, (int)(dst_stride >> 1),
+                          pred2, pred2_stride, w, h);
+    } else {
+        bi_avg_8bit_neon(dst, (int)dst_stride, pred2, pred2_stride, w, h);
+    }
+}
+
+static void bi_avg_2src_neon(uint8_t *dst, ptrdiff_t dst_stride,
+                             const int16_t *pred1, int pred1_stride,
+                             const int16_t *pred2, int pred2_stride,
+                             int w, int h, int bit_depth)
+{
+    if (bit_depth > 8) {
+        bi_avg_2src_10bit_neon((uint16_t*)(void *)dst, (int)(dst_stride >> 1),
+                               pred1, pred1_stride, pred2, pred2_stride, w, h);
+    } else {
+        bi_avg_2src_8bit_neon(dst, (int)dst_stride,
+                              pred1, pred1_stride, pred2, pred2_stride, w, h);
+    }
+}
+
+static void fill_block_neon(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
+                            int fill_val, int bit_depth)
+{
+    if (bit_depth > 8) {
+        fill_block_10bit_neon((uint16_t*)(void *)dst, (int)(dst_stride >> 1),
+                              w, h, fill_val);
+    } else {
+        fill_block_8bit_neon(dst, (int)dst_stride, w, h, fill_val);
+    }
+}
+
+/* MC + 双向平均: 亮度 (NEON) */
+static void mc_luma_avg_neon(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                             ptrdiff_t dstride, int w, int h, int mx, int my,
+                             int bit_depth)
+{
+    if (bit_depth > 8) {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t *)(void *)dst;
+        const pel_t *src16 = (const pel_t *)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_avg_10bit_neon(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN16(short pred2[64 * 64]);
+            ip_filter_luma_ver_10bit_neon((pel_t *)pred2, w, src16, i_src,
+                                          w, h, avs2_intpl_filters[dy], max_val);
+            block_avg_10bit_neon(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN16(short pred2[64 * 64]);
+            ip_filter_luma_hor_10bit_neon((pel_t *)pred2, w, src16, i_src,
+                                          w, h, avs2_intpl_filters[dx], max_val);
+            block_avg_10bit_neon(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else {
+            ip_filter_luma_ext_10bit_avg_neon(dst16, i_dst, src16, i_src,
+                                              w, h,
+                                              avs2_intpl_filters[dx],
+                                              avs2_intpl_filters[dy], max_val);
+        }
+    } else {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int i_dst = (int)dstride;
+        int i_src = (int)sstride;
+
+        if (dx == 0 && dy == 0) {
+            block_avg_8bit_neon(dst, i_dst, src, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN16(uint8_t pred2[64 * 64]);
+            ip_filter_luma_ver_8bit_neon(pred2, w, src, i_src,
+                                         w, h, avs2_intpl_filters[dy]);
+            block_avg_8bit_neon(dst, i_dst, pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN16(uint8_t pred2[64 * 64]);
+            ip_filter_luma_hor_8bit_neon(pred2, w, src, i_src,
+                                         w, h, avs2_intpl_filters[dx]);
+            block_avg_8bit_neon(dst, i_dst, pred2, w, w, h);
+        } else {
+            ip_filter_luma_ext_8bit_avg_neon(dst, i_dst, src, i_src,
+                                             w, h,
+                                             avs2_intpl_filters[dx],
+                                             avs2_intpl_filters[dy]);
+        }
+    }
+}
+
+/* MC + 双向平均: 色度 (NEON) */
+static void mc_chroma_avg_neon(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                               ptrdiff_t dstride, int w, int h, int mx, int my,
+                               int bit_depth)
+{
+    if (bit_depth > 8) {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t *)(void *)dst;
+        const pel_t *src16 = (const pel_t *)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_avg_10bit_neon(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN16(short pred2[32 * 32]);
+            ip_filter_chroma_ver_10bit_neon((pel_t *)pred2, w, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dy], max_val);
+            block_avg_10bit_neon(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN16(short pred2[32 * 32]);
+            ip_filter_chroma_hor_10bit_neon((pel_t *)pred2, w, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dx], max_val);
+            block_avg_10bit_neon(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else {
+            ip_filter_chroma_ext_10bit_avg_neon(dst16, i_dst, src16, i_src,
+                                                w, h,
+                                                avs2_intpl_filters_c[dx],
+                                                avs2_intpl_filters_c[dy], max_val);
+        }
+    } else {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int i_dst = (int)dstride;
+        int i_src = (int)sstride;
+
+        if (dx == 0 && dy == 0) {
+            block_avg_8bit_neon(dst, i_dst, src, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN16(uint8_t pred2[32 * 32]);
+            ip_filter_chroma_ver_8bit_neon(pred2, w, src, i_src,
+                                           w, h, avs2_intpl_filters_c[dy]);
+            block_avg_8bit_neon(dst, i_dst, pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN16(uint8_t pred2[32 * 32]);
+            ip_filter_chroma_hor_8bit_neon(pred2, w, src, i_src,
+                                           w, h, avs2_intpl_filters_c[dx]);
+            block_avg_8bit_neon(dst, i_dst, pred2, w, w, h);
+        } else {
+            ip_filter_chroma_ext_8bit_avg_neon(dst, i_dst, src, i_src,
+                                               w, h,
+                                               avs2_intpl_filters_c[dx],
+                                               avs2_intpl_filters_c[dy]);
+        }
+    }
+}
+
+/* ===========================================================================
+ * DSP 初始化 (NEON)
+ * =========================================================================== */
+void avs2_mc_init_neon(const avs2_cpu_flags *flags)
+{
+    (void)flags;
+    avs2_dsp_table.mc_luma       = mc_luma_neon;
+    avs2_dsp_table.mc_chroma     = mc_chroma_neon;
+    avs2_dsp_table.mc_luma_avg   = mc_luma_avg_neon;
+    avs2_dsp_table.mc_chroma_avg = mc_chroma_avg_neon;
+    avs2_dsp_table.bi_avg        = bi_avg_neon;
+    avs2_dsp_table.bi_avg_2src   = bi_avg_2src_neon;
+    avs2_dsp_table.fill_block    = fill_block_neon;
+}
+
+/* 非 NEON 平台: SSE/AVX 接口空实现以供链接 */
 void avs2_mc_init_sse41(const avs2_cpu_flags *flags) { (void)flags; }
 void avs2_mc_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 void avs2_mc_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
+
+#else /* 其它平台: 回退到 C */
+
+/* NEON 路径回退到 C, 保留空实现以供链接 */
+void avs2_mc_init_sse41(const avs2_cpu_flags *flags) { (void)flags; }
+void avs2_mc_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
+void avs2_mc_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
+void avs2_mc_init_neon(const avs2_cpu_flags *flags) { (void)flags; }
 
 #endif

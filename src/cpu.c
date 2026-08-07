@@ -7,6 +7,13 @@
 #include <unistd.h>
 #endif
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define AVS2_X86
 #endif
@@ -43,6 +50,7 @@ static void avs2_cpu_detect_x86(avs2_cpu_flags *flags)
     flags->avx2 = 0;
     flags->avx512 = 0;
     flags->neon = 0;
+    flags->dotprod = 0;
 
     avs2_cpuid(info, 0);
     max_leaf = info[0];
@@ -87,11 +95,20 @@ void avs2_cpu_detect(avs2_cpu_flags *flags)
     flags->avx2 = 0;
     flags->avx512 = 0;
     flags->neon = 0;
+    flags->dotprod = 0;
 
 #if defined(AVS2_X86)
     avs2_cpu_detect_x86(flags);
 #elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
     flags->neon = 1;
+  #if defined(__ARM_FEATURE_DOTPROD)
+    /* 编译时已启用 dotprod 指令, 运行时确认 CPU 支持 */
+    #if defined(__aarch64__) && defined(__linux__)
+    flags->dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) ? 1 : 0;
+    #else
+    flags->dotprod = 1;
+    #endif
+  #endif
 #endif
 }
 

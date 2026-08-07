@@ -18,6 +18,8 @@ typedef CONDITION_VARIABLE avs2_cond_t;
 typedef HANDLE avs2_sem_t;
 #else
 #include <pthread.h>
+#include <time.h>
+#include <errno.h>
 typedef pthread_t avs2_thread_t;
 typedef pthread_mutex_t avs2_mutex_t;
 typedef pthread_cond_t avs2_cond_t;
@@ -84,6 +86,22 @@ static inline void avs2_cond_wait(avs2_cond_t *c, avs2_mutex_t *m) {
 #endif
 }
 
+/* 带超时的条件变量等待 (毫秒). 返回 0=被唤醒, 1=超时.
+ * 用于调度循环的可靠唤醒: 若依赖信号在进入等待前发出 (信号丢失),
+ * 超时后重新扫描任务, 避免永久睡眠死锁. */
+static inline int avs2_cond_timedwait(avs2_cond_t *c, avs2_mutex_t *m, int timeout_ms) {
+#if defined(_WIN32)
+    return SleepConditionVariableCS(c, m, (DWORD)timeout_ms) ? 0 : 1;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (long)timeout_ms * 1000000L;
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    return pthread_cond_timedwait(c, m, &ts) == ETIMEDOUT ? 1 : 0;
+#endif
+}
+
 /* 条件变量广播 (唤醒所有等待者). Win32 使用 WakeAllConditionVariable
  * 实现真正的广播语义 (不再需要 n_waiters 计数). */
 static inline void avs2_cond_broadcast(avs2_cond_t *c, avs2_mutex_t *m, int n_waiters) {
@@ -116,8 +134,12 @@ static inline void avs2_cond_broadcast(avs2_cond_t *c, avs2_mutex_t *m, int n_wa
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define avs2_cpu_relax() _mm_pause()
-#elif defined(__GNUC__) || defined(__clang__)
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define avs2_cpu_relax() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define avs2_cpu_relax() __asm__ volatile("yield")
+#elif defined(__ARM_ARCH)
+#define avs2_cpu_relax() __asm__ volatile("nop")
 #else
 #define avs2_cpu_relax() ((void)0)
 #endif

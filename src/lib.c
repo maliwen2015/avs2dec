@@ -675,13 +675,19 @@ static void *worker_thread(void *arg)
                 }
                 if (fc) break;
 
-                /* 2. Phase 1 任务: 扫描 fc 数组, 只取 n_aec_deps==0 的任务. */
-                for (int i = 0; i < c->n_fc; i++) {
-                    if (c->fc[i].task_state == 1 && c->fc[i].n_aec_deps == 0) {
-                        fc = &c->fc[i];
-                        fc->task_state = 2;  /* decoding */
-                        phase = 1;
-                        break;
+                /* 2. Phase 1 任务: P1 串行 (p1_busy 锁), 只取 n_aec_deps==0 的任务.
+                 * AEC 按解码顺序串行执行 (derive_skip_mv 依赖 col_pic mvbuf),
+                 * 保证 col_pic 的 AEC 在依赖帧 AEC 前完成, derive_skip_mv 的
+                 * aec_row_done spin 永远立即通过. */
+                if (!c->p1_busy) {
+                    for (int i = 0; i < c->n_fc; i++) {
+                        if (c->fc[i].task_state == 1 && c->fc[i].n_aec_deps == 0) {
+                            fc = &c->fc[i];
+                            fc->task_state = 2;  /* decoding */
+                            c->p1_busy = 1;
+                            phase = 1;
+                            break;
+                        }
                     }
                 }
                 if (fc) break;
@@ -709,10 +715,11 @@ static void *worker_thread(void *arg)
             }
             if (row_fc) break;
 
-            /* 4. 无任务, 等待 */
+            /* 4. 无任务, 等待. 带超时: 若依赖信号在进入等待前发出 (丢失),
+             * 超时后重新扫描, 避免永久睡眠死锁. */
             {
                 c->n_waiters_task++;
-                avs2_cond_wait(&c->task_cond, &c->task_lock);
+                avs2_cond_timedwait(&c->task_cond, &c->task_lock, 50);
                 c->n_waiters_task--;
             }
         }
@@ -738,12 +745,14 @@ static void *worker_thread(void *arg)
 
             if (c->shutdown) break;
 
-            /* Phase 1 完成: 设 state=5, 释放 worker. 不推入 phase2_queue
-             * (已改用 fc 数组扫描 + p2_started 检查). 唤醒空闲 worker 让其
-             * 扫描 state==5 帧并检查参考帧 p2_started/done 后启动 Phase 2. */
+            /* Phase 1 完成: 设 state=5, 释放 P1 串行锁, 唤醒空闲 worker.
+             * 不推入 phase2_queue (已改用 fc 数组扫描 + p2_started 检查).
+             * 唤醒空闲 worker 让其扫描 state==5 帧并检查参考帧
+             * p2_started/done 后启动 Phase 2. */
             avs2_mutex_lock(&c->task_lock);
             fc->task_state = 5;  /* phase1_done, waiting for Phase 2 */
-            avs2_cond_signal(&c->task_cond);
+            c->p1_busy = 0;      /* 释放 P1 串行锁 */
+            avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
             avs2_mutex_unlock(&c->task_lock);
         } else if (phase == 2) {
             /* ---- 2-pass Phase 2 (重建+LF) ----
@@ -803,10 +812,11 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
             }
         }
         if (!fc) {
-            /* 无空闲 fc, 等待 worker 完成 */
+            /* 无空闲 fc, 等待 worker 完成. 带超时: 若 broadcast 在进入等待前
+             * 发出 (信号丢失), 超时后重新扫描. */
             PDBG("PICK: no idle fc, cond_wait(done_cond) pending=%d\n", c->n_pending);
             c->n_waiters_done++;
-            avs2_cond_wait(&c->done_cond, &c->task_lock);
+            avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
             c->n_waiters_done--;
         }
     }
@@ -865,20 +875,11 @@ int avs2_submit_frame_task(struct avs2_internal *c, avs2_frame_ctx *fc)
                      * state==6: AEC 进行中 (行级流水线), 重建未完成. */
                     fc->n_deps++;
                     /* n_aec_deps 仅统计 col_pic 且 AEC 未完成的参考帧.
-                     * 通用模式 (多 worker): 等待 aec_started 即可, B 帧 AEC
-                     *   可与 col_pic AEC 在不同 worker 并行 (derive_skip_mv
-                     *   按行 spin-wait col_pic->aec_row_done, col_pic AEC
-                     *   在另一线程持续推进).
-                     * 行级流水线模式 (单 AEC 线程): 必须等待 aec_done, 否则
-                     *   AEC 线程在 B 帧 Phase 1 的 derive_skip_mv 中 spin-wait
-                     *   col_pic->aec_row_done, 但 col_pic AEC 尚未开始
-                     *   (AEC 线程串行处理), 导致死锁. */
+                     * 统一等待 col_pic 的 aec_done (AEC 完全完成) 后才启动
+                     * 依赖帧的 AEC: P1 串行, derive_skip_mv 的 aec_row_done
+                     * 行级 spin 变为防御性检查, 消除多 worker 链式 spin 活锁. */
                     if (ref == col_pic) {
-                        if (c->n_aec_threads > 0) {
-                            if (!fc2->aec_done) fc->n_aec_deps++;
-                        } else {
-                            if (!fc2->aec_started) fc->n_aec_deps++;
-                        }
+                        if (!fc2->aec_done) fc->n_aec_deps++;
                     }
                     break;
                 }
@@ -1317,7 +1318,7 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
                 avs2_mutex_lock(&c->task_lock);
                 if (c->n_pending > 0) {
                     c->n_waiters_done++;
-                    avs2_cond_wait(&c->done_cond, &c->task_lock);
+                    avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
                     c->n_waiters_done--;
                 }
                 avs2_mutex_unlock(&c->task_lock);
@@ -1357,7 +1358,7 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
         if (c->flushing) {
             while (c->n_pending > 0) {
                 c->n_waiters_done++;
-                avs2_cond_wait(&c->done_cond, &c->task_lock);
+                avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
                 c->n_waiters_done--;
             }
         }

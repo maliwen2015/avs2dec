@@ -504,8 +504,9 @@ void mc_chroma_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
  * 第七部分: DSP 初始化
  * =================================================================== */
 
-/* 双向预测平均 C 回退: dst[i] = (dst[i] + pred2[i] + 1) >> 1 */
-static void bi_avg_c(uint8_t *dst, ptrdiff_t dst_stride, const int16_t *pred2,
+/* 双向预测平均 C 回退: dst[i] = (dst[i] + pred2[i] + 1) >> 1
+ * 非 static: 供 mc_simd.c NEON 路径的 8-bit 回退调用 */
+void bi_avg_c(uint8_t *dst, ptrdiff_t dst_stride, const int16_t *pred2,
                      int pred2_stride, int w, int h, int bit_depth)
 {
     int x, y;
@@ -528,8 +529,9 @@ static void bi_avg_c(uint8_t *dst, ptrdiff_t dst_stride, const int16_t *pred2,
     }
 }
 
-/* 双向预测平均 (双源) C 回退: dst[i] = (pred1[i] + pred2[i] + 1) >> 1 */
-static void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
+/* 双源双向预测平均 C 回退: dst[i] = (pred1[i] + pred2[i] + 1) >> 1
+ * 非 static: 供 mc_simd.c NEON 路径的 8-bit 回退调用 */
+void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
                           const int16_t *pred1, int pred1_stride,
                           const int16_t *pred2, int pred2_stride,
                           int w, int h, int bit_depth)
@@ -554,8 +556,9 @@ static void bi_avg_2src_c(uint8_t *dst, ptrdiff_t dst_stride,
     }
 }
 
-/* 块填充 C 回退: dst[i] = fill_val */
-static void fill_block_c(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
+/* 块填充 C 回退: dst[i] = fill_val
+ * 非 static: 供 mc_simd.c NEON 路径的 8-bit 回退调用 */
+void fill_block_c(uint8_t *dst, ptrdiff_t dst_stride, int w, int h,
                          int fill_val, int bit_depth)
 {
     int x, y;
