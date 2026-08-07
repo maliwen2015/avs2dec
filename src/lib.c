@@ -637,8 +637,15 @@ static void *worker_thread(void *arg)
                  *    大幅减少依赖帧 Phase 2 的 lf_wait spin 时间.
                  *    P2 并发上限 (p2_cap): 防止 P2 优先调度导致 P1 饥饿.
                  *    当 P2 活跃 worker 数达到上限时, 跳过 P2 调度, 让 worker
-                 *    执行 P1, 持续产生 state==5 帧保持 P2 不间断. */
-                if (c->n_p2_active < c->p2_cap) {
+                 * 执行 P1, 持续产生 state==5 帧保持 P2 不间断.
+                 * 2 线程 (n_workers==1): 跳过此块, 走下方 P1 优先 + worker 兜底 P2
+                 * (P2 由主线程在 pick_idle_fc 中帮忙, 实现 P1/P2 重叠). */
+                if (c->n_threads != 2 && c->n_p2_active < c->p2_cap) {
+                    /* 公平选择: 选 coi 最小 (最早提交) 且参考帧就绪的 state==5 帧.
+                     * 原实现按 fc 索引顺序扫描, 与 P1 相同会导致低索引 fc 帧
+                     * 优先推进, 高索引 fc 帧饥饿. */
+                    int best_i = -1;
+                    int best_coi = 0x7fffffff;
                     for (int i = 0; i < c->n_fc; i++) {
                         avs2_frame_ctx *cand = &c->fc[i];
                         if (cand->task_state != 5) continue;
@@ -662,32 +669,95 @@ static void *worker_thread(void *arg)
                                 }
                             }
                         }
-                        if (refs_ready) {
-                            fc = cand;
-                            fc->task_state = 2;  /* decoding */
-                            if (c->thread_mode == AVS2_THREAD_ROW)
-                                fc->recon_active = 1;
-                            phase = 2;
-                            c->n_p2_active++;
-                            break;
+                        if (!refs_ready) continue;
+                        int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
+                        if (coi < best_coi) {
+                            best_coi = coi;
+                            best_i = i;
                         }
+                    }
+                    if (best_i >= 0) {
+                        fc = &c->fc[best_i];
+                        fc->task_state = 2;  /* decoding */
+                        if (c->thread_mode == AVS2_THREAD_ROW)
+                            fc->recon_active = 1;
+                        phase = 2;
+                        c->n_p2_active++;
                     }
                 }
                 if (fc) break;
 
-                /* 2. Phase 1 任务: P1 串行 (p1_busy 锁), 只取 n_aec_deps==0 的任务.
-                 * AEC 按解码顺序串行执行 (derive_skip_mv 依赖 col_pic mvbuf),
-                 * 保证 col_pic 的 AEC 在依赖帧 AEC 前完成, derive_skip_mv 的
-                 * aec_row_done spin 永远立即通过. */
-                if (!c->p1_busy) {
+                /* 2. Phase 1 任务: 并行 AEC (n_aec_active < aec_cap), 只取 n_aec_deps==0
+                 * 且 coi 最小的 queued 帧. 按 coi 顺序取帧保证 col_pic (更早 coi)
+                 * 的 AEC 先被取走执行, derive_skip_mv 的 aec_row_done 等待最终
+                 * 通过, 不会形成多 worker 链式 spin 活锁.
+                 * aec_cap 限制同时并行 AEC 的 worker 数, 防止 P2 饥饿. */
+                if (c->n_aec_active < c->aec_cap) {
+                    /* 公平选择: 选 coi 最小 (最早提交) 的 queued 帧.
+                     * 原实现按 fc 索引顺序扫描, 主线程 PICK 也偏爱低索引 fc,
+                     * 两者叠加使高索引 fc 上的帧饥饿 (永不执行, get_picture
+                     * 卡死在该帧的 POC). 按 coi 选择保证先提交先处理. */
+                    int best_i = -1;
+                    int best_coi = 0x7fffffff;
                     for (int i = 0; i < c->n_fc; i++) {
-                        if (c->fc[i].task_state == 1 && c->fc[i].n_aec_deps == 0) {
-                            fc = &c->fc[i];
-                            fc->task_state = 2;  /* decoding */
-                            c->p1_busy = 1;
-                            phase = 1;
-                            break;
+                        avs2_frame_ctx *cand = &c->fc[i];
+                        if (cand->task_state == 1 && cand->n_aec_deps == 0) {
+                            int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
+                            if (coi < best_coi) {
+                                best_coi = coi;
+                                best_i = i;
+                            }
                         }
+                    }
+                    if (best_i >= 0) {
+                        PDBG("WORKER: take P1 fc[%d] (coi=%d)\n", best_i, best_coi);
+                        fc = &c->fc[best_i];
+                        fc->task_state = 2;  /* decoding */
+                        c->n_aec_active++;
+                        phase = 1;
+                    }
+                }
+                if (fc) break;
+
+                /* 3. 2 线程时 worker 的 P2 任务 (仅当 P1 无活时).
+                 * 2 线程 (n_workers==1): P1 优先, P2 由主线程在 pick_idle_fc
+                 * 等待时帮忙, 实现 P1/P2 重叠. worker 仅在无 P1 可做时接管 P2,
+                 * 避免 P2 名额被 worker 独占导致主线程无法参与. */
+                if (c->n_threads == 2 && c->n_p2_active < c->p2_cap) {
+                    int best_i = -1;
+                    int best_coi = 0x7fffffff;
+                    for (int i = 0; i < c->n_fc; i++) {
+                        avs2_frame_ctx *cand = &c->fc[i];
+                        if (cand->task_state != 5) continue;
+                        int refs_ready = 1;
+                        for (int j = 0; j < cand->n_refs; j++) {
+                            avs2_frame *ref = cand->fref[j];
+                            if (ref && !ref->done) {
+                                if (!avs2_atomic_load(&ref->p2_started) &&
+                                    avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                                    refs_ready = 0;
+                                    break;
+                                }
+                                if (avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                                    refs_ready = 0;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!refs_ready) continue;
+                        int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
+                        if (coi < best_coi) {
+                            best_coi = coi;
+                            best_i = i;
+                        }
+                    }
+                    if (best_i >= 0) {
+                        fc = &c->fc[best_i];
+                        fc->task_state = 2;  /* decoding */
+                        if (c->thread_mode == AVS2_THREAD_ROW)
+                            fc->recon_active = 1;
+                        phase = 2;
+                        c->n_p2_active++;
                     }
                 }
                 if (fc) break;
@@ -751,7 +821,7 @@ static void *worker_thread(void *arg)
              * p2_started/done 后启动 Phase 2. */
             avs2_mutex_lock(&c->task_lock);
             fc->task_state = 5;  /* phase1_done, waiting for Phase 2 */
-            c->p1_busy = 0;      /* 释放 P1 串行锁 */
+            c->n_aec_active--;   /* 释放 AEC 并行名额 */
             avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
             avs2_mutex_unlock(&c->task_lock);
         } else if (phase == 2) {
@@ -811,14 +881,61 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
                 break;
             }
         }
-        if (!fc) {
-            /* 无空闲 fc, 等待 worker 完成. 带超时: 若 broadcast 在进入等待前
-             * 发出 (信号丢失), 超时后重新扫描. */
-            PDBG("PICK: no idle fc, cond_wait(done_cond) pending=%d\n", c->n_pending);
-            c->n_waiters_done++;
-            avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
-            c->n_waiters_done--;
+        if (fc) break;
+
+        /* 2 线程优化: 主线程空闲等待时认领一个 P2 (重建) 任务帮 worker.
+         * worker 同时做 P1 (AEC), 实现 P1/P2 重叠 (单 worker 无法自重叠,
+         * 这是 2 线程提升的关键). 仅多线程 (worker 存在) 时参与. */
+        if (c->n_threads_active > 0 && c->n_p2_active < c->p2_cap) {
+            avs2_frame_ctx *p2 = NULL;
+            int best_coi = 0x7fffffff;
+            for (int i = 0; i < c->n_fc; i++) {
+                avs2_frame_ctx *cand = &c->fc[i];
+                if (cand->task_state != 5) continue;
+                int refs_ready = 1;
+                for (int j = 0; j < cand->n_refs; j++) {
+                    avs2_frame *ref = cand->fref[j];
+                    if (ref && !ref->done) {
+                        if (!avs2_atomic_load(&ref->p2_started) &&
+                            avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                            refs_ready = 0;
+                            break;
+                        }
+                        if (avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                            refs_ready = 0;
+                            break;
+                        }
+                    }
+                }
+                if (!refs_ready) continue;
+                int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
+                if (coi < best_coi) {
+                    best_coi = coi;
+                    p2 = cand;
+                }
+            }
+            if (p2) {
+                p2->task_state = 2;  /* decoding */
+                c->n_p2_active++;
+                avs2_mutex_unlock(&c->task_lock);
+                /* 主线程执行 Phase 2 (逐行重建+LF).
+                 * 参考帧 LF 领先 2 行 (refs_ready 保证), 跨帧 LF 等待不会死锁:
+                 * worker 会按 coi 顺序推进参考帧 P2. */
+                avs2_decode_frame_fc_phase2(c, p2);
+                avs2_mutex_lock(&c->task_lock);
+                c->n_p2_active--;
+                complete_frame(c, p2);
+                avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
+                continue;  /* 重新扫描空闲 fc */
+            }
         }
+
+        /* 无空闲 fc, 等待 worker 完成. 带超时: 若 broadcast 在进入等待前
+         * 发出 (信号丢失), 超时后重新扫描. */
+        PDBG("PICK: no idle fc, cond_wait(done_cond) pending=%d\n", c->n_pending);
+        c->n_waiters_done++;
+        avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
+        c->n_waiters_done--;
     }
     /* 标记为 reserved, 防止其他调用选中同一个 fc */
     fc->task_state = 4;
@@ -974,6 +1091,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     c->n_waiters_done = 0;
     c->n_waiters_recon = 0;
     c->n_p2_active = 0;
+    c->n_aec_active = 0;
     c->n_threads_active = 0;
     c->threads = NULL;
     c->aec_threads = NULL;
@@ -1003,11 +1121,18 @@ avs2_ctx *avs2_open(const avs2_settings *s)
      * FRAME 模式: P2 无行级并行, p2_cap = n_workers/2 平衡 P1/P2 供给. */
     if (c->n_threads > 1) {
         c->p2_cap = (c->thread_mode == AVS2_THREAD_ROW) ?
-                    (c->n_threads - 1) : (c->n_threads - 1) / 2;
+                    (c->n_threads - 1) : (c->n_threads - 1) * 2 / 3;
     } else {
         c->p2_cap = 1;
     }
     if (c->p2_cap < 1) c->p2_cap = 1;
+
+    /* AEC 并行上限: 允许多 worker 并行 Phase 1 (熵解码).
+     * P2 优先调度保证 worker 在 P2 有活时先做 P2, AEC 只在空闲时执行;
+     * aec_cap 防止极端情况下全部 worker 涌入 AEC 导致 P2 停顿.
+     * 初始设为本机可并行度上限的一半 (AEC 约占 30% 工作量). */
+    c->aec_cap = (c->n_threads - 1 + 1) / 2;  /* ~一半 worker */
+    if (c->aec_cap < 1) c->aec_cap = 1;
 
     /* 创建 worker 线程 (n_threads > 1 时).
      * n_threads=1: n_threads_active=0, 走同步路径.

@@ -91,7 +91,10 @@ endif()
 
 # SIMD 源文件仅使用 SSE4.1/SSSE3 intrinsics (AVX2 代码已全部清除)
 # simd_init.c 不含 intrinsics, 不需要特殊标志
+# cpu.c 需要 -march=armv8.2-a+dotprod: 其 dotprod 运行时检测被
+# __ARM_FEATURE_DOTPROD 宏包裹, 无该标志时检测代码被排除, SDOT 永远不启用
 set(AVS2DEC_SIMD_SOURCES
+    src/cpu.c
     src/itx_simd.c
     src/mc_simd.c
     src/ipred_simd.c
@@ -112,7 +115,11 @@ else()
             COMPILE_OPTIONS "-msse4.1;-mssse3"
         )
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
-        # aarch64: NEON 为默认, 不需要额外编译标志
+        # aarch64: NEON 为默认. 启用 ARMv8.2 dotprod (SDOT) 以加速 16x16/32x32 IDCT.
+        # 运行时通过 HWCAP_ASIMDDP 检测, 不支持 dotprod 的 CPU 自动回退蝶形 NEON.
+        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod"
+        )
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|ARM)")
         set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
             COMPILE_OPTIONS "-mfpu=neon"

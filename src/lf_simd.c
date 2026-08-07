@@ -1836,7 +1836,7 @@ static void deblock_chroma_ver_neon(void *src_u_v, void *src_v_v,
                                     int stride, int alpha, int beta,
                                     uint8_t *flt_flag, int bit_depth)
 {
-    if (bit_depth <= 8 || 1) {  /* DEBUG: force C fallback to isolate luma */
+    if (bit_depth <= 8) {
         deblock_chroma_ver(src_u_v, src_v_v, stride, alpha, beta, flt_flag, bit_depth);
         return;
     }
@@ -1947,7 +1947,7 @@ static void deblock_chroma_hor_neon(void *src_u_v, void *src_v_v,
                                     int stride, int alpha, int beta,
                                     uint8_t *flt_flag, int bit_depth)
 {
-    if (bit_depth <= 8 || 1) {  /* DEBUG: force C fallback to isolate luma */
+    if (bit_depth <= 8) {
         deblock_chroma_hor(src_u_v, src_v_v, stride, alpha, beta, flt_flag, bit_depth);
         return;
     }

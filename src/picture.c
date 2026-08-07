@@ -1,6 +1,7 @@
 #include "internal.h"
 #include "aec_internal.h"
 #include <string.h>
+#include <stdio.h>
 
 /* 帧边界扩展 padding (对应 davs2 AVS2_PAD) */
 #define PAD_LUMA   AVS2_PAD_LUMA    /* 64 */

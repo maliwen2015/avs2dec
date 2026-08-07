@@ -366,9 +366,12 @@ struct avs2_internal {
     int n_waiters_recon;     /* 等待 recon_cond 的重建线程数 (Win32 广播用) */
     int n_p2_active;         /* 当前正在执行 Phase 2 的 worker 数 (task_lock 保护) */
     int p2_cap;              /* Phase 2 并发上限 (防止 P1 饥饿) */
-    int p1_busy;             /* Phase 1 (AEC) 串行锁: 1 = 有 worker 正在执行 P1.
-                              * AEC 必须按解码顺序串行 (derive_skip_mv 依赖 col_pic
-                              * 的 mvbuf), 若多 worker 并行 P1 会形成链式 spin 活锁. */
+    int n_aec_active;        /* 当前并行执行 Phase 1 (AEC) 的 worker 数 (task_lock 保护) */
+    int aec_cap;             /* Phase 1 (AEC) 并行上限: 允许多 worker 并行 AEC.
+                              * 取帧按 coi 顺序 (col_pic 总是更早 coi 且先被取走),
+                              * 因此并行 AEC 不会形成 derive_skip_mv 链式活锁.
+                              * 上限防止全部 worker 涌入 AEC 导致 P2 饥饿. */
+    int p1_busy;             /* 兼容字段 (不再使用, 保留避免破坏外部引用) */
 
     /* 行级并行: 当前正在行级并行解码的 fc (NULL = 无行级任务).
      * worker 在帧任务队列为空时检查此指针, 参与行级重建.

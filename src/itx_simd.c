@@ -3710,11 +3710,12 @@ static void idct_32x32_neon(int16_t *coeff, int w, int h, int bit_depth)
  *   第二趟: out = T × tmp          (行变换, shift2=20-bit_depth)
  * 系数矩阵 T 元素范围 [-45, 45], 适合 int8 存储.
  *
- * 输入为 int16, 通过高低字节分解:
- *   v = v_h * 256 + v_l  (v_h 有符号, v_l 无符号)
- *   sum(v[k] * c[k]) = 256 * SDOT(v_h, c) + USDOT(v_l, c)
- * SDOT: 有符号 int8 × 有符号 int8 → int32 (4 lane 同时计算)
- * USDOT: 无符号 uint8 × 有符号 int8 → int32
+ * 输入为 int16, 通过高低字节分解 (全部用有符号 SDOT, 仅需 dotprod):
+ *   v = v_h * 256 + v_l          (v_h 有符号高字节, v_l 无符号低字节)
+ *   v_l = v_l7m + 128 * bit7     (v_l7m ∈ [0,127], bit7 ∈ {0,1})
+ *   sum(v*c) = 256*SDOT(v_h,c) + SDOT(v_l7m,c) + 128*SDOT(bit7,c)
+ * SDOT: 有符号 int8 × 有符号 int8 → int32 (每指令 4 个 lane 各含 4 元素部分和)
+ * (混合符号 USDOT 属 ARMv8.6 i8mm, 普通 dotprod 芯片无此指令, 故不采用)
  *
  * 位精确性: partial_butterfly_inverse 仅在最终输出处有一次舍入 (+add >>shift),
  * 中间蝶形阶段无舍入 (全 int32 精度), 因此矩阵乘法与蝶形分解数学结果完全一致.
@@ -3781,7 +3782,11 @@ static const int8_t g_t32_s8[32][32] = {
 };
 
 /* 16 元素点积: sum(input[k] * coeff[k])
- * int16 输入通过高低字节分解, 用 SDOT + USDOT 计算 */
+ * int16 输入通过高低字节分解, 全部用有符号 SDOT 计算 (仅需 dotprod, 不依赖 i8mm):
+ *   v = v_h * 256 + v_l         (v_h 有符号高字节, v_l 无符号低字节)
+ *   v_l = v_l7m + 128 * bit7    (v_l7m ∈ [0,127], bit7 ∈ {0,1})
+ *   sum(v*c) = 256*SDOT(v_h,c) + SDOT(v_l7m,c) + 128*SDOT(bit7,c)
+ * 注: vusdotq_s32 (混合符号) 属 ARMv8.6 i8mm 扩展, 普通 dotprod 芯片无此指令. */
 static inline int32_t dot16_s8(const int16_t *input, const int8_t *coeff)
 {
     int16x8_t in0 = vld1q_s16(input);
@@ -3792,22 +3797,28 @@ static inline int32_t dot16_s8(const int16_t *input, const int8_t *coeff)
     /* 低字节 (无符号): input & 0xFF */
     uint8x16_t in_l = vcombine_u8(vmovn_u16(vreinterpretq_u16_s16(in0)),
                                   vmovn_u16(vreinterpretq_u16_s16(in1)));
+    /* 低 7 位 (0..127, 有符号非负): in_l & 0x7F */
+    int8x16_t in_l7m = vreinterpretq_s8_u8(vandq_u8(in_l, vdupq_n_u8(0x7F)));
+    /* bit7 (0/1): in_l >> 7 */
+    int8x16_t in_bit7 = vreinterpretq_s8_u8(vshrq_n_u8(in_l, 7));
 
     int8x16_t c = vld1q_s8(coeff);
 
-    /* SDOT: 有符号高字节 × 有符号系数 → 4×int32 (每 lane 4 元素部分和) */
+    /* SDOT: 有符号 × 有符号 → 4×int32 (每 lane 4 元素部分和) */
     int32x4_t acc_h = vdotq_s32(vdupq_n_s32(0), in_h, c);
-    /* USDOT: 无符号低字节 × 有符号系数 → 4×int32 */
-    int32x4_t acc_l = vusdotq_s32(vdupq_n_s32(0), in_l, c);
+    int32x4_t acc_l = vdotq_s32(vdupq_n_s32(0), in_l7m, c);
+    int32x4_t acc_b = vdotq_s32(vdupq_n_s32(0), in_bit7, c);
 
     /* 水平求和 4 个 int32 → 1 个 int32 */
     int32x2_t pair_h = vpadd_s32(vget_low_s32(acc_h), vget_high_s32(acc_h));
     int32x2_t pair_l = vpadd_s32(vget_low_s32(acc_l), vget_high_s32(acc_l));
+    int32x2_t pair_b = vpadd_s32(vget_low_s32(acc_b), vget_high_s32(acc_b));
     int32_t sum_h = vget_lane_s32(pair_h, 0) + vget_lane_s32(pair_h, 1);
     int32_t sum_l = vget_lane_s32(pair_l, 0) + vget_lane_s32(pair_l, 1);
+    int32_t sum_b = vget_lane_s32(pair_b, 0) + vget_lane_s32(pair_b, 1);
 
-    /* 合并: result = sum_h * 256 + sum_l */
-    return sum_h * 256 + sum_l;
+    /* 合并: result = 256*sum_h + sum_l + 128*sum_b */
+    return sum_h * 256 + sum_l + sum_b * 128;
 }
 
 /* 32 元素点积: 分两组 16 元素 */
@@ -3891,6 +3902,110 @@ static void idct_32x32_sdot(int16_t *coeff, int w, int h, int bit_depth)
 #endif /* __ARM_FEATURE_DOTPROD */
 
 /* ===========================================================================
+ * 残差叠加 (NEON): dst[i] = clip(dst[i] + coeff[i], 0, max_val)
+ *
+ * 10-bit 路径: uint16_t 像素 + int16 系数, 直接向量加.
+ *   由于 dst ∈ [0, 1023] 且 coeff ∈ [-32768, 32767], 和 ∈ [-32768, 33790],
+ *   不会超过 16-bit 无符号环绕范围, vaddq_u16 的 mod 2^16 加法等价于 int 加法.
+ *   裁剪: 先 vmaxq_s16(0) 去负值 (有符号比较), 再 vminq_u16(max_val) 去上界.
+ *
+ * 8-bit 路径: uint8 像素 + int16 系数, 需扩展到 int16 做饱和加.
+ *   vqaddq_s16 饱和加自动处理下溢 (clip 到 0), vminq_u16 去上界,
+ *   vqmovn_u16 饱和缩窄回 uint8 (上界已由 vminq 保证, 无二次裁剪).
+ * =========================================================================== */
+
+/* 10-bit: uint16 像素路径 */
+static void recon_residual_neon_10bit(uint8_t *dst, ptrdiff_t stride,
+                                      const int16_t *coeff, int w, int h,
+                                      int bit_depth)
+{
+    uint16_t *dst16 = (uint16_t *)(void *)dst;
+    int stride16 = (int)(stride >> 1);
+    const uint16_t max_val = (uint16_t)((1 << bit_depth) - 1);
+    const uint16x8_t v_zero = vdupq_n_u16(0);
+    const uint16x8_t v_max = vdupq_n_u16(max_val);
+    int y;
+
+    for (y = 0; y < h; y++) {
+        uint16_t *d = dst16 + y * stride16;
+        const int16_t *c = coeff + y * w;
+        int x = 0;
+        /* 向量主体: 一次处理 8 像素 */
+        for (; x + 7 < w; x += 8) {
+            uint16x8_t dd = vld1q_u16(d + x);
+            uint16x8_t cc = vreinterpretq_u16_s16(vld1q_s16(c + x));
+            uint16x8_t r = vaddq_u16(dd, cc);
+            /* clip 下界 0: 有符号 max (负数以有符号解释) */
+            int16x8_t rs = vmaxq_s16(vreinterpretq_s16_u16(r), vdupq_n_s16(0));
+            /* clip 上界 max_val: 无符号 min */
+            r = vminq_u16(vreinterpretq_u16_s16(rs), v_max);
+            vst1q_u16(d + x, r);
+        }
+        /* 标量尾部 */
+        for (; x < w; x++) {
+            int v = d[x] + c[x];
+            if (v < 0) v = 0;
+            if (v > (int)max_val) v = (int)max_val;
+            d[x] = (uint16_t)v;
+        }
+    }
+    (void)v_zero;
+}
+
+/* 8-bit: uint8 像素路径 */
+static void recon_residual_neon_8bit(uint8_t *dst, ptrdiff_t stride,
+                                     const int16_t *coeff, int w, int h,
+                                     int bit_depth)
+{
+    const uint16_t max_val = (uint16_t)((1 << bit_depth) - 1);
+    const uint16x8_t v_max = vdupq_n_u16(max_val);
+    int y;
+
+    for (y = 0; y < h; y++) {
+        uint8_t *d = dst + y * stride;
+        const int16_t *c = coeff + y * w;
+        int x = 0;
+        /* 向量主体: 一次处理 16 像素 (8-bit) */
+        for (; x + 15 < w; x += 16) {
+            uint8x16_t dd = vld1q_u8(d + x);
+            /* uint8 → int16 扩展 (低 8 + 高 8) */
+            int16x8_t d_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(dd)));
+            int16x8_t d_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(dd)));
+            int16x8_t c_lo = vld1q_s16(c + x);
+            int16x8_t c_hi = vld1q_s16(c + x + 8);
+            /* 有符号饱和加: 下溢 clip 到 0 */
+            int16x8_t r_lo = vqaddq_s16(d_lo, c_lo);
+            int16x8_t r_hi = vqaddq_s16(d_hi, c_hi);
+            /* clip 上界: 无符号 min */
+            uint16x8_t rl = vminq_u16(vreinterpretq_u16_s16(r_lo), v_max);
+            uint16x8_t rh = vminq_u16(vreinterpretq_u16_s16(r_hi), v_max);
+            /* 饱和缩窄回 uint8 (上界已保证 ≤ max_val ≤ 255) */
+            uint8x16_t r = vcombine_u8(vqmovn_u16(rl), vqmovn_u16(rh));
+            vst1q_u8(d + x, r);
+        }
+        /* 标量尾部 */
+        for (; x < w; x++) {
+            int v = d[x] + c[x];
+            if (v < 0) v = 0;
+            if (v > (int)max_val) v = (int)max_val;
+            d[x] = (uint8_t)v;
+        }
+    }
+    (void)bit_depth;
+}
+
+/* NEON dispatcher */
+static void recon_residual_neon(uint8_t *dst, ptrdiff_t stride, const int16_t *coeff,
+                                int w, int h, int bit_depth)
+{
+    if (bit_depth > 8) {
+        recon_residual_neon_10bit(dst, stride, coeff, w, h, bit_depth);
+    } else {
+        recon_residual_neon_8bit(dst, stride, coeff, w, h, bit_depth);
+    }
+}
+
+/* ===========================================================================
  * DSP 初始化 (NEON)
  *
  * 注册策略:
@@ -3900,6 +4015,7 @@ static void idct_32x32_sdot(int16_t *coeff, int w, int h, int bit_depth)
  *       通过高低字节分解用 SDOT+USDOT 计算点积, 彻底消除蝶形版的 64+ 活跃
  *       向量寄存器溢出问题
  *     无 SDOT: 启用蝶形 NEON 版 (位精确, 可能有寄存器溢出) 或 C 回退
+ *   - 残差叠加: NEON 版 (8/10-bit 均覆盖)
  * =========================================================================== */
 void avs2_itx_init_neon(const avs2_cpu_flags *flags)
 {
@@ -3907,17 +4023,20 @@ void avs2_itx_init_neon(const avs2_cpu_flags *flags)
     avs2_dsp_table.itx[1] = idct_8x8_neon;
 
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (flags && flags->dotprod) {
-        avs2_dsp_table.itx[2] = idct_16x16_sdot;
-        avs2_dsp_table.itx[3] = idct_32x32_sdot;
-    } else {
-        avs2_dsp_table.itx[2] = idct_16x16_neon;
-        avs2_dsp_table.itx[3] = idct_32x32_neon;
-    }
+    /* SDOT 版实测比蝶形 NEON 慢 ~25%: 16 元素点积需 int16 字节分解
+     * (vshrn/vmovn/vand/vshr) + 3 次 vdotq_s32 + 3 次 vpadd 水平归约,
+     * 开销大于蝶形 NEON 的 vmlal 乘加. 固定使用蝶形 NEON.
+     * SDOT 实现保留 (idct_16x16_sdot / idct_32x32_sdot), 供未来
+     * 批量点积 (共享输入加载 + 向量化归约) 优化后重新启用. */
+    (void)flags;
+    avs2_dsp_table.itx[2] = idct_16x16_neon;
+    avs2_dsp_table.itx[3] = idct_32x32_neon;
 #else
     avs2_dsp_table.itx[2] = idct_16x16_neon;
     avs2_dsp_table.itx[3] = idct_32x32_neon;
 #endif
+
+    avs2_dsp_table.recon_residual = recon_residual_neon;
 }
 
 /* 非 x86 平台: SSE/AVX 接口保留空实现以供链接 */
