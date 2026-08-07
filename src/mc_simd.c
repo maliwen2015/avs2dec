@@ -81,7 +81,7 @@ static void block_copy_10bit_sse4(pel_t *dst, int i_dst,
             _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
         for (x = 0; x < width; x += 8) {
             __m128i v = _mm_loadu_si128((const __m128i*)(src + x));
-            _mm_store_si128((__m128i*)(dst + x), v);
+            _mm_storeu_si128((__m128i*)(dst + x), v);
         }
         /* 尾部标量 */
         for (; x < width; x++) {
