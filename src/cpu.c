@@ -1,5 +1,9 @@
 #include "cpu.h"
 
+#if defined(__GNUC__) && defined(__linux__)
+#include <stdio.h>
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #elif defined(__GNUC__)
@@ -112,6 +116,50 @@ void avs2_cpu_detect(avs2_cpu_flags *flags)
 #endif
 }
 
+#if defined(__GNUC__) && defined(__linux__)
+/* 容器/cgroup CPU 配额检测: 返回 cgroup 允许的 CPU 数 (向上取整), <=0 表示无限制.
+ * 容器中逻辑 CPU 数可能远大于配额 (如 3 核机器配额 2.0 CPU),
+ * 线程数超过配额会导致 cfs 配额节流 + 缓存抖动, 实测吞吐反而下降. */
+static int avs2_cpu_quota_count(void)
+{
+    /* cgroup v2: /sys/fs/cgroup/cpu.max = "<quota> <period>" 或 "max <period>" */
+    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char quota[32];
+        long period = 0;
+        if (fscanf(f, "%31s %ld", quota, &period) == 2 && quota[0] != 'm' && period > 0) {
+            long q = atol(quota);
+            fclose(f);
+            if (q > 0) {
+                long n = (q + period - 1) / period;  /* 向上取整 */
+                return (int)n;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+    /* cgroup v1: /sys/fs/cgroup/cpu/cpu.cfs_quota_us (=-1 无限制) + cpu.cfs_period_us */
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (f) {
+        long q = 0, period = 0;
+        int ok = (fscanf(f, "%ld", &q) == 1);
+        fclose(f);
+        if (ok && q > 0) {
+            f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+            if (f) {
+                if (fscanf(f, "%ld", &period) == 1 && period > 0) {
+                    fclose(f);
+                    long n = (q + period - 1) / period;
+                    return (int)n;
+                }
+                fclose(f);
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 int avs2_cpu_count(void)
 {
 #if defined(_WIN32)
@@ -120,7 +168,15 @@ int avs2_cpu_count(void)
     return (int)si.dwNumberOfProcessors;
 #elif defined(__GNUC__)
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return (n > 0) ? (int)n : 1;
+    int count = (n > 0) ? (int)n : 1;
+#if defined(__linux__)
+    /* 取逻辑 CPU 数与 cgroup 配额的较小值, 避免容器中线程数超配额 */
+    int quota = avs2_cpu_quota_count();
+    if (quota > 0 && quota < count) {
+        count = quota;
+    }
+#endif
+    return count;
 #else
     return 1;
 #endif

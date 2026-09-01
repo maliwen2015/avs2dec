@@ -179,7 +179,7 @@ static int avs2_decode_frame_fc_row(struct avs2_internal *c, avs2_frame_ctx *fc)
     compute_mv_row_ranges(f, 1 << c->seq->log2_lcu_size, fc->mv_row_range);
 
     /* ---- Pass 2: owning worker 也参与行级并行重建+LF ---- */
-    avs2_row_parallel_pass2(c, fc, 0);
+    avs2_row_parallel_pass2(c, fc, 0, 0);
 
     /* 等待辅助 worker 退出 */
     avs2_mutex_lock(&c->task_lock);
@@ -587,7 +587,7 @@ int avs2_decode_frame_fc_phase2_row(struct avs2_internal *c, avs2_frame_ctx *fc)
     avs2_mutex_unlock(&c->task_lock);
 
     /* ---- Pass 2: owning worker 参与行级并行重建+LF ---- */
-    avs2_row_parallel_pass2(c, fc, 0);
+    avs2_row_parallel_pass2(c, fc, 0, 0);
 
     /* 等待辅助 worker 退出 */
     avs2_mutex_lock(&c->task_lock);

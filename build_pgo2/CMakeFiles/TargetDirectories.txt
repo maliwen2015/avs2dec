@@ -1,0 +1,4 @@
+/workspace/build_pgo2/CMakeFiles/avs2dec.dir
+/workspace/build_pgo2/CMakeFiles/avs2dec_cli.dir
+/workspace/build_pgo2/CMakeFiles/edit_cache.dir
+/workspace/build_pgo2/CMakeFiles/rebuild_cache.dir

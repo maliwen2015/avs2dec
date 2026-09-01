@@ -435,8 +435,9 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc);
  * 调用前需确保 n_deps==0 (所有参考帧完全完成). */
 int avs2_decode_frame_fc_phase2_row(struct avs2_internal *c, avs2_frame_ctx *fc);
 /* 行级并行: worker 参与 Pass 2 重建+LF. is_helper=1 时为辅助 worker, 可在
- * 无任务且有待处理 P1 任务时提前退出. 返回 1=帧完成, 0=helper 提前退出. */
-int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_helper);
+ * 无任务且有待处理 P1 任务时提前退出; is_main=1 (主线程 helper) 跳过
+ * P1 抢占检查, 空转超限即返回. 返回 1=帧完成, 0=helper 提前退出. */
+int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_helper, int is_main);
 /* LF helper: Phase 2 中并行执行 deblock + pad (流水化重建与 LF). */
 void avs2_lf_helper(struct avs2_internal *c, avs2_frame_ctx *fc);
 /* Inter-parallel P2 helper: 并行执行 inter 重建 (pass=3, 无行依赖).
