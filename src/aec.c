@@ -179,13 +179,13 @@ static inline int aec_get_next_n_bit(avs2_aec *p_aec, int num_bits)
  * ===========================================================================
  */
 
-static inline void update_ctx_mps(aec_ctx *ctx, const uint16_t *tab_ctx_mps)
+static inline void update_ctx_mps(aec_ctx *ctx, const uint32_t *tab_ctx)
 {
 #if CTRL_OPT_AEC
-    /* 压缩表查找: 移除 mps 位构建索引, 查表后 OR 回原 mps 位 */
+    /* 交错表查找: 移除 mps 位构建索引, 查表后 OR 回原 mps 位 */
     uint16_t v = ctx->v;
     int idx = (v & 3) | ((v & 0xFFF8) >> 1);
-    ctx->v = tab_ctx_mps[idx] | (v & 4);
+    ctx->v = (uint16_t)(tab_ctx[idx] | (v & 4));
 #else
     uint32_t lg_pmps = ctx->b.lg_pmps;
     uint8_t  cycno   = (uint8_t)ctx->b.cycno;
@@ -199,14 +199,14 @@ static inline void update_ctx_mps(aec_ctx *ctx, const uint16_t *tab_ctx_mps)
 #endif
 }
 
-static inline void update_ctx_lps(aec_ctx *ctx, const uint16_t *tab_ctx_lps)
+static inline void update_ctx_lps(aec_ctx *ctx, const uint32_t *tab_ctx)
 {
 #if CTRL_OPT_AEC
-    /* 压缩表查找: 移除 mps 位构建索引, 查表后 XOR 原 mps 位
+    /* 交错表查找: 移除 mps 位构建索引, 取高 16 位 (LPS 转移) 后 XOR 原 mps 位
      * (LPS 中 mps 翻转与输入 mps 无关, 存储的是 mps=0 的结果) */
     uint16_t v = ctx->v;
     int idx = (v & 3) | ((v & 0xFFF8) >> 1);
-    ctx->v = tab_ctx_lps[idx] ^ (v & 4);
+    ctx->v = (uint16_t)((tab_ctx[idx] >> 16) ^ (v & 4));
 #else
     uint32_t cycno   = ctx->b.cycno;
     uint32_t cwr     = tab_cwr[cycno];
@@ -226,43 +226,40 @@ static inline void update_ctx_lps(aec_ctx *ctx, const uint16_t *tab_ctx_lps)
 #endif
 }
 
-/* 初始化概率转移表 (查表优化用).
+/* 初始化概率转移表 (查表优化用, 交错布局).
  * 使用 g_tab_initialized 做线程安全的懒初始化.
- * 初始化完成后表内容只读, 多线程读取安全. */
-void aec_init_context_tab(uint16_t aec_tab_ctx_mps[4 * 2048], uint16_t aec_tab_ctx_lps[4 * 2048])
+ * 初始化完成后表内容只读, 多线程读取安全.
+ * 索引 = cycno | (lg_pmps << 2), lg_pmps 可达范围 [0,1023]
+ * (初值 1023, MPS 递减, LPS 翻转公式 2047-new_lg 保证上界).
+ * 低 16 位 = MPS 转移 (mps=0 结果), 高 16 位 = LPS 转移 (翻转后 mps). */
+void aec_init_context_tab(uint32_t aec_tab_ctx[4 * 1024])
 {
 #if CTRL_OPT_AEC
     int cycno;
 
-    memset(aec_tab_ctx_mps, 0, sizeof(uint16_t) * 4 * 2048);
-    memset(aec_tab_ctx_lps, 0, sizeof(uint16_t) * 4 * 2048);
+    memset(aec_tab_ctx, 0, sizeof(uint32_t) * 4 * 1024);
 
-    /* MPS 转移: 仅填充 mps=0 的条目, 查找时 OR 回实际 mps 位 */
     for (cycno = 0; cycno < 4; cycno++) {
         uint32_t cwr = tab_cwr[cycno];
-        uint32_t new_cycno = DAVS2_MAX(cycno, 1);
+        uint32_t new_cycno_mps = DAVS2_MAX(cycno, 1);
+        uint32_t new_cycno_lps = DAVS2_MIN(cycno + 1, 3);
         int lg_pmps;
-        for (lg_pmps = 0; lg_pmps <= 1024; lg_pmps++) {
-            uint32_t new_lg = (uint32_t)lg_pmps - ((uint32_t)lg_pmps >> cwr) - ((uint32_t)lg_pmps >> (cwr + 2));
-            int idx = cycno | (lg_pmps << 2);
-            aec_tab_ctx_mps[idx] = MAKE_CONTEXT(new_lg, 0, new_cycno);
-        }
-    }
+        for (lg_pmps = 0; lg_pmps <= 1023; lg_pmps++) {
+            uint32_t new_lg_mps = (uint32_t)lg_pmps - ((uint32_t)lg_pmps >> cwr) - ((uint32_t)lg_pmps >> (cwr + 2));
+            uint32_t new_lg_lps = (uint32_t)lg_pmps + tab_lg_pmps_offset[cwr];
+            uint32_t new_mps_lps = 0;
+            uint32_t entry;
+            int idx;
 
-    /* LPS 转移: 仅填充 mps=0 的条目, 存储翻转后的 mps, 查找时 XOR 原 mps 位 */
-    for (cycno = 0; cycno < 4; cycno++) {
-        uint32_t cwr = tab_cwr[cycno];
-        uint32_t new_cycno = DAVS2_MIN(cycno + 1, 3);
-        int lg_pmps;
-        for (lg_pmps = 0; lg_pmps <= 1024; lg_pmps++) {
-            uint32_t new_lg = (uint32_t)lg_pmps + tab_lg_pmps_offset[cwr];
-            uint32_t new_mps = 0;
-            if (new_lg >= (256 << LG_PMPS_SHIFTNO)) {
-                new_lg = (512 << LG_PMPS_SHIFTNO) - 1 - new_lg;
-                new_mps = 1;
+            if (new_lg_lps >= (256 << LG_PMPS_SHIFTNO)) {
+                new_lg_lps = (512 << LG_PMPS_SHIFTNO) - 1 - new_lg_lps;
+                new_mps_lps = 1;
             }
-            int idx = cycno | (lg_pmps << 2);
-            aec_tab_ctx_lps[idx] = MAKE_CONTEXT(new_lg, new_mps, new_cycno);
+
+            entry = (uint32_t)MAKE_CONTEXT(new_lg_mps, 0, new_cycno_mps)
+                  | ((uint32_t)MAKE_CONTEXT(new_lg_lps, new_mps_lps, new_cycno_lps) << 16);
+            idx = cycno | (lg_pmps << 2);
+            aec_tab_ctx[idx] = entry;
         }
     }
 #else
@@ -360,48 +357,90 @@ static inline int aec_renormalize_slow(avs2_aec *p_aec, uint32_t *pi_value_s)
  * 优化: (A) MPS 快速路径 + 显式位移替代位域访问; (C) 内联归一化检查.
  * 位域映射: lg_pmps = v >> 5 (字段 lg_pmps(11位, 起始位3) >> LG_PMPS_SHIFTNO=2),
  *           mps = (v >> 2) & 1. 显式位移避免位域实现的编译器依赖开销. */
-static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
+/* 算术解码器核心状态 (i_s1/i_t1/i_value_s/b_val_bound/b_val_domain 打包).
+ * 方案 E: bin 循环 (continue0/continu0_ext/run 解码) 将状态保持在
+ * 局部变量 (寄存器) 中, 消除每 bin 经 p_aec 内存的 store-to-load 转发链. */
+typedef struct {
+    uint32_t s1;
+    uint32_t t1;
+    uint32_t value_s;
+    uint32_t b_val_bound;
+    uint32_t b_val_domain;
+} aec_core_state_t;
+
+/* 核心状态装载/写回 */
+static inline void aec_state_load(const avs2_aec *p_aec, aec_core_state_t *st)
+{
+    st->s1           = p_aec->i_s1;
+    st->t1           = p_aec->i_t1;
+    st->value_s      = p_aec->i_value_s;
+    st->b_val_bound  = p_aec->b_val_bound;
+    st->b_val_domain = p_aec->b_val_domain;
+}
+
+static inline void aec_state_store(avs2_aec *p_aec, const aec_core_state_t *st)
+{
+    p_aec->i_s1          = st->s1;
+    p_aec->i_t1          = st->t1;
+    p_aec->i_value_s     = st->value_s;
+    p_aec->b_val_bound   = st->b_val_bound;
+    p_aec->b_val_domain  = st->b_val_domain;
+}
+
+/* 带上下文的双域算术解码核心 (状态经 st 传递).
+ * 与 biari_decode_symbol 逻辑完全一致, 仅字段访问改为经 st,
+ * 内联后调用方循环内状态可保持在寄存器中.
+ * 返回值: -1 = 错误 (b_bit_error 已置位), 否则为解码的 bin (0/1). */
+static inline int biari_decode_bin_core(avs2_aec *p_aec, aec_ctx *ctx,
+                                        aec_core_state_t *st)
 {
     uint32_t v = ctx->v;
     uint32_t lg_pmps = v >> 5;            /* ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
     int bit = (int)((v >> 2) & 1);        /* ctx->b.mps */
-    uint32_t i_value_s = p_aec->i_value_s;
+    uint32_t i_value_s = st->value_s;
     uint32_t s_flag;
     uint32_t s2;
     uint32_t t2;
     int is_LPS;
 
-    /* 内联归一化快速检查 (方案 C): 常见路径无需归一化, 跳过函数调用 */
-    if (unlikely(aec_renormalize_needed(p_aec))) {
-        if (unlikely(aec_renormalize_slow(p_aec, &i_value_s))) {
-            return 0;
+    /* 内联归一化快速检查: 常见路径无需归一化, 跳过函数调用 */
+    if (unlikely(st->b_val_domain != 0 ||
+                 (st->s1 == AEC_VALUE_BOUND && st->b_val_bound != 0))) {
+        int r;
+        p_aec->i_s1 = st->s1;
+        r = aec_renormalize_slow(p_aec, &i_value_s);
+        st->s1          = p_aec->i_s1;        /* 归一化恒置 0 */
+        st->b_val_bound = p_aec->b_val_bound;
+        if (unlikely(r)) {
+            st->value_s = i_value_s;
+            return -1;
         }
     }
 
     if (unlikely(i_value_s > AEC_VALUE_BOUND)) {
         p_aec->b_bit_error = 1;
-        p_aec->i_value_s   = i_value_s;
-        return 0;
+        st->value_s        = i_value_s;
+        return -1;
     }
 
-    s_flag = p_aec->i_t1 < lg_pmps;
-    s2     = p_aec->i_s1 + s_flag;
-    t2     = p_aec->i_t1 - lg_pmps + (s_flag << 8); /* 8 位 */
-    is_LPS = (s2 > i_value_s || (s2 == i_value_s && p_aec->i_value_t >= t2)) && p_aec->b_val_bound == 0;
+    s_flag = st->t1 < lg_pmps;
+    s2     = st->s1 + s_flag;
+    t2     = st->t1 - lg_pmps + (s_flag << 8); /* 8 位 */
+    is_LPS = (s2 > i_value_s || (s2 == i_value_s && p_aec->i_value_t >= t2)) && st->b_val_bound == 0;
 
-    p_aec->b_val_domain = is_LPS;
+    st->b_val_domain = is_LPS;
 
-    if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A): 80%+ 的 bin 走此路径 */
-        p_aec->i_s1 = s2;
-        p_aec->i_t1 = t2;
-        p_aec->i_value_s = i_value_s;
-        update_ctx_mps(ctx, p_aec->tab_ctx_mps);
+    if (likely(!is_LPS)) {     /* MPS 快速路径: 80%+ 的 bin 走此路径 */
+        st->s1      = s2;
+        st->t1      = t2;
+        st->value_s = i_value_s;
+        update_ctx_mps(ctx, p_aec->tab_ctx);
         return bit;
     }
 
     /* LPS 慢速路径 */
     {
-        uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
+        uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (st->t1 + lg_pmps);
         int n_bits;
         bit = !bit;
 
@@ -409,7 +448,8 @@ static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
             p_aec->i_value_t -= t2;
         } else {
             if (unlikely(aec_get_next_bit(p_aec))) {
-                return 0;
+                st->value_s = i_value_s;
+                return -1;
             }
             p_aec->i_value_t += 256 - t2;
         }
@@ -420,17 +460,30 @@ static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
         t_rlps <<= n_bits;
         if (n_bits) {
             if (unlikely(aec_get_next_n_bit(p_aec, n_bits))) {
-                return 0;
+                st->value_s = i_value_s;
+                return -1;
             }
         }
 
-        p_aec->i_s1 = 0;
-        p_aec->i_t1 = t_rlps & 0xff;
-        p_aec->i_value_s = i_value_s;
-        update_ctx_lps(ctx, p_aec->tab_ctx_lps);
+        st->s1      = 0;
+        st->t1      = t_rlps & 0xff;
+        st->value_s = i_value_s;
+        update_ctx_lps(ctx, p_aec->tab_ctx);
     }
 
     return bit;
+}
+
+/* 带上下文的双域算术解码 (单 bin, 状态经 p_aec 内存) */
+static inline int biari_decode_symbol(avs2_aec *p_aec, aec_ctx *ctx)
+{
+    aec_core_state_t st;
+    int bit;
+
+    aec_state_load(p_aec, &st);
+    bit = biari_decode_bin_core(p_aec, ctx, &st);
+    aec_state_store(p_aec, &st);
+    return bit < 0 ? 0 : bit;
 }
 
 /* 等概率解码 (无上下文，无更新) */
@@ -532,149 +585,49 @@ static inline int biari_decode_final(avs2_aec *p_aec)
  * 优化: (A) MPS 快速路径 + 显式位移; (C) 内联归一化检查. */
 static inline int biari_decode_symbol_continue0(avs2_aec *p_aec, aec_ctx *ctx, int max_num)
 {
-    uint32_t i_value_s = p_aec->i_value_s;
+    aec_core_state_t st;
     int bit = 0;
     int i;
 
+    aec_state_load(p_aec, &st);
+
     for (i = 0; i < max_num && !bit; i++) {
-        uint32_t v = ctx->v;
-        uint32_t lg_pmps = v >> 5;          /* ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
-        uint32_t t2;
-        uint32_t s2;
-        uint32_t s_flag;
-        int is_LPS;
-
-        bit = (int)((v >> 2) & 1);          /* ctx->b.mps */
-
-        /* 内联归一化快速检查 (方案 C) */
-        if (unlikely(aec_renormalize_needed(p_aec))) {
-            if (unlikely(aec_renormalize_slow(p_aec, &i_value_s))) {
-                return 0;
-            }
-        }
-
-        s_flag = p_aec->i_t1 < lg_pmps;
-        s2 = p_aec->i_s1 + s_flag;
-        t2 = p_aec->i_t1 - lg_pmps + (s_flag << 8); /* 8 位 */
-
-        if (unlikely(i_value_s > AEC_VALUE_BOUND)) {
-            p_aec->b_bit_error = 1;
+        /* 方案 E: 状态保持在局部 (寄存器), 每 bin 无内存往返;
+         * 错误经返回值 (-1) 传递, 循环内无需访问 p_aec->b_bit_error */
+        bit = biari_decode_bin_core(p_aec, ctx, &st);
+        if (unlikely(bit < 0)) {
             return 0;
-        }
-
-        is_LPS = (s2 > i_value_s || (s2 == i_value_s && p_aec->i_value_t >= t2)) && p_aec->b_val_bound == 0;
-        p_aec->b_val_domain = is_LPS;
-
-        if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A) */
-            p_aec->i_s1 = s2;
-            p_aec->i_t1 = t2;
-            update_ctx_mps(ctx, p_aec->tab_ctx_mps);
-        } else {     /* LPS */
-            uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
-            int n_bits;
-            bit = !bit;
-
-            if (s2 == i_value_s) {
-                p_aec->i_value_t -= t2;
-            } else {
-                if (unlikely(aec_get_next_bit(p_aec))) {
-                    return 0;
-                }
-                p_aec->i_value_t += 256 - t2;
-            }
-
-            /* clz 计算 LPS 移位位数 */
-            n_bits = (t_rlps != 0) ? (clz32(t_rlps) - 23) : 0;
-            if (n_bits < 0) n_bits = 0;
-            t_rlps <<= n_bits;
-            if (n_bits) {
-                if (unlikely(aec_get_next_n_bit(p_aec, n_bits))) {
-                    return 0;
-                }
-            }
-
-            p_aec->i_s1 = 0;
-            p_aec->i_t1 = t_rlps & 0xff;
-            update_ctx_lps(ctx, p_aec->tab_ctx_lps);
         }
     }
 
-    p_aec->i_value_s = i_value_s;
+    aec_state_store(p_aec, &st);
     return i - bit;
 }
 
 /* 连续解码，上下文按 ctx_add 递增 (最多 max_ctx_inc).
- * 优化: (A) MPS 快速路径 + 显式位移; (C) 内联归一化检查. */
+ * 优化: (A) MPS 快速路径 + 显式位移; (C) 内联归一化检查;
+ *       (E) 核心状态保持在局部 (寄存器), 每 bin 无内存往返. */
 static inline int biari_decode_symbol_continu0_ext(avs2_aec *p_aec, aec_ctx *ctx, int max_ctx_inc, int max_num)
 {
+    aec_core_state_t st;
     int bit = 0;
     int i;
+
+    aec_state_load(p_aec, &st);
 
     for (i = 0; i < max_num && !bit; i++) {
         int ctx_add = DAVS2_MIN(i, max_ctx_inc);
         aec_ctx *p_ctx = ctx + ctx_add;
-        uint32_t v = p_ctx->v;
-        uint32_t lg_pmps = v >> 5;          /* p_ctx->b.lg_pmps >> LG_PMPS_SHIFTNO */
-        uint32_t t2;
-        uint32_t s2;
-        int is_LPS;
-        int s_flag;
 
-        bit = (int)((v >> 2) & 1);          /* p_ctx->b.mps */
-
-        /* 内联归一化快速检查 (方案 C) */
-        if (unlikely(aec_renormalize_needed(p_aec))) {
-            if (unlikely(aec_renormalize_slow(p_aec, &p_aec->i_value_s))) {
-                return 0;
-            }
-        }
-
-        s_flag = p_aec->i_t1 < lg_pmps;
-        s2 = p_aec->i_s1 + s_flag;
-        t2 = p_aec->i_t1 - lg_pmps + (s_flag << 8); /* 8 位 */
-
-        if (unlikely(p_aec->i_value_s > AEC_VALUE_BOUND)) {
-            p_aec->b_bit_error = 1;
+        /* 方案 E: 状态保持在局部 (寄存器), 每 bin 无内存往返;
+         * 错误经返回值 (-1) 传递, 循环内无需访问 p_aec->b_bit_error */
+        bit = biari_decode_bin_core(p_aec, p_ctx, &st);
+        if (unlikely(bit < 0)) {
             return 0;
-        }
-
-        is_LPS = (s2 > p_aec->i_value_s || (s2 == p_aec->i_value_s && p_aec->i_value_t >= t2)) && p_aec->b_val_bound == 0;
-        p_aec->b_val_domain = is_LPS;
-
-        if (likely(!is_LPS)) {     /* MPS 快速路径 (方案 A) */
-            p_aec->i_s1 = s2;
-            p_aec->i_t1 = t2;
-            update_ctx_mps(p_ctx, p_aec->tab_ctx_mps);
-        } else {     /* LPS */
-            uint32_t t_rlps = (s_flag == 0) ? (lg_pmps) : (p_aec->i_t1 + lg_pmps);
-            int n_bits;
-            bit = !bit;
-
-            if (s2 == p_aec->i_value_s) {
-                p_aec->i_value_t -= t2;
-            } else {
-                if (unlikely(aec_get_next_bit(p_aec))) {
-                    return 0;
-                }
-                p_aec->i_value_t += 256 - t2;
-            }
-
-            /* clz 计算移位位数, 批量读取替换逐比特循环 */
-            n_bits = (t_rlps != 0) ? (clz32(t_rlps) - 23) : 0;
-            if (n_bits < 0) n_bits = 0;
-            t_rlps <<= n_bits;
-            if (n_bits) {
-                if (unlikely(aec_get_next_n_bit(p_aec, n_bits))) {
-                    return 0;
-                }
-            }
-
-            p_aec->i_s1 = 0;
-            p_aec->i_t1 = t_rlps & 0xff;
-            update_ctx_lps(p_ctx, p_aec->tab_ctx_lps);
         }
     }
 
+    aec_state_store(p_aec, &st);
     return i - bit;
 }
 
@@ -726,15 +679,14 @@ void aec_new_slice(struct avs2_internal *c)
  * ===========================================================================
  */
 
-avs2_aec *avs2_aec_create(const uint16_t *aec_tab_ctx_mps, const uint16_t *aec_tab_ctx_lps)
+avs2_aec *avs2_aec_create(const uint32_t *aec_tab_ctx)
 {
     avs2_aec *a = (avs2_aec *)avs2_mem_allocz(sizeof(*a));
     if (!a) return NULL;
 
 #if CTRL_OPT_AEC
     /* 存储表指针, 供 update_ctx_mps/lps 通过 AEC 状态访问 */
-    a->tab_ctx_mps = aec_tab_ctx_mps;
-    a->tab_ctx_lps = aec_tab_ctx_lps;
+    a->tab_ctx = aec_tab_ctx;
 #endif
 
     return a;
@@ -2094,7 +2046,6 @@ static int aec_read_run_luma1(avs2_aec *p_aec, aec_ctx *p_ctx, int pos, int b_on
     int ctxpos;
     int Run = 0;
     int offset = 0;
-
     b_only_one_cg = b_only_one_cg ? 0 : 4;
 
     for (ctxpos = 0; Run != pos; ctxpos++) {
@@ -2119,7 +2070,6 @@ static int aec_read_run_luma2(avs2_aec *p_aec, aec_ctx *p_ctx, int pos, int b_on
     int ctxpos;
     int Run = 0;
     int offset = 0;
-
     b_only_one_cg = b_only_one_cg ? 0 : 4;
 
     for (ctxpos = 0; Run != pos; ctxpos++) {
@@ -2144,7 +2094,6 @@ static int aec_read_run_chroma(avs2_aec *p_aec, aec_ctx *p_ctx, int pos, int b_o
     int ctxpos;
     int Run = 0;
     int offset = 0;
-
     b_only_one_cg = b_only_one_cg ? 0 : 3;
 
     for (ctxpos = 0; Run != pos; ctxpos++) {

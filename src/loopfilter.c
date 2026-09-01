@@ -437,10 +437,22 @@ void deblock_chroma_hor(void *src_u, void *src_v, int stride,
 
 /* --------------------------------------------------------------------------
  * 对一个 8x8 SCU 的指定方向边执行去块滤波 (对应 davs2 lf_scu_deblock)
+ *
+ * 优化:
+ *   - stride/stride_c (原为每次调用 2 次运行时除法) 由调用方计算后传入;
+ *   - alpha/beta 按 QP 均值记忆化: 同一 CU 内所有 SCU 共享相同 QP,
+ *     连续 SCU 命中率高, 避免每次 4 次查表 + 4 次 CLIP3 + 色度 QP 映射.
  * -------------------------------------------------------------------------- */
+typedef struct {
+    int  last_qp;          /* 上次计算的 QP 均值 (-1 表示未命中) */
+    int  alpha, beta;      /* 亮度阈值 */
+    int  alpha_c, beta_c;  /* 色度阈值 */
+} deblock_thresh_memo_t;
+
 static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
                         avs2_frame *f, int scu_x, int scu_y, int dir,
-                        int frame_type)
+                        int frame_type, int stride, int stride_c,
+                        deblock_thresh_memo_t *memo)
 {
     const int w_in_scu = f->w8;
     const int scu_xy   = scu_y * w_in_scu + scu_x;
@@ -454,8 +466,6 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
         const int bps = f->bytes_per_sample;
         const int byte_stride  = (int)f->stride[0];   /* 字节步长 */
         const int byte_stride_c = (int)f->stride[1];
-        const int stride    = byte_stride / bps;     /* 元素步长 */
-        const int stride_c  = byte_stride_c / bps;
         /* qp_shift: 码流中 QP 包含 8*(bit_depth-8) 的偏移, 需减回后查表.
          * val_shift: alpha/beta 表是 8-bit, 需左移到当前位深. */
         const int qp_shift  = c->bit_depth - 8;
@@ -487,11 +497,26 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
             int alpha, beta;
             qp = (scu_p->qp + scu_q->qp + 1) >> 1;  /* 两块 QP 均值 */
 
-            /* 10/12-bit 时 QP 已在配置中加 8*(bit_depth-8), 此处减回 */
-            alpha = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                          qp - (qp_shift << 3) + fc->pic_local.alpha_offset)] << val_shift;
-            beta  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                          qp - (qp_shift << 3) + fc->pic_local.beta_offset)] << val_shift;
+            if (qp != memo->last_qp) {
+                int qp_c;
+                int delta_cb = fc->pic_local.chroma_quant_param_disable ? 0
+                              : fc->pic_local.chroma_quant_param_delta_cb;
+
+                /* 10/12-bit 时 QP 已在配置中加 8*(bit_depth-8), 此处减回 */
+                memo->alpha = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
+                                                    qp - (qp_shift << 3) + fc->pic_local.alpha_offset)] << val_shift;
+                memo->beta  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
+                                                    qp - (qp_shift << 3) + fc->pic_local.beta_offset)] << val_shift;
+
+                qp_c = avs2_chroma_qp(qp, delta_cb, c->bit_depth) - (qp_shift << 3);
+                memo->alpha_c = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
+                                                       qp_c + fc->pic_local.alpha_offset)] << val_shift;
+                memo->beta_c  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
+                                                       qp_c + fc->pic_local.beta_offset)] << val_shift;
+                memo->last_qp = qp;
+            }
+            alpha = memo->alpha;
+            beta  = memo->beta;
 
             avs2_dsp_table.deblock_luma[dir](src_y, stride, alpha, beta,
                                              b_filter_flag, c->bit_depth);
@@ -505,15 +530,8 @@ static void scu_deblock(avs2_frame_ctx *fc, struct avs2_internal *c,
                 int uv_pix_y = scu_y << (MIN_CU_SIZE_IN_BIT - 1);
                 uint8_t *src_u = f->data[1] + uv_pix_y * byte_stride_c + uv_pix_x * bps;
                 uint8_t *src_v = f->data[2] + uv_pix_y * byte_stride_c + uv_pix_x * bps;
-                int delta_cb = fc->pic_local.chroma_quant_param_disable ? 0
-                              : fc->pic_local.chroma_quant_param_delta_cb;
-                int alpha, beta;
-
-                qp = avs2_chroma_qp(qp, delta_cb, c->bit_depth) - (qp_shift << 3);
-                alpha = alpha_table[AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                              qp + fc->pic_local.alpha_offset)] << val_shift;
-                beta  = beta_table [AVS2_CLIP3(0, MAX_QP_DEBLOCK,
-                                              qp + fc->pic_local.beta_offset)] << val_shift;
+                int alpha = memo->alpha_c;
+                int beta  = memo->beta_c;
 
                 avs2_dsp_table.deblock_chroma[dir](src_u, src_v, stride_c,
                                                    alpha, beta, b_filter_flag,
@@ -539,7 +557,14 @@ void avs2_loop_filter(avs2_frame_ctx *fc, struct avs2_internal *c,
     int num_hor = AVS2_MIN(w_in_scu - scu_x, num_in_scu);
     int num_ver = AVS2_MIN(h_in_scu - scu_y, num_in_scu);
     const int frame_type = (int)fc->pic_local.picture_coding_type;
+    /* 元素步长: 提前计算一次 (原在 scu_deblock 中每 SCU 做除法) */
+    const int bps = f->bytes_per_sample;
+    const int stride   = (int)f->stride[0] / bps;
+    const int stride_c = (int)f->stride[1] / bps;
+    deblock_thresh_memo_t memo;
     int i, j;
+
+    memo.last_qp = -1;
 
     /* 清零当前 LCU 区域的滤波标志 (避免重复解码时的残留) */
     for (j = 0; j < num_ver; j++) {
@@ -553,7 +578,8 @@ void avs2_loop_filter(avs2_frame_ctx *fc, struct avs2_internal *c,
     /* 垂直边滤波 */
     for (j = 0; j < num_ver; j++)
         for (i = 0; i < num_hor; i++)
-            scu_deblock(fc, c, f, scu_x + i, scu_y + j, EDGE_VER, frame_type);
+            scu_deblock(fc, c, f, scu_x + i, scu_y + j, EDGE_VER, frame_type,
+                        stride, stride_c, &memo);
 
     /* 水平边滤波: 调整起始位置以覆盖上一 LCU 的最后一条水平边 */
     if (scu_x == 0) {
@@ -566,7 +592,8 @@ void avs2_loop_filter(avs2_frame_ctx *fc, struct avs2_internal *c,
 
     for (j = 0; j < num_ver; j++)
         for (i = 0; i < num_hor; i++)
-            scu_deblock(fc, c, f, scu_x + i, scu_y + j, EDGE_HOR, frame_type);
+            scu_deblock(fc, c, f, scu_x + i, scu_y + j, EDGE_HOR, frame_type,
+                        stride, stride_c, &memo);
 }
 
 /* --------------------------------------------------------------------------

@@ -1052,7 +1052,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
 
     avs2_cpu_detect(&c->cpu);
 
-    aec_init_context_tab(c->aec_tab_ctx_mps, c->aec_tab_ctx_lps);
+    aec_init_context_tab(c->aec_tab_ctx);
 
     int nthr = c->n_threads;
     if (nthr <= 0) nthr = avs2_cpu_count();
@@ -1108,7 +1108,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         /* coeff_scratch_y/u/v 为静态数组, 无需分配 */
         c->fc[i].task_state = 0;  /* idle */
         /* 预分配 AEC 上下文 (避免每帧 create/destroy 堆操作) */
-        c->fc[i].aec_pool = avs2_aec_create(c->aec_tab_ctx_mps, c->aec_tab_ctx_lps);
+        c->fc[i].aec_pool = avs2_aec_create(c->aec_tab_ctx);
         if (!c->fc[i].aec_pool) {
             avs2_close((avs2_ctx **)&c);
             return NULL;
@@ -1497,7 +1497,9 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
      * 2. flushing 模式下: 查找最小的 POC >= out_next_poc (跳过缺失的 POC),
      *    若不存在则输出最小的 POC (处理迟到/重复帧)
      * 3. 输出帧后检查是否有相同 POC 的重复帧, 若有则保持 out_next_poc 不变 */
-    if (c->out_initialized) {
+    /* flushing 时 out_initialized 可能已被 avs2_flush 重置 (用于 seek 重启),
+     * 但 DPB 中仍有待输出帧, 因此 flushing 模式下也执行输出搜索. */
+    if (c->out_initialized || c->flushing) {
         /* 1. 精确匹配: 在所有 POC == out_next_poc 的帧中选 coi 最大的
          *    (对应 davs2 有序链表: 后解码的重复帧插入在前面, 先输出).
          *    多线程时只选 done 的帧 (已解码完成). */

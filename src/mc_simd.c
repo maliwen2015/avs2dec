@@ -34,6 +34,9 @@
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
+#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>  /* AVX2 (经 target 属性局部启用) */
+#endif
 
 /* ---- 对齐宏 ---- */
 #if defined(_MSC_VER)
@@ -1901,7 +1904,939 @@ static void mc_chroma_avg_sse4(const uint8_t *src, ptrdiff_t sstride, uint8_t *d
 }
 
 /* ===========================================================================
- * 第十二部分: DSP 初始化
+ * 第十二部分: AVX2 运动补偿 (10-bit)
+ *
+ * 使用 GCC/Clang 的 target 属性在未全局开启 -mavx2 的编译单元中启用 AVX2,
+ * 运行时由 avs2_mc_init_avx2 (经 cpu->avx2 检测) 注册, 不支持 AVX2 的
+ * CPU 或编译器 (MSVC) 自动回退 SSE4.1.
+ *
+ * 覆盖的 10-bit 路径: 块拷贝 / 块平均 / 亮度 8 抽头 H/V/双向 / 色度 4 抽头
+ * H/V/双向. 8-bit 路径与融合 ext_avg (双向预测第二路) 委托给 SSE4.1 实现.
+ * ===========================================================================
+ */
+#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
+#define AVS2_MC_HAVE_AVX2 1
+#define AVS2_MC_AVX2 __attribute__((target("avx2")))
+#else
+#define AVS2_MC_HAVE_AVX2 0
+#endif
+
+#if AVS2_MC_HAVE_AVX2
+
+/* 整像素块拷贝 (10-bit, AVX2)
+ * 宽度为 16 的倍数时每次拷贝 16 像素 (32 字节); 宽度 8 用 128-bit;
+ * 宽度 2/4 与 SSE4.1 版一致: 每行一次 128-bit 操作 (超出块宽的写入
+ * 由同一行后续块的预测写入覆盖, 与 SSE4.1 行为相同). */
+static AVS2_MC_AVX2 void block_copy_10bit_avx2(pel_t *dst, int i_dst,
+                                               const pel_t *src, int i_src,
+                                               int width, int height)
+{
+    int y, x;
+    if ((width & 15) == 0) {
+        for (y = 0; y < height; y++) {
+            if (y + 8 < height)
+                _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
+            for (x = 0; x < width; x += 16) {
+                __m256i v = _mm256_loadu_si256((const __m256i*)(src + x));
+                _mm256_storeu_si256((__m256i*)(dst + x), v);
+            }
+            src += i_src;
+            dst += i_dst;
+        }
+    } else if ((width & 7) == 0) {
+        for (y = 0; y < height; y++) {
+            if (y + 8 < height)
+                _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
+            for (x = 0; x < width; x += 8) {
+                __m128i v = _mm_loadu_si128((const __m128i*)(src + x));
+                _mm_storeu_si128((__m128i*)(dst + x), v);
+            }
+            src += i_src;
+            dst += i_dst;
+        }
+    } else {
+        for (y = 0; y < height; y++) {
+            __m128i v = _mm_loadu_si128((const __m128i*)src);
+            _mm_storeu_si128((__m128i*)dst, v);
+            src += i_src;
+            dst += i_dst;
+        }
+    }
+}
+
+/* 块平均 (10-bit, AVX2): dst[i] = (dst[i] + src[i] + 1) >> 1
+ * _mm256_avg_epu16 恰好实现 (a+b+1)>>1 的无符号语义 */
+static AVS2_MC_AVX2 void block_avg_10bit_avx2(pel_t *dst, int i_dst,
+                                              const pel_t *src, int i_src,
+                                              int width, int height)
+{
+    int y, x;
+    for (y = 0; y < height; y++) {
+        for (x = 0; x + 15 < width; x += 16) {
+            __m256i vd = _mm256_loadu_si256((const __m256i*)(dst + x));
+            __m256i vs = _mm256_loadu_si256((const __m256i*)(src + x));
+            __m256i avg = _mm256_avg_epu16(vd, vs);
+            _mm256_storeu_si256((__m256i*)(dst + x), avg);
+        }
+        for (; x + 3 < width; x += 4) {
+            __m128i vd = _mm_loadl_epi64((const __m128i*)(dst + x));
+            __m128i vs = _mm_loadl_epi64((const __m128i*)(src + x));
+            __m128i avg = _mm_avg_epu16(vd, vs);
+            _mm_storel_epi64((__m128i*)(dst + x), avg);
+        }
+        for (; x < width; x++) {
+            int v = dst[x] + src[x];
+            dst[x] = (pel_t)((v + 1) >> 1);
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* 亮度 8 抽头水平插值 (10-bit, AVX2): 每次处理 16 个输出
+ * 与 SSE4.1 版同构: T_k 为起点偏移 k 的 16 像素窗口, madd 后
+ * 两级 hadd 折叠出每个输出的点积 (每 128-bit lane 独立处理) */
+static AVS2_MC_AVX2 void ip_filter_luma_hor_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int j, i;
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+    __m256i offset = _mm256_set1_epi32(32);
+    __m256i mCoef = _mm256_broadcastsi128_si256(
+                        _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i*)coeff)));
+
+    src -= 3;
+
+    for (j = 0; j < height; j++) {
+        const pel_t *p = src;
+        if (j + 8 < height)
+            _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
+        for (i = 0; i + 15 < width; i += 16) {
+            __m256i T0, T1, T2, T3, T4, T5, T6, T7;
+            __m256i M0, M1, M2, M3, M4, M5, M6, M7;
+            __m256i A0, A1, A2, A3, B0, B1;
+
+            T0 = _mm256_loadu_si256((__m256i*)(p + i + 0));
+            T1 = _mm256_loadu_si256((__m256i*)(p + i + 1));
+            T2 = _mm256_loadu_si256((__m256i*)(p + i + 2));
+            T3 = _mm256_loadu_si256((__m256i*)(p + i + 3));
+            T4 = _mm256_loadu_si256((__m256i*)(p + i + 4));
+            T5 = _mm256_loadu_si256((__m256i*)(p + i + 5));
+            T6 = _mm256_loadu_si256((__m256i*)(p + i + 6));
+            T7 = _mm256_loadu_si256((__m256i*)(p + i + 7));
+
+            M0 = _mm256_madd_epi16(T0, mCoef);
+            M1 = _mm256_madd_epi16(T1, mCoef);
+            M2 = _mm256_madd_epi16(T2, mCoef);
+            M3 = _mm256_madd_epi16(T3, mCoef);
+            M4 = _mm256_madd_epi16(T4, mCoef);
+            M5 = _mm256_madd_epi16(T5, mCoef);
+            M6 = _mm256_madd_epi16(T6, mCoef);
+            M7 = _mm256_madd_epi16(T7, mCoef);
+
+            A0 = _mm256_hadd_epi32(M0, M1);
+            A1 = _mm256_hadd_epi32(M2, M3);
+            A2 = _mm256_hadd_epi32(M4, M5);
+            A3 = _mm256_hadd_epi32(M6, M7);
+
+            B0 = _mm256_hadd_epi32(A0, A1);
+            B1 = _mm256_hadd_epi32(A2, A3);
+
+            B0 = _mm256_add_epi32(B0, offset);
+            B1 = _mm256_add_epi32(B1, offset);
+            B0 = _mm256_srai_epi32(B0, 6);
+            B1 = _mm256_srai_epi32(B1, 6);
+            B0 = _mm256_packus_epi32(B0, B1);
+            B0 = _mm256_min_epu16(B0, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + i), B0);
+        }
+        for (; i + 7 < width; i += 8) {
+            __m128i t0 = _mm_loadu_si128((__m128i*)(p + i + 0));
+            __m128i t1 = _mm_loadu_si128((__m128i*)(p + i + 1));
+            __m128i t2 = _mm_loadu_si128((__m128i*)(p + i + 2));
+            __m128i t3 = _mm_loadu_si128((__m128i*)(p + i + 3));
+            __m128i t4 = _mm_loadu_si128((__m128i*)(p + i + 4));
+            __m128i t5 = _mm_loadu_si128((__m128i*)(p + i + 5));
+            __m128i t6 = _mm_loadu_si128((__m128i*)(p + i + 6));
+            __m128i t7 = _mm_loadu_si128((__m128i*)(p + i + 7));
+            __m128i mc = _mm256_castsi256_si128(mCoef);
+            __m128i m0 = _mm_madd_epi16(t0, mc);
+            __m128i m1 = _mm_madd_epi16(t1, mc);
+            __m128i m2 = _mm_madd_epi16(t2, mc);
+            __m128i m3 = _mm_madd_epi16(t3, mc);
+            __m128i m4 = _mm_madd_epi16(t4, mc);
+            __m128i m5 = _mm_madd_epi16(t5, mc);
+            __m128i m6 = _mm_madd_epi16(t6, mc);
+            __m128i m7 = _mm_madd_epi16(t7, mc);
+            __m128i a0 = _mm_hadd_epi32(m0, m1);
+            __m128i a1 = _mm_hadd_epi32(m2, m3);
+            __m128i a2 = _mm_hadd_epi32(m4, m5);
+            __m128i a3 = _mm_hadd_epi32(m6, m7);
+            __m128i b0 = _mm_hadd_epi32(a0, a1);
+            __m128i b1 = _mm_hadd_epi32(a2, a3);
+            b0 = _mm_add_epi32(b0, _mm256_castsi256_si128(offset));
+            b1 = _mm_add_epi32(b1, _mm256_castsi256_si128(offset));
+            b0 = _mm_srai_epi32(b0, 6);
+            b1 = _mm_srai_epi32(b1, 6);
+            b0 = _mm_packus_epi32(b0, b1);
+            b0 = _mm_min_epu16(b0, _mm256_castsi256_si128(max_val2));
+            _mm_storeu_si128((__m128i*)(dst + i), b0);
+        }
+        for (; i < width; i++) {
+            int v = p[i]     * coeff[0] + p[i + 1] * coeff[1]
+                  + p[i + 2] * coeff[2] + p[i + 3] * coeff[3]
+                  + p[i + 4] * coeff[4] + p[i + 5] * coeff[5]
+                  + p[i + 6] * coeff[6] + p[i + 7] * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        dst += i_dst;
+        src += i_src;
+    }
+}
+
+/* 亮度 8 抽头垂直插值 (10-bit, AVX2): 每次处理 16 个像素 */
+static AVS2_MC_AVX2 void ip_filter_luma_ver_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int i, j;
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+    __m256i mAddOffset = _mm256_set1_epi32(32);
+
+    __m128i c0 = _mm_set1_epi16(*(const short*)(coeff + 0));
+    __m128i c1 = _mm_set1_epi16(*(const short*)(coeff + 2));
+    __m128i c2 = _mm_set1_epi16(*(const short*)(coeff + 4));
+    __m128i c3 = _mm_set1_epi16(*(const short*)(coeff + 6));
+    __m256i coeff00 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c0));
+    __m256i coeff01 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c1));
+    __m256i coeff02 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c2));
+    __m256i coeff03 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c3));
+
+    src -= 3 * i_src;
+
+    for (j = 0; j < height; j++) {
+        const pel_t *p = src;
+        for (i = 0; i + 15 < width; i += 16) {
+            __m256i T0, T1, T2, T3, T4, T5, T6, T7;
+            __m256i M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+            __m256i N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+            __m256i sum_lo, sum_hi;
+
+            _mm_prefetch((const char*)(p + 16 * i_src), _MM_HINT_T0);
+
+            T0 = _mm256_loadu_si256((__m256i*)(p + i));
+            T1 = _mm256_loadu_si256((__m256i*)(p + i + i_src));
+            T2 = _mm256_loadu_si256((__m256i*)(p + i + 2 * i_src));
+            T3 = _mm256_loadu_si256((__m256i*)(p + i + 3 * i_src));
+            T4 = _mm256_loadu_si256((__m256i*)(p + i + 4 * i_src));
+            T5 = _mm256_loadu_si256((__m256i*)(p + i + 5 * i_src));
+            T6 = _mm256_loadu_si256((__m256i*)(p + i + 6 * i_src));
+            T7 = _mm256_loadu_si256((__m256i*)(p + i + 7 * i_src));
+
+            M0_lo = _mm256_unpacklo_epi16(T0, T1);
+            M0_hi = _mm256_unpackhi_epi16(T0, T1);
+            M1_lo = _mm256_unpacklo_epi16(T2, T3);
+            M1_hi = _mm256_unpackhi_epi16(T2, T3);
+            M2_lo = _mm256_unpacklo_epi16(T4, T5);
+            M2_hi = _mm256_unpackhi_epi16(T4, T5);
+            M3_lo = _mm256_unpacklo_epi16(T6, T7);
+            M3_hi = _mm256_unpackhi_epi16(T6, T7);
+
+            N0_lo = _mm256_madd_epi16(M0_lo, coeff00);
+            N0_hi = _mm256_madd_epi16(M0_hi, coeff00);
+            N1_lo = _mm256_madd_epi16(M1_lo, coeff01);
+            N1_hi = _mm256_madd_epi16(M1_hi, coeff01);
+            N2_lo = _mm256_madd_epi16(M2_lo, coeff02);
+            N2_hi = _mm256_madd_epi16(M2_hi, coeff02);
+            N3_lo = _mm256_madd_epi16(M3_lo, coeff03);
+            N3_hi = _mm256_madd_epi16(M3_hi, coeff03);
+
+            sum_lo = _mm256_add_epi32(N0_lo, N1_lo);
+            sum_lo = _mm256_add_epi32(sum_lo, N2_lo);
+            sum_lo = _mm256_add_epi32(sum_lo, N3_lo);
+
+            sum_hi = _mm256_add_epi32(N0_hi, N1_hi);
+            sum_hi = _mm256_add_epi32(sum_hi, N2_hi);
+            sum_hi = _mm256_add_epi32(sum_hi, N3_hi);
+
+            sum_lo = _mm256_add_epi32(sum_lo, mAddOffset);
+            sum_hi = _mm256_add_epi32(sum_hi, mAddOffset);
+            sum_lo = _mm256_srai_epi32(sum_lo, 6);
+            sum_hi = _mm256_srai_epi32(sum_hi, 6);
+
+            sum_lo = _mm256_packus_epi32(sum_lo, sum_hi);
+            sum_lo = _mm256_min_epu16(sum_lo, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + i), sum_lo);
+        }
+        for (; i + 7 < width; i += 8) {
+            __m128i t0 = _mm_loadu_si128((__m128i*)(p + i));
+            __m128i t1 = _mm_loadu_si128((__m128i*)(p + i + i_src));
+            __m128i t2 = _mm_loadu_si128((__m128i*)(p + i + 2 * i_src));
+            __m128i t3 = _mm_loadu_si128((__m128i*)(p + i + 3 * i_src));
+            __m128i t4 = _mm_loadu_si128((__m128i*)(p + i + 4 * i_src));
+            __m128i t5 = _mm_loadu_si128((__m128i*)(p + i + 5 * i_src));
+            __m128i t6 = _mm_loadu_si128((__m128i*)(p + i + 6 * i_src));
+            __m128i t7 = _mm_loadu_si128((__m128i*)(p + i + 7 * i_src));
+            __m128i m0l = _mm_unpacklo_epi16(t0, t1);
+            __m128i m0h = _mm_unpackhi_epi16(t0, t1);
+            __m128i m1l = _mm_unpacklo_epi16(t2, t3);
+            __m128i m1h = _mm_unpackhi_epi16(t2, t3);
+            __m128i m2l = _mm_unpacklo_epi16(t4, t5);
+            __m128i m2h = _mm_unpackhi_epi16(t4, t5);
+            __m128i m3l = _mm_unpacklo_epi16(t6, t7);
+            __m128i m3h = _mm_unpackhi_epi16(t6, t7);
+            __m128i n0l = _mm_madd_epi16(m0l, _mm256_castsi256_si128(coeff00));
+            __m128i n0h = _mm_madd_epi16(m0h, _mm256_castsi256_si128(coeff00));
+            __m128i n1l = _mm_madd_epi16(m1l, _mm256_castsi256_si128(coeff01));
+            __m128i n1h = _mm_madd_epi16(m1h, _mm256_castsi256_si128(coeff01));
+            __m128i n2l = _mm_madd_epi16(m2l, _mm256_castsi256_si128(coeff02));
+            __m128i n2h = _mm_madd_epi16(m2h, _mm256_castsi256_si128(coeff02));
+            __m128i n3l = _mm_madd_epi16(m3l, _mm256_castsi256_si128(coeff03));
+            __m128i n3h = _mm_madd_epi16(m3h, _mm256_castsi256_si128(coeff03));
+            __m128i sl = _mm_add_epi32(_mm_add_epi32(n0l, n1l),
+                                       _mm_add_epi32(n2l, n3l));
+            __m128i sh = _mm_add_epi32(_mm_add_epi32(n0h, n1h),
+                                       _mm_add_epi32(n2h, n3h));
+            sl = _mm_add_epi32(sl, _mm256_castsi256_si128(mAddOffset));
+            sh = _mm_add_epi32(sh, _mm256_castsi256_si128(mAddOffset));
+            sl = _mm_srai_epi32(sl, 6);
+            sh = _mm_srai_epi32(sh, 6);
+            sl = _mm_packus_epi32(sl, sh);
+            sl = _mm_min_epu16(sl, _mm256_castsi256_si128(max_val2));
+            _mm_storeu_si128((__m128i*)(dst + i), sl);
+        }
+        for (; i < width; i++) {
+            int v = src[i]              * coeff[0]
+                  + src[i + i_src]      * coeff[1]
+                  + src[i + 2 * i_src]  * coeff[2]
+                  + src[i + 3 * i_src]  * coeff[3]
+                  + src[i + 4 * i_src]  * coeff[4]
+                  + src[i + 5 * i_src]  * coeff[5]
+                  + src[i + 6 * i_src]  * coeff[6]
+                  + src[i + 7 * i_src]  * coeff[7];
+            v = (v + 32) >> 6;
+            dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 色度 4 抽头水平插值 (10-bit, AVX2): 每次处理 16 个输出
+ * 与 SSE4.1 版同构的滑窗 shuffle 方案, 每组需要两处加载 (p+col 与 p+col+4) */
+static AVS2_MC_AVX2 void ip_filter_chroma_hor_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+
+    __m256i mCoef = _mm256_broadcastsi128_si256(
+                        _mm_cvtepi8_epi16(_mm_set1_epi32(*(const int32_t*)coeff)));
+    __m256i mSwitch1 = _mm256_setr_epi8(
+        0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6, 7, 8, 9,
+        0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6, 7, 8, 9);
+    __m256i mSwitch2 = _mm256_setr_epi8(
+        4, 5, 6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11, 12, 13,
+        4, 5, 6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11, 12, 13);
+    __m256i mAddOffset = _mm256_set1_epi32(offset_val);
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+
+    src -= 1;
+
+    for (row = 0; row < height; row++) {
+        const pel_t *p = src;
+        if (row + 8 < height)
+            _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
+        for (col = 0; col + 15 < width; col += 16) {
+            __m256i s, s1, s2, s3, s4;
+            __m256i m1, m2, m3, m4, sum_lo, sum_hi;
+
+            /* 低 128 lane 产出输出 0..3 与 8..11 */
+            s = _mm256_loadu_si256((__m256i*)(p + col));
+            s1 = _mm256_shuffle_epi8(s, mSwitch1);
+            s2 = _mm256_shuffle_epi8(s, mSwitch2);
+            m1 = _mm256_madd_epi16(s1, mCoef);
+            m2 = _mm256_madd_epi16(s2, mCoef);
+            sum_lo = _mm256_hadd_epi32(m1, m2);
+
+            /* 高 128 lane 产出输出 4..7 与 12..15 */
+            s3 = _mm256_loadu_si256((__m256i*)(p + col + 4));
+            s3 = _mm256_shuffle_epi8(s3, mSwitch1);
+            s4 = _mm256_loadu_si256((__m256i*)(p + col + 4));
+            s4 = _mm256_shuffle_epi8(s4, mSwitch2);
+            m3 = _mm256_madd_epi16(s3, mCoef);
+            m4 = _mm256_madd_epi16(s4, mCoef);
+            sum_hi = _mm256_hadd_epi32(m3, m4);
+
+            sum_lo = _mm256_add_epi32(sum_lo, mAddOffset);
+            sum_hi = _mm256_add_epi32(sum_hi, mAddOffset);
+            sum_lo = _mm256_srai_epi32(sum_lo, shift);
+            sum_hi = _mm256_srai_epi32(sum_hi, shift);
+            sum_lo = _mm256_packus_epi32(sum_lo, sum_hi);
+            sum_lo = _mm256_min_epu16(sum_lo, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + col), sum_lo);
+        }
+        for (; col + 7 < width; col += 8) {
+            __m128i s = _mm_loadu_si128((__m128i*)(p + col));
+            __m128i s1 = _mm_shuffle_epi8(s, _mm256_castsi256_si128(mSwitch1));
+            __m128i s2 = _mm_shuffle_epi8(s, _mm256_castsi256_si128(mSwitch2));
+            __m128i m1 = _mm_madd_epi16(s1, _mm256_castsi256_si128(mCoef));
+            __m128i m2 = _mm_madd_epi16(s2, _mm256_castsi256_si128(mCoef));
+            __m128i sl = _mm_hadd_epi32(m1, m2);
+            __m128i s3 = _mm_loadu_si128((__m128i*)(p + col + 4));
+            s3 = _mm_shuffle_epi8(s3, _mm256_castsi256_si128(mSwitch1));
+            __m128i s4 = _mm_loadu_si128((__m128i*)(p + col + 4));
+            s4 = _mm_shuffle_epi8(s4, _mm256_castsi256_si128(mSwitch2));
+            __m128i m3 = _mm_madd_epi16(s3, _mm256_castsi256_si128(mCoef));
+            __m128i m4 = _mm_madd_epi16(s4, _mm256_castsi256_si128(mCoef));
+            __m128i sh = _mm_hadd_epi32(m3, m4);
+            sl = _mm_add_epi32(sl, _mm256_castsi256_si128(mAddOffset));
+            sh = _mm_add_epi32(sh, _mm256_castsi256_si128(mAddOffset));
+            sl = _mm_srai_epi32(sl, shift);
+            sh = _mm_srai_epi32(sh, shift);
+            sl = _mm_packus_epi32(sl, sh);
+            sl = _mm_min_epu16(sl, _mm256_castsi256_si128(max_val2));
+            _mm_storeu_si128((__m128i*)(dst + col), sl);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coeff[0] + src[col + 1] * coeff[1]
+                  + src[col + 2] * coeff[2] + src[col + 3] * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 色度 4 抽头垂直插值 (10-bit, AVX2): 每次处理 16 个像素 */
+static AVS2_MC_AVX2 void ip_filter_chroma_ver_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height, const int8_t *coeff, int max_val)
+{
+    int row, col;
+    const int offset_val = 32;
+    const int shift = 6;
+    __m256i mAddOffset = _mm256_set1_epi32(offset_val);
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+    const int i_src2 = i_src * 2;
+    const int i_src3 = i_src * 3;
+
+    __m128i c0 = _mm_set1_epi16(*(const short*)(coeff + 0));
+    __m128i c1 = _mm_set1_epi16(*(const short*)(coeff + 2));
+    __m256i coeff0 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c0));
+    __m256i coeff1 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(c1));
+
+    src -= i_src;
+
+    for (row = 0; row < height; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 15 < width; col += 16) {
+            __m256i S0, S1, S2, S3;
+            __m256i T0_lo, T0_hi, T1_lo, T1_hi;
+            __m256i N0_lo, N0_hi, N1_lo, N1_hi;
+            __m256i sum_lo, sum_hi;
+
+            _mm_prefetch((const char*)(p + col + 12 * i_src), _MM_HINT_T0);
+
+            S0 = _mm256_loadu_si256((__m256i*)(p + col));
+            S1 = _mm256_loadu_si256((__m256i*)(p + col + i_src));
+            S2 = _mm256_loadu_si256((__m256i*)(p + col + i_src2));
+            S3 = _mm256_loadu_si256((__m256i*)(p + col + i_src3));
+
+            T0_lo = _mm256_unpacklo_epi16(S0, S1);
+            T0_hi = _mm256_unpackhi_epi16(S0, S1);
+            T1_lo = _mm256_unpacklo_epi16(S2, S3);
+            T1_hi = _mm256_unpackhi_epi16(S2, S3);
+
+            N0_lo = _mm256_madd_epi16(T0_lo, coeff0);
+            N0_hi = _mm256_madd_epi16(T0_hi, coeff0);
+            N1_lo = _mm256_madd_epi16(T1_lo, coeff1);
+            N1_hi = _mm256_madd_epi16(T1_hi, coeff1);
+
+            sum_lo = _mm256_add_epi32(N0_lo, N1_lo);
+            sum_hi = _mm256_add_epi32(N0_hi, N1_hi);
+
+            sum_lo = _mm256_add_epi32(sum_lo, mAddOffset);
+            sum_hi = _mm256_add_epi32(sum_hi, mAddOffset);
+            sum_lo = _mm256_srai_epi32(sum_lo, shift);
+            sum_hi = _mm256_srai_epi32(sum_hi, shift);
+            sum_lo = _mm256_packus_epi32(sum_lo, sum_hi);
+            sum_lo = _mm256_min_epu16(sum_lo, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + col), sum_lo);
+        }
+        for (; col + 7 < width; col += 8) {
+            __m128i s0 = _mm_loadu_si128((__m128i*)(p + col));
+            __m128i s1 = _mm_loadu_si128((__m128i*)(p + col + i_src));
+            __m128i s2 = _mm_loadu_si128((__m128i*)(p + col + i_src2));
+            __m128i s3 = _mm_loadu_si128((__m128i*)(p + col + i_src3));
+            __m128i t0l = _mm_unpacklo_epi16(s0, s1);
+            __m128i t0h = _mm_unpackhi_epi16(s0, s1);
+            __m128i t1l = _mm_unpacklo_epi16(s2, s3);
+            __m128i t1h = _mm_unpackhi_epi16(s2, s3);
+            __m128i n0l = _mm_madd_epi16(t0l, _mm256_castsi256_si128(coeff0));
+            __m128i n0h = _mm_madd_epi16(t0h, _mm256_castsi256_si128(coeff0));
+            __m128i n1l = _mm_madd_epi16(t1l, _mm256_castsi256_si128(coeff1));
+            __m128i n1h = _mm_madd_epi16(t1h, _mm256_castsi256_si128(coeff1));
+            __m128i sl = _mm_add_epi32(n0l, n1l);
+            __m128i sh = _mm_add_epi32(n0h, n1h);
+            sl = _mm_add_epi32(sl, _mm256_castsi256_si128(mAddOffset));
+            sh = _mm_add_epi32(sh, _mm256_castsi256_si128(mAddOffset));
+            sl = _mm_srai_epi32(sl, shift);
+            sh = _mm_srai_epi32(sh, shift);
+            sl = _mm_packus_epi32(sl, sh);
+            sl = _mm_min_epu16(sl, _mm256_castsi256_si128(max_val2));
+            _mm_storeu_si128((__m128i*)(dst + col), sl);
+        }
+        for (; col < width; col++) {
+            int v = src[col]             * coeff[0]
+                  + src[col + i_src]     * coeff[1]
+                  + src[col + i_src2]    * coeff[2]
+                  + src[col + i_src3]    * coeff[3];
+            v = (v + offset_val) >> shift;
+            dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        src += i_src;
+        dst += i_dst;
+    }
+}
+
+/* 色度 4 抽头双向插值 (10-bit, AVX2): 两级滤波, 每级 16 像素/迭代 */
+static AVS2_MC_AVX2 void ip_filter_chroma_ext_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN32(short tmp_res[(32 + 3) * 32]);
+    short *tmp = tmp_res;
+    const int i_tmp = 32;
+    const int shift1 = 2;
+    const int shift2 = 10;
+    const int add1 = (1 << shift1) >> 1;
+    const int add2 = 1 << (shift2 - 1);
+    int row, col;
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+    __m256i mCoef = _mm256_broadcastsi128_si256(
+                        _mm_cvtepi8_epi16(_mm_set1_epi32(*(const int32_t*)coef_x)));
+    __m256i mSwitch1 = _mm256_setr_epi8(
+        0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6, 7, 8, 9,
+        0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6, 7, 8, 9);
+    __m256i mSwitch2 = _mm256_setr_epi8(
+        4, 5, 6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11, 12, 13,
+        4, 5, 6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11, 12, 13);
+    __m128i cy0, cy1;
+    __m256i coeffy0, coeffy1;
+
+    /* ---- 第一级: 水平滤波 (shift1=2) ---- */
+    __m256i mAddOffset = _mm256_set1_epi32(add1);
+    src = src - i_src - 1;
+
+    for (row = -1; row < height + 2; row++) {
+        const pel_t *p = src;
+        for (col = 0; col + 15 < width; col += 16) {
+            __m256i s, s1, s2, s3, s4;
+            __m256i m1, m2, m3, m4, sum_lo, sum_hi;
+
+            s = _mm256_loadu_si256((__m256i*)(p + col));
+            s1 = _mm256_shuffle_epi8(s, mSwitch1);
+            s2 = _mm256_shuffle_epi8(s, mSwitch2);
+            m1 = _mm256_madd_epi16(s1, mCoef);
+            m2 = _mm256_madd_epi16(s2, mCoef);
+            sum_lo = _mm256_hadd_epi32(m1, m2);
+
+            s3 = _mm256_loadu_si256((__m256i*)(p + col + 4));
+            s3 = _mm256_shuffle_epi8(s3, mSwitch1);
+            s4 = _mm256_loadu_si256((__m256i*)(p + col + 4));
+            s4 = _mm256_shuffle_epi8(s4, mSwitch2);
+            m3 = _mm256_madd_epi16(s3, mCoef);
+            m4 = _mm256_madd_epi16(s4, mCoef);
+            sum_hi = _mm256_hadd_epi32(m3, m4);
+
+            sum_lo = _mm256_add_epi32(sum_lo, mAddOffset);
+            sum_hi = _mm256_add_epi32(sum_hi, mAddOffset);
+            sum_lo = _mm256_srai_epi32(sum_lo, shift1);
+            sum_hi = _mm256_srai_epi32(sum_hi, shift1);
+            sum_lo = _mm256_packs_epi32(sum_lo, sum_hi);
+            _mm256_store_si256((__m256i*)(tmp + col), sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = src[col]     * coef_x[0] + src[col + 1] * coef_x[1]
+                  + src[col + 2] * coef_x[2] + src[col + 3] * coef_x[3];
+            v = (v + add1) >> shift1;
+            tmp[col] = (short)v;
+        }
+        src += i_src;
+        tmp += i_tmp;
+    }
+
+    /* ---- 第二级: 垂直滤波 (shift2=10) ---- */
+    tmp = tmp_res;
+    mAddOffset = _mm256_set1_epi32(add2);
+    cy0 = _mm_set1_epi16(*(const short*)(coef_y + 0));
+    cy1 = _mm_set1_epi16(*(const short*)(coef_y + 2));
+    coeffy0 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(cy0));
+    coeffy1 = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(cy1));
+
+    for (row = 0; row < height; row++) {
+        const short *p = tmp;
+        for (col = 0; col + 15 < width; col += 16) {
+            __m256i S0, S1, S2, S3;
+            __m256i T0_lo, T0_hi, T1_lo, T1_hi;
+            __m256i N0_lo, N0_hi, N1_lo, N1_hi;
+            __m256i sum_lo, sum_hi;
+
+            S0 = _mm256_load_si256((__m256i*)(p + col));
+            S1 = _mm256_load_si256((__m256i*)(p + col + i_tmp));
+            S2 = _mm256_load_si256((__m256i*)(p + col + 2 * i_tmp));
+            S3 = _mm256_load_si256((__m256i*)(p + col + 3 * i_tmp));
+
+            T0_lo = _mm256_unpacklo_epi16(S0, S1);
+            T0_hi = _mm256_unpackhi_epi16(S0, S1);
+            T1_lo = _mm256_unpacklo_epi16(S2, S3);
+            T1_hi = _mm256_unpackhi_epi16(S2, S3);
+
+            N0_lo = _mm256_madd_epi16(T0_lo, coeffy0);
+            N0_hi = _mm256_madd_epi16(T0_hi, coeffy0);
+            N1_lo = _mm256_madd_epi16(T1_lo, coeffy1);
+            N1_hi = _mm256_madd_epi16(T1_hi, coeffy1);
+
+            sum_lo = _mm256_add_epi32(N0_lo, N1_lo);
+            sum_hi = _mm256_add_epi32(N0_hi, N1_hi);
+
+            sum_lo = _mm256_add_epi32(sum_lo, mAddOffset);
+            sum_hi = _mm256_add_epi32(sum_hi, mAddOffset);
+            sum_lo = _mm256_srai_epi32(sum_lo, shift2);
+            sum_hi = _mm256_srai_epi32(sum_hi, shift2);
+            sum_lo = _mm256_packus_epi32(sum_lo, sum_hi);
+            sum_lo = _mm256_min_epu16(sum_lo, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + col), sum_lo);
+        }
+        for (; col < width; col++) {
+            int v = tmp[col]            * coef_y[0]
+                  + tmp[col + i_tmp]    * coef_y[1]
+                  + tmp[col + 2 * i_tmp] * coef_y[2]
+                  + tmp[col + 3 * i_tmp] * coef_y[3];
+            v = (v + add2) >> shift2;
+            dst[col] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        dst += i_dst;
+        tmp += i_tmp;
+    }
+}
+
+/* 亮度 8 抽头双向插值 (10-bit, AVX2): 两级滤波, 每级 16 像素/迭代 */
+static AVS2_MC_AVX2 void ip_filter_luma_ext_10bit_avx2(
+        pel_t *dst, int i_dst, const pel_t *src, int i_src,
+        int width, int height,
+        const int8_t *coef_x, const int8_t *coef_y, int max_val)
+{
+    AVS2_ALIGN32(short tmp_res[(64 + 7) * 64]);
+    short *tmp = tmp_res;
+    const int i_tmp = MC_TMP_STRIDE;
+    const int shift1 = 2;
+    const int shift2 = 10;
+    const int add1 = (1 << shift1) >> 1;
+    const int add2 = 1 << (shift2 - 1);
+    int i, j;
+    __m256i offset;
+    __m256i max_val2 = _mm256_set1_epi16((short)max_val);
+    __m256i mCoef = _mm256_broadcastsi128_si256(
+                        _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i*)coef_x)));
+    __m256i c0, c1, c2, c3, coeff00, coeff01, coeff02, coeff03;
+
+    /* ---- 第一级: 水平滤波 (shift1=2) ---- */
+    src += -3 * i_src - 3;
+    offset = _mm256_set1_epi32(add1);
+
+    for (j = -3; j < height + 4; j++) {
+        const pel_t *p = src;
+        if (j + 8 < height + 4)
+            _mm_prefetch((const char*)(src + 8 * i_src), _MM_HINT_T0);
+        for (i = 0; i + 15 < width; i += 16) {
+            __m256i T0, T1, T2, T3, T4, T5, T6, T7;
+            __m256i M0, M1, M2, M3, M4, M5, M6, M7;
+            __m256i A0, A1, A2, A3, B0, B1;
+
+            T0 = _mm256_loadu_si256((__m256i*)(p + i + 0));
+            T1 = _mm256_loadu_si256((__m256i*)(p + i + 1));
+            T2 = _mm256_loadu_si256((__m256i*)(p + i + 2));
+            T3 = _mm256_loadu_si256((__m256i*)(p + i + 3));
+            T4 = _mm256_loadu_si256((__m256i*)(p + i + 4));
+            T5 = _mm256_loadu_si256((__m256i*)(p + i + 5));
+            T6 = _mm256_loadu_si256((__m256i*)(p + i + 6));
+            T7 = _mm256_loadu_si256((__m256i*)(p + i + 7));
+
+            M0 = _mm256_madd_epi16(T0, mCoef);
+            M1 = _mm256_madd_epi16(T1, mCoef);
+            M2 = _mm256_madd_epi16(T2, mCoef);
+            M3 = _mm256_madd_epi16(T3, mCoef);
+            M4 = _mm256_madd_epi16(T4, mCoef);
+            M5 = _mm256_madd_epi16(T5, mCoef);
+            M6 = _mm256_madd_epi16(T6, mCoef);
+            M7 = _mm256_madd_epi16(T7, mCoef);
+
+            A0 = _mm256_hadd_epi32(M0, M1);
+            A1 = _mm256_hadd_epi32(M2, M3);
+            A2 = _mm256_hadd_epi32(M4, M5);
+            A3 = _mm256_hadd_epi32(M6, M7);
+
+            B0 = _mm256_hadd_epi32(A0, A1);
+            B1 = _mm256_hadd_epi32(A2, A3);
+
+            B0 = _mm256_add_epi32(B0, offset);
+            B1 = _mm256_add_epi32(B1, offset);
+            B0 = _mm256_srai_epi32(B0, shift1);
+            B1 = _mm256_srai_epi32(B1, shift1);
+            B0 = _mm256_packs_epi32(B0, B1);
+            _mm256_store_si256((__m256i*)(tmp + i), B0);
+        }
+        for (; i < width; i++) {
+            int v = p[i]     * coef_x[0] + p[i + 1] * coef_x[1]
+                  + p[i + 2] * coef_x[2] + p[i + 3] * coef_x[3]
+                  + p[i + 4] * coef_x[4] + p[i + 5] * coef_x[5]
+                  + p[i + 6] * coef_x[6] + p[i + 7] * coef_x[7];
+            v = (v + add1) >> shift1;
+            tmp[i] = (short)v;
+        }
+        tmp += i_tmp;
+        src += i_src;
+    }
+
+    /* ---- 第二级: 垂直滤波 (shift2=10) ---- */
+    offset = _mm256_set1_epi32(add2);
+    tmp = tmp_res;
+
+    c0 = _mm256_set1_epi16(*(const short*)(coef_y + 0));
+    c1 = _mm256_set1_epi16(*(const short*)(coef_y + 2));
+    c2 = _mm256_set1_epi16(*(const short*)(coef_y + 4));
+    c3 = _mm256_set1_epi16(*(const short*)(coef_y + 6));
+    coeff00 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(c0));
+    coeff01 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(c1));
+    coeff02 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(c2));
+    coeff03 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(c3));
+
+    for (j = 0; j < height; j++) {
+        const short *p = tmp;
+        for (i = 0; i + 15 < width; i += 16) {
+            __m256i T0, T1, T2, T3, T4, T5, T6, T7;
+            __m256i M0_lo, M0_hi, M1_lo, M1_hi, M2_lo, M2_hi, M3_lo, M3_hi;
+            __m256i N0_lo, N0_hi, N1_lo, N1_hi, N2_lo, N2_hi, N3_lo, N3_hi;
+            __m256i sum_lo, sum_hi;
+
+            T0 = _mm256_load_si256((__m256i*)(p + i));
+            T1 = _mm256_load_si256((__m256i*)(p + i + i_tmp));
+            T2 = _mm256_load_si256((__m256i*)(p + i + 2 * i_tmp));
+            T3 = _mm256_load_si256((__m256i*)(p + i + 3 * i_tmp));
+            T4 = _mm256_load_si256((__m256i*)(p + i + 4 * i_tmp));
+            T5 = _mm256_load_si256((__m256i*)(p + i + 5 * i_tmp));
+            T6 = _mm256_load_si256((__m256i*)(p + i + 6 * i_tmp));
+            T7 = _mm256_load_si256((__m256i*)(p + i + 7 * i_tmp));
+
+            M0_lo = _mm256_unpacklo_epi16(T0, T1);
+            M0_hi = _mm256_unpackhi_epi16(T0, T1);
+            M1_lo = _mm256_unpacklo_epi16(T2, T3);
+            M1_hi = _mm256_unpackhi_epi16(T2, T3);
+            M2_lo = _mm256_unpacklo_epi16(T4, T5);
+            M2_hi = _mm256_unpackhi_epi16(T4, T5);
+            M3_lo = _mm256_unpacklo_epi16(T6, T7);
+            M3_hi = _mm256_unpackhi_epi16(T6, T7);
+
+            N0_lo = _mm256_madd_epi16(M0_lo, coeff00);
+            N0_hi = _mm256_madd_epi16(M0_hi, coeff00);
+            N1_lo = _mm256_madd_epi16(M1_lo, coeff01);
+            N1_hi = _mm256_madd_epi16(M1_hi, coeff01);
+            N2_lo = _mm256_madd_epi16(M2_lo, coeff02);
+            N2_hi = _mm256_madd_epi16(M2_hi, coeff02);
+            N3_lo = _mm256_madd_epi16(M3_lo, coeff03);
+            N3_hi = _mm256_madd_epi16(M3_hi, coeff03);
+
+            sum_lo = _mm256_add_epi32(N0_lo, N1_lo);
+            sum_lo = _mm256_add_epi32(sum_lo, N2_lo);
+            sum_lo = _mm256_add_epi32(sum_lo, N3_lo);
+
+            sum_hi = _mm256_add_epi32(N0_hi, N1_hi);
+            sum_hi = _mm256_add_epi32(sum_hi, N2_hi);
+            sum_hi = _mm256_add_epi32(sum_hi, N3_hi);
+
+            sum_lo = _mm256_add_epi32(sum_lo, offset);
+            sum_hi = _mm256_add_epi32(sum_hi, offset);
+            sum_lo = _mm256_srai_epi32(sum_lo, shift2);
+            sum_hi = _mm256_srai_epi32(sum_hi, shift2);
+
+            sum_lo = _mm256_packus_epi32(sum_lo, sum_hi);
+            sum_lo = _mm256_min_epu16(sum_lo, max_val2);
+            _mm256_storeu_si256((__m256i*)(dst + i), sum_lo);
+        }
+        for (; i < width; i++) {
+            int v = tmp[i]              * coef_y[0]
+                  + tmp[i + i_tmp]      * coef_y[1]
+                  + tmp[i + 2 * i_tmp]  * coef_y[2]
+                  + tmp[i + 3 * i_tmp]  * coef_y[3]
+                  + tmp[i + 4 * i_tmp]  * coef_y[4]
+                  + tmp[i + 5 * i_tmp]  * coef_y[5]
+                  + tmp[i + 6 * i_tmp]  * coef_y[6]
+                  + tmp[i + 7 * i_tmp]  * coef_y[7];
+            v = (v + add2) >> shift2;
+            dst[i] = (pel_t)(v < 0 ? 0 : (v > max_val ? max_val : v));
+        }
+        dst += i_dst;
+        tmp += i_tmp;
+    }
+}
+
+/* ---- AVX2 MC 入口: 10-bit 用 AVX2 内核, 8-bit 委托 SSE4.1 ---- */
+static AVS2_MC_AVX2 void mc_luma_avx2(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                                      ptrdiff_t dstride, int w, int h, int mx, int my,
+                                      int bit_depth)
+{
+    if (bit_depth <= 8) {
+        mc_luma_sse4(src, sstride, dst, dstride, w, h, mx, my, bit_depth);
+        return;
+    }
+    {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t*)(void *)dst;
+        const pel_t *src16 = (const pel_t*)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_copy_10bit_avx2(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_luma_ver_10bit_avx2(dst16, i_dst, src16, i_src,
+                                          w, h, avs2_intpl_filters[dy], max_val);
+        } else if (dy == 0) {
+            ip_filter_luma_hor_10bit_avx2(dst16, i_dst, src16, i_src,
+                                          w, h, avs2_intpl_filters[dx], max_val);
+        } else {
+            ip_filter_luma_ext_10bit_avx2(dst16, i_dst, src16, i_src,
+                                          w, h,
+                                          avs2_intpl_filters[dx],
+                                          avs2_intpl_filters[dy], max_val);
+        }
+    }
+}
+
+static AVS2_MC_AVX2 void mc_chroma_avx2(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                                        ptrdiff_t dstride, int w, int h, int mx, int my,
+                                        int bit_depth)
+{
+    if (bit_depth <= 8) {
+        mc_chroma_sse4(src, sstride, dst, dstride, w, h, mx, my, bit_depth);
+        return;
+    }
+    {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t*)(void *)dst;
+        const pel_t *src16 = (const pel_t*)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_copy_10bit_avx2(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            ip_filter_chroma_ver_10bit_avx2(dst16, i_dst, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dy], max_val);
+        } else if (dy == 0) {
+            ip_filter_chroma_hor_10bit_avx2(dst16, i_dst, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dx], max_val);
+        } else {
+            ip_filter_chroma_ext_10bit_avx2(dst16, i_dst, src16, i_src,
+                                            w, h,
+                                            avs2_intpl_filters_c[dx],
+                                            avs2_intpl_filters_c[dy], max_val);
+        }
+    }
+}
+
+static AVS2_MC_AVX2 void mc_luma_avg_avx2(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                                          ptrdiff_t dstride, int w, int h, int mx, int my,
+                                          int bit_depth)
+{
+    if (bit_depth <= 8) {
+        mc_luma_avg_sse4(src, sstride, dst, dstride, w, h, mx, my, bit_depth);
+        return;
+    }
+    {
+        int dx = mx & 3;
+        int dy = my & 3;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t *)(void *)dst;
+        const pel_t *src16 = (const pel_t *)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_avg_10bit_avx2(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN32(short pred2[64 * 64]);
+            ip_filter_luma_ver_10bit_avx2((pel_t *)pred2, w, src16, i_src,
+                                          w, h, avs2_intpl_filters[dy], max_val);
+            block_avg_10bit_avx2(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN32(short pred2[64 * 64]);
+            ip_filter_luma_hor_10bit_avx2((pel_t *)pred2, w, src16, i_src,
+                                          w, h, avs2_intpl_filters[dx], max_val);
+            block_avg_10bit_avx2(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else {
+            ip_filter_luma_ext_10bit_avg_sse4(dst16, i_dst, src16, i_src,
+                                              w, h,
+                                              avs2_intpl_filters[dx],
+                                              avs2_intpl_filters[dy], max_val);
+        }
+    }
+}
+
+static AVS2_MC_AVX2 void mc_chroma_avg_avx2(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
+                                            ptrdiff_t dstride, int w, int h, int mx, int my,
+                                            int bit_depth)
+{
+    if (bit_depth <= 8) {
+        mc_chroma_avg_sse4(src, sstride, dst, dstride, w, h, mx, my, bit_depth);
+        return;
+    }
+    {
+        int dx = mx & 7;
+        int dy = my & 7;
+        int max_val = (1 << bit_depth) - 1;
+        pel_t *dst16 = (pel_t *)(void *)dst;
+        const pel_t *src16 = (const pel_t *)(const void *)src;
+        int i_dst = (int)(dstride >> 1);
+        int i_src = (int)(sstride >> 1);
+
+        if (dx == 0 && dy == 0) {
+            block_avg_10bit_avx2(dst16, i_dst, src16, i_src, w, h);
+        } else if (dx == 0) {
+            AVS2_ALIGN32(short pred2[32 * 32]);
+            ip_filter_chroma_ver_10bit_avx2((pel_t *)pred2, w, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dy], max_val);
+            block_avg_10bit_avx2(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else if (dy == 0) {
+            AVS2_ALIGN32(short pred2[32 * 32]);
+            ip_filter_chroma_hor_10bit_avx2((pel_t *)pred2, w, src16, i_src,
+                                            w, h, avs2_intpl_filters_c[dx], max_val);
+            block_avg_10bit_avx2(dst16, i_dst, (const pel_t *)pred2, w, w, h);
+        } else {
+            ip_filter_chroma_ext_10bit_avg_sse4(dst16, i_dst, src16, i_src,
+                                                w, h,
+                                                avs2_intpl_filters_c[dx],
+                                                avs2_intpl_filters_c[dy], max_val);
+        }
+    }
+}
+
+#endif /* AVS2_MC_HAVE_AVX2 */
+
+/* ===========================================================================
+ * 第十三部分: DSP 初始化
  * =========================================================================== */
 
 void avs2_mc_init_sse41(const avs2_cpu_flags *flags)
@@ -1919,6 +2854,13 @@ void avs2_mc_init_sse41(const avs2_cpu_flags *flags)
 void avs2_mc_init_avx2(const avs2_cpu_flags *flags)
 {
     (void)flags;
+#if AVS2_MC_HAVE_AVX2
+    /* 10-bit 路径使用 AVX2 内核; 8-bit 与未覆盖路径内部委托 SSE4.1 */
+    avs2_dsp_table.mc_luma       = mc_luma_avx2;
+    avs2_dsp_table.mc_chroma     = mc_chroma_avx2;
+    avs2_dsp_table.mc_luma_avg   = mc_luma_avg_avx2;
+    avs2_dsp_table.mc_chroma_avg = mc_chroma_avg_avx2;
+#endif
 }
 
 void avs2_mc_init_avx512(const avs2_cpu_flags *flags)

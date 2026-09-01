@@ -316,8 +316,11 @@ struct avs2_internal {
     avs2_pic_header *pic;
     avs2_rps sps_rps[AVS2_MAX_RPS]; /* RPS table from sequence header */
 
-    uint16_t aec_tab_ctx_mps[4 * 2048];
-    uint16_t aec_tab_ctx_lps[4 * 2048];
+    /* AEC 概率转移表 (交错布局): 索引 = cycno | (lg_pmps << 2), lg_pmps∈[0,1023].
+     * 低 16 位 = MPS 转移结果, 高 16 位 = LPS 转移结果.
+     * 交错保证同一状态的 MPS/LPS 转移结果共处一条 cache line,
+     * 总大小 16KB (原两张 16KB 分离表减半, L1 命中率更优). */
+    uint32_t aec_tab_ctx[4 * 1024];
 
     /* frame contexts */
     avs2_frame_ctx *fc;
@@ -450,7 +453,7 @@ void avs2_set_thread_scratch(int16_t *y, int16_t *u, int16_t *v);
 
 /* AEC (aec.c) */
 typedef struct avs2_aec avs2_aec;
-avs2_aec *avs2_aec_create(const uint16_t *aec_tab_ctx_mps, const uint16_t *aec_tab_ctx_lps);
+avs2_aec *avs2_aec_create(const uint32_t *aec_tab_ctx);
 void avs2_aec_destroy(avs2_aec *aec);
 void avs2_aec_init_contexts(avs2_aec *aec, int slice_type);
 int  avs2_aec_start_decoding(avs2_aec *aec, const uint8_t *buf, int sz, int bit_pos);

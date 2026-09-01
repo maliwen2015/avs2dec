@@ -1099,6 +1099,9 @@ static int get_pu_type_for_mvp(int bsx, int bsy, int cu_pix_x, int cu_pix_y)
 static int find_pu_index(avs2_cu *cu, int rel_x, int rel_y)
 {
     int i;
+    /* 快路径: 单 PU (2Nx2N, 最常见) 无需查找 */
+    if (cu->num_pu <= 1)
+        return 0;
     for (i = 0; i < cu->num_pu; i++) {
         if (rel_x >= cu->pu_x[i] && rel_x < cu->pu_x[i] + cu->pu_w[i] &&
             rel_y >= cu->pu_y[i] && rel_y < cu->pu_y[i] + cu->pu_h[i]) {
