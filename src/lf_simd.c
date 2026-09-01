@@ -1282,14 +1282,23 @@ restore_simd_ch:
  * 注册函数
  * =========================================================================== */
 
-/* SSE4.1: 注册亮度+色度去块滤波 */
+/* SSE4.1: 注册亮度+色度去块滤波
+ * 优化: 验证模式 (AVS2_LF_VERIFY) 在注册时一次性判定,
+ * 生产路径直连 SIMD 实现, 去除每次调用的包装跳转与分支. */
 void avs2_lf_init_sse41(const avs2_cpu_flags *flags)
 {
     (void)flags;
-    avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_verify;
-    avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_verify;
-    avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_verify;
-    avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_verify;
+    if (lf_verify_enabled()) {
+        avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_verify;
+        avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_verify;
+        avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_verify;
+        avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_verify;
+    } else {
+        avs2_dsp_table.deblock_luma[EDGE_VER]   = deblock_luma_ver_sse4;
+        avs2_dsp_table.deblock_luma[EDGE_HOR]   = deblock_luma_hor_sse4;
+        avs2_dsp_table.deblock_chroma[EDGE_VER] = deblock_chroma_ver_sse4;
+        avs2_dsp_table.deblock_chroma[EDGE_HOR] = deblock_chroma_hor_sse4;
+    }
 }
 
 /* AVX2: 已降级为 SSE4, 无额外注册 */

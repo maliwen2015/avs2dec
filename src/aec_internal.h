@@ -248,17 +248,17 @@ struct avs2_aec {
     uint32_t i_value_s;
     uint32_t i_value_t;
 
-    /* 上下文概率转移表 (查表优化用).
+    /* 上下文概率转移表 (查表优化用, 交错布局).
      * 每次 AEC 解码通过指针访问, 避免全局变量的 cache 不友好性.
-     * 表在 avs2_aec_create 中初始化, 内容全局只读. */
-    const uint16_t *tab_ctx_mps;  /* [4 * 2048] MPS 转移表 */
-    const uint16_t *tab_ctx_lps;  /* [4 * 2048] LPS 转移表 */
+     * 表在 avs2_aec_create 中绑定, 内容全局只读.
+     * 索引 = cycno | (lg_pmps << 2); 低 16 位 = MPS 转移, 高 16 位 = LPS 转移. */
+    const uint32_t *tab_ctx;      /* [4 * 1024] 交错 MPS/LPS 转移表 */
 
     aec_context_set syn_ctx;
 };
 
 /* ---- 公共 API (与 internal.h 声明一致) ---- */
-avs2_aec *avs2_aec_create(const uint16_t *aec_tab_ctx_mps, const uint16_t *aec_tab_ctx_lps);
+avs2_aec *avs2_aec_create(const uint32_t *aec_tab_ctx);
 void      avs2_aec_destroy(avs2_aec *aec);
 void      avs2_aec_init_contexts(avs2_aec *aec, int slice_type);
 int       avs2_aec_start_decoding(avs2_aec *aec, const uint8_t *buf, int sz, int bit_pos);
@@ -270,7 +270,7 @@ int       avs2_aec_decode_se(avs2_aec *aec, void *ctx);
 int       avs2_aec_get_bits_read(avs2_aec *aec);
 
 /* ---- 内部核心函数 ---- */
-void aec_init_context_tab(uint16_t aec_tab_ctx_mps[4 * 2048], uint16_t aec_tab_ctx_lps[4 * 2048]);
+void aec_init_context_tab(uint32_t aec_tab_ctx[4 * 1024]);
 void aec_new_slice(struct avs2_internal *c);
 int  aec_bits_read(avs2_aec *p_aec);
 

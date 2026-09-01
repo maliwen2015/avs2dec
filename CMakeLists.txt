@@ -89,7 +89,9 @@ if(NOT MSVC)
     target_link_libraries(avs2dec PRIVATE m)
 endif()
 
-# SIMD 源文件仅使用 SSE4.1/SSSE3 intrinsics (AVX2 代码已全部清除)
+# SIMD 源文件主体使用 SSE4.1/SSSE3 intrinsics 编译;
+# AVX2 内核 (mc_simd.c) 通过 __attribute__((target("avx2"))) 局部启用,
+# 由运行时 CPU 检测分发, 不需要全局 -mavx2 标志.
 # simd_init.c 不含 intrinsics, 不需要特殊标志
 # cpu.c 需要 -march=armv8.2-a+dotprod: 其 dotprod 运行时检测被
 # __ARM_FEATURE_DOTPROD 宏包裹, 无该标志时检测代码被排除, SDOT 永远不启用
@@ -109,7 +111,8 @@ if(MSVC)
     )
 else()
     # GCC/MinGW/Clang: 按目标架构启用对应 SIMD 指令集.
-    # x86: 仅 SSE4.1 + SSSE3 (无 AVX2); aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
+    # x86: SSE4.1 + SSSE3 (AVX2 内核用 target 属性局部启用, 见上方说明);
+    # aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
         set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
             COMPILE_OPTIONS "-msse4.1;-mssse3"

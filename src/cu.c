@@ -93,7 +93,8 @@ static int g_dsp_inited = 0;
 /* 前向声明 */
 static void decode_cu_recursive(avs2_frame_ctx *fc, struct avs2_internal *c,
                                 avs2_aec *aec, int x, int y, int level,
-                                int qp, int *prev_qp, int pass);
+                                int qp, int *prev_qp, int pass,
+                                int *p_off_y, int *p_off_u);
 static void get_mvp_default(avs2_frame *f, avs2_cu *cu, int pix_x, int pix_y,
                             avs2_mv *pmv, int bwd_2nd, int ref_frame,
                             int bsx, int pu_type_for_mvp, int frame_type,
@@ -1099,6 +1100,9 @@ static int get_pu_type_for_mvp(int bsx, int bsy, int cu_pix_x, int cu_pix_y)
 static int find_pu_index(avs2_cu *cu, int rel_x, int rel_y)
 {
     int i;
+    /* 快路径: 单 PU (2Nx2N, 最常见) 无需查找 */
+    if (cu->num_pu <= 1)
+        return 0;
     for (i = 0; i < cu->num_pu; i++) {
         if (rel_x >= cu->pu_x[i] && rel_x < cu->pu_x[i] + cu->pu_w[i] &&
             rel_y >= cu->pu_y[i] && rel_y < cu->pu_y[i] + cu->pu_h[i]) {
@@ -1397,10 +1401,9 @@ static int8_t read_block_coeffs(avs2_aec *aec, avs2_cu *cu, aec_cu_t *aec_desc,
         cg_scan = avs2_tab_scan_cg[tu_level][TU_SPLIT_NON];
     }
 
-    /* 设置 runlevel 结构 */
-    memset(&runlevel, 0, sizeof(runlevel));
-    memset(pairs, 0, sizeof(pairs));
-
+    /* 设置 runlevel 结构.
+     * 无需 memset: 所有字段均在下方赋值 (num_nonzero_cg 由
+     * aec_read_run_level 写入), pairs[] 仅写入后才被读取. */
     runlevel.cg_scan = cg_scan;
     if (is_luma) {
         runlevel.p_ctx_run = aec->syn_ctx.coeff_run[0];
@@ -1429,14 +1432,33 @@ static int8_t read_block_coeffs(avs2_aec *aec, avs2_cu *cu, aec_cu_t *aec_desc,
                                scale, shift, wq_size_id);
 }
 
-/* 读取 CU 的所有系数 (对应 davs2 cu_read_all_coeffs) */
+/* 读取 CU 的所有系数 (对应 davs2 cu_read_all_coeffs).
+ * 2-pass (fc->coeff_lcu_y 已分配): 直接写入本 CU 的稠密槽位 (slot_y/slot_u),
+ * 消除 save 拷贝; 单 pass 仍写共享 scratch. */
 static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
-                          int bit_depth, int chroma_format, int x, int y)
+                          int bit_depth, int chroma_format, int x, int y,
+                          int slot_y, int slot_u)
 {
     aec_cu_t aec_desc;
     int bit_size = cu->cu_level;
     int tu_level = cu->cu_level;
     int b8, uv;
+    coeff_t *slot_y_base, *slot_u_base, *slot_v_base;
+
+    if (fc->coeff_lcu_y) {
+        avs2_frame *f = fc->fdec;
+        int lcu_size = 1 << fc->lcu_size;
+        int lcu_sq = lcu_size * lcu_size;
+        int c_lcu_sq = (lcu_size >> 1) * (lcu_size >> 1);
+        int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
+        slot_y_base = fc->coeff_lcu_y + (size_t)lcu_idx * lcu_sq + slot_y;
+        slot_u_base = fc->coeff_lcu_u + (size_t)lcu_idx * c_lcu_sq + slot_u;
+        slot_v_base = fc->coeff_lcu_v + (size_t)lcu_idx * c_lcu_sq + slot_u;
+    } else {
+        slot_y_base = fc->coeff_scratch_y;
+        slot_u_base = fc->coeff_scratch_u;
+        slot_v_base = fc->coeff_scratch_v;
+    }
 
     fill_aec_cu_desc(&aec_desc, cu);
 
@@ -1459,10 +1481,12 @@ static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
 
             /* bit_size - (i_trans_size != TU_SPLIT_NON) = bit_size - 0 = bit_size */
             avs2_get_quant_params(cu->qp, bit_size, bit_depth, &shift, &scale);
-            memset(fc->coeff_scratch_y, 0, sizeof(int16_t) * 64 * 64);
+            /* 仅清零 CU 大小的区域: read_block_coeffs 只写 blocksize² ≤ cu_size² 元素.
+             * 原实现固定清零 64x64 (8KB), 小 CU (8x8 仅 128B) 浪费 64 倍带宽. */
+            memset(slot_y_base, 0, sizeof(int16_t) * (1 << bit_size) * (1 << bit_size));
 
             cu->dct_pattern[0] = read_block_coeffs(aec, cu, &aec_desc,
-                                                    fc->coeff_scratch_y,
+                                                    slot_y_base,
                                                     blocksize, blocksize,
                                                     tu_level, TU_SPLIT_NON, 1,
                                                     intra_pred_class, b_swap_xy,
@@ -1501,7 +1525,7 @@ static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
                                  intra_pred_class == INTRA_PRED_HOR &&
                                  cu->cu_type != PRED_I_2Nxn &&
                                  cu->cu_type != PRED_I_nx2N);
-                coeff_t *p_res = fc->coeff_scratch_y + (b8 << ((bit_size - 1) << 1));
+                coeff_t *p_res = slot_y_base + (b8 << ((bit_size - 1) << 1));
 
                 memset(p_res, 0, sizeof(coeff_t) * bsx * bsy);
                 cu->dct_pattern[b8] = read_block_coeffs(aec, cu, &aec_desc,
@@ -1526,7 +1550,7 @@ static int read_cu_coeffs(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu,
         for (uv = 0; uv < 2; uv++) {
             if ((cu->i_cbp >> (uv + 4)) & 0x1) {
                 int blocksize = 1 << wq_size_id;
-                coeff_t *p_res = (uv == 0) ? fc->coeff_scratch_u : fc->coeff_scratch_v;
+                coeff_t *p_res = (uv == 0) ? slot_u_base : slot_v_base;
                 int shift, scale;
                 int chroma_qp = avs2_chroma_qp(cu->qp,
                                                 uv == 0 ? fc->chroma_quant_param_delta_cb
@@ -1622,7 +1646,7 @@ static int read_cu_info(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu, int leve
                         int x, int y, int frame_type,
                         avs2_seq_header *seq, int num_refs,
                         int bit_depth, int chroma_format, int *prev_qp,
-                        avs2_frame *f)
+                        avs2_frame *f, int slot_y, int slot_u)
 {
     int real_cu_type = 0;
 
@@ -1637,11 +1661,26 @@ static int read_cu_info(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu, int leve
     cu->i_skip_mode = DS_NONE;
     cu->b_intra = 0;
     cu->i_slice_nr = 0;  /* 单条带帧: 所有 CU 同属条带 0 */
-    memset(cu->dct_pattern, 0, sizeof(cu->dct_pattern));
-    memset(cu->intra_pred_modes, 0, sizeof(cu->intra_pred_modes));
-    memset(cu->b8pdir, 0, sizeof(cu->b8pdir));
-    memset(cu->mv, 0, sizeof(cu->mv));
-    memset(cu->i_ref, 0xFF, sizeof(cu->i_ref));  /* INVALID_REF = -1 */
+    /* 小数组清零用显式赋值 (编译为立即数宽存储), 避免 5 次 libc memset
+     * 调用开销 (实测占 ~9% CPU) */
+    {
+        int i;
+        for (i = 0; i < 6; i++) {
+            cu->dct_pattern[i] = 0;
+        }
+        for (i = 0; i < 4; i++) {
+            cu->intra_pred_modes[i] = 0;
+            cu->b8pdir[i] = 0;
+        }
+        for (i = 0; i < 4; i++) {
+            cu->mv[i][0].x = 0; cu->mv[i][0].y = 0;
+            cu->mv[i][1].x = 0; cu->mv[i][1].y = 0;
+        }
+        for (i = 0; i < 4; i++) {
+            cu->i_ref[i][0] = INVALID_REF;  /* -1 */
+            cu->i_ref[i][1] = INVALID_REF;
+        }
+    }
 
     /* 1. 读取 CU 头部 */
     {
@@ -1698,7 +1737,8 @@ static int read_cu_info(avs2_frame_ctx *fc, avs2_aec *aec, avs2_cu *cu, int leve
             return -1;
         }
         if (cu->i_cbp != 0) {
-            if (read_cu_coeffs(fc, aec, cu, bit_depth, chroma_format, x, y) < 0) {
+            if (read_cu_coeffs(fc, aec, cu, bit_depth, chroma_format, x, y,
+                               slot_y, slot_u) < 0) {
                 return -1;
             }
         }
@@ -1928,22 +1968,35 @@ static int reconstruct_inter(avs2_frame_ctx *fc, avs2_cu *cu,
  * 残差重建 (对应 davs2 davs2_get_recons)
  * =================================================================== */
 
-/* 对一个块执行反量化 + 反变换 + 加到预测上 */
+/* 对一个块执行反量化 + 反变换 + 加到预测上.
+ * slot_y/slot_u: 稠密槽位偏移. 2-pass (fc->coeff_lcu_y 已分配) 时残差
+ * 直接从本 CU 的槽位读取 (每个 CU 独占, 多 worker 无竞争); 单 pass 用 scratch. */
 static void reconstruct_residual(avs2_frame_ctx *fc, struct avs2_internal *c,
                                  avs2_cu *cu, int block_idx,
                                  int blk_x, int blk_y, int bsx, int bsy,
-                                 int bit_depth, int is_luma)
+                                 int bit_depth, int is_luma,
+                                 int slot_y, int slot_u)
 {
     avs2_frame *f = fc->fdec;
     coeff_t *coeff;
     int pl;
 
-    /* 获取系数缓冲区 (系数已在 aec_read_run_level 中完成反量化).
-     * Pass 2 (行级并行): 使用 TLS scratch (per-worker 独立, 避免 fc->cur_lcu_coeff 竞争).
-     * Pass 0/1: 使用 fc->cur_lcu_coeff (单线程或串行, 无竞争). */
-    int16_t *scratch_y = tls_coeff_scratch_y ? tls_coeff_scratch_y : fc->cur_lcu_coeff_y;
-    int16_t *scratch_u = tls_coeff_scratch_u ? tls_coeff_scratch_u : fc->cur_lcu_coeff_u;
-    int16_t *scratch_v = tls_coeff_scratch_v ? tls_coeff_scratch_v : fc->cur_lcu_coeff_v;
+    /* 获取系数缓冲区 (系数已在 aec_read_run_level 中完成反量化). */
+    int16_t *scratch_y, *scratch_u, *scratch_v;
+    if (fc->coeff_lcu_y) {
+        int lcu_size = 1 << fc->lcu_size;
+        int lcu_sq = lcu_size * lcu_size;
+        int c_lcu_sq = (lcu_size >> 1) * (lcu_size >> 1);
+        int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
+        scratch_y = fc->coeff_lcu_y + (size_t)lcu_idx * lcu_sq + slot_y;
+        scratch_u = fc->coeff_lcu_u + (size_t)lcu_idx * c_lcu_sq + slot_u;
+        scratch_v = fc->coeff_lcu_v + (size_t)lcu_idx * c_lcu_sq + slot_u;
+    } else {
+        /* 单 pass: fc->cur_lcu_coeff (AEC 与重建在同一次 pass 中完成) */
+        scratch_y = tls_coeff_scratch_y ? tls_coeff_scratch_y : fc->cur_lcu_coeff_y;
+        scratch_u = tls_coeff_scratch_u ? tls_coeff_scratch_u : fc->cur_lcu_coeff_u;
+        scratch_v = tls_coeff_scratch_v ? tls_coeff_scratch_v : fc->cur_lcu_coeff_v;
+    }
 
     if (is_luma) {
         coeff = scratch_y;
@@ -1991,9 +2044,10 @@ static void reconstruct_residual(avs2_frame_ctx *fc, struct avs2_internal *c,
  * CU 重建 (对应 davs2 cu_recon)
  * =================================================================== */
 
-/* 重建一个 CU: 预测 + 残差 */
+/* 重建一个 CU: 预测 + 残差.
+ * slot_y/slot_u: 稠密槽位偏移 (2-pass 时残差直接读槽, 单 pass 用 scratch). */
 static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
-                          avs2_cu *cu, int x, int y)
+                          avs2_cu *cu, int x, int y, int slot_y, int slot_u)
 {
     avs2_frame *f = fc->fdec;
     int bit_depth = c->bit_depth;
@@ -2012,7 +2066,7 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
                                 cu->intra_pred_modes[0]);
             if (cu->i_cbp & 0x0F) {
                 reconstruct_residual(fc, c, cu, 0, x, y, tu_w[0], tu_h[0],
-                                     bit_depth, 1);
+                                     bit_depth, 1, slot_y, slot_u);
             }
         } else {
             /* 有 TU 分割: 4 个子块分别预测 */
@@ -2025,7 +2079,7 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
                 if (cu->i_cbp & (1 << blockidx)) {
                     reconstruct_residual(fc, c, cu, blockidx, bx, by,
                                          tu_w[blockidx], tu_h[blockidx],
-                                         bit_depth, 1);
+                                         bit_depth, 1, slot_y, slot_u);
                 }
             }
         }
@@ -2044,7 +2098,7 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
         if (cu->i_tu_split == TU_SPLIT_NON) {
             if (cu->i_cbp & 0x0F) {
                 reconstruct_residual(fc, c, cu, 0, x, y, tu_w[0], tu_h[0],
-                                     bit_depth, 1);
+                                     bit_depth, 1, slot_y, slot_u);
             }
         } else {
             for (blockidx = 0; blockidx < 4; blockidx++) {
@@ -2053,7 +2107,7 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
                     int by = y + tu_y[blockidx];
                     reconstruct_residual(fc, c, cu, blockidx, bx, by,
                                          tu_w[blockidx], tu_h[blockidx],
-                                         bit_depth, 1);
+                                         bit_depth, 1, slot_y, slot_u);
                 }
             }
         }
@@ -2066,10 +2120,12 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
         int ch = cw;
 
         if (cu->i_cbp & (1 << 4)) {
-            reconstruct_residual(fc, c, cu, 4, cx, cy, cw, ch, bit_depth, 0);
+            reconstruct_residual(fc, c, cu, 4, cx, cy, cw, ch, bit_depth, 0,
+                                 slot_y, slot_u);
         }
         if (cu->i_cbp & (1 << 5)) {
-            reconstruct_residual(fc, c, cu, 5, cx, cy, cw, ch, bit_depth, 0);
+            reconstruct_residual(fc, c, cu, 5, cx, cy, cw, ch, bit_depth, 0,
+                                 slot_y, slot_u);
         }
     }
 
@@ -2078,174 +2134,17 @@ static int reconstruct_cu(avs2_frame_ctx *fc, struct avs2_internal *c,
 
 
 /* ===================================================================
- * 行级并行: per-LCU 系数保存/恢复 (按 LCU 行布局)
+ * 系数存储: 稠密槽位布局 (2-pass 系数直达)
  *
- * pass=0 中 cur_lcu_coeff 是 per-CU 复用的 scratch, 每个 CU AEC 后立即重建,
- * 覆盖没问题. 但 2-pass 的 Pass 1 中所有 CU 的系数都写入 scratch[0..blocksize²-1],
- * 后面的 CU 覆盖前面的. 因此 Pass 1 需要将每个 CU 的系数保存到 per-LCU 缓冲区,
- * Pass 2 重建前恢复到 scratch.
+ * 2-pass (Pass1 AEC 串行 + Pass2 重建并行) 需要把每个 CU 的系数
+ * 保留到 Pass2. 原实现用共享 scratch + save/load 两次全量拷贝
+ * (实测占 ~14% CPU). 现改为: 每个叶 CU 在 per-LCU 缓冲中独占一段
+ * 稠密槽位 (扫描序, 槽位总和恰为 LCU 面积, 不额外占内存),
+ * AEC 直接写槽, 重建直接读槽, 消除全部中间拷贝.
  *
- * per-LCU 缓冲区按 LCU 行布局存储 (stride = lcu_size), CU 的系数偏移:
- *   y_offset = cu_y_in_lcu * lcu_size + cu_x_in_lcu
- * 色度 (420): stride = lcu_size/2, 偏移折半.
+ * 槽位布局与 scratch 完全一致 (TU_NON: 整块稠密; TU_SPLIT: 4 个
+ * 稠密象限按 block_idx 顺序排列), 反变换/残差重建代码无需改动.
  * =================================================================== */
-
-/* 保存 CU 亮度系数从 scratch 到 per-LCU 缓冲区 (按 LCU 行布局) */
-static void save_cu_coeffs_y(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y)
-{
-    avs2_frame *f = fc->fdec;
-    int lcu_size = 1 << fc->lcu_size;
-    int lcu_sq = lcu_size * lcu_size;  /* per-LCU 系数块大小 */
-    /* 使用 TLS lcu_x/lcu_y: Pass 1 (AEC 串行) 与 Pass 2 (重建并行) 重叠执行时,
-     * Pass 2 的 avs2_decode_lcu 会覆盖 fc->lcu_x/lcu_y, 导致 save 读取错误位置.
-     * TLS 保证每个线程读取自己设置的 LCU 位置. */
-    int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
-    int cu_size = 1 << cu->cu_level;
-    int cu_x_in_lcu = x - tls_lcu_x * lcu_size;
-    int cu_y_in_lcu = y - tls_lcu_y * lcu_size;
-    int bit_size = cu->cu_level;
-    coeff_t *lcu_base = fc->coeff_lcu_y + lcu_idx * lcu_sq;
-
-    if (cu->i_tu_split == TU_SPLIT_NON) {
-        /* 无 TU 分割: 整块连续存储在 scratch[0..cu_size²-1] */
-        if (cu->i_cbp & 0x0F) {
-            coeff_t *src = fc->coeff_scratch_y;
-            coeff_t *dst = lcu_base + cu_y_in_lcu * lcu_size + cu_x_in_lcu;
-            int yy;
-            for (yy = 0; yy < cu_size; yy++) {
-                memcpy(dst + yy * lcu_size, src + yy * cu_size,
-                       cu_size * sizeof(coeff_t));
-            }
-        }
-    } else {
-        /* 有 TU 分割: 4 个 TU 块分别存储 */
-        int8_t tu_x[4], tu_y[4], tu_w[4], tu_h[4];
-        int b8;
-        init_transform_units(cu, tu_x, tu_y, tu_w, tu_h);
-        for (b8 = 0; b8 < 4; b8++) {
-            if (cu->i_cbp & (1 << b8)) {
-                coeff_t *src = fc->coeff_scratch_y + (b8 << ((bit_size - 1) << 1));
-                coeff_t *dst = lcu_base + (cu_y_in_lcu + tu_y[b8]) * lcu_size
-                               + (cu_x_in_lcu + tu_x[b8]);
-                int yy;
-                for (yy = 0; yy < tu_h[b8]; yy++) {
-                    memcpy(dst + yy * lcu_size, src + yy * tu_w[b8],
-                           tu_w[b8] * sizeof(coeff_t));
-                }
-            }
-        }
-    }
-}
-
-/* 保存 CU 色度系数从 scratch 到 per-LCU 缓冲区 (按 LCU/2 行布局) */
-static void save_cu_coeffs_c(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y)
-{
-    avs2_frame *f = fc->fdec;
-    int lcu_size = 1 << fc->lcu_size;
-    int c_lcu_size = lcu_size >> 1;
-    int c_lcu_sq = c_lcu_size * c_lcu_size;
-    /* 使用 TLS lcu_x/lcu_y: 避免 Pass 1/Pass 2 重叠时 fc->lcu_x/lcu_y 竞争 */
-    int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
-    int cu_size = 1 << cu->cu_level;
-    int c_cu_size = cu_size >> 1;
-    int c_cu_x_in_lcu = (x - tls_lcu_x * lcu_size) >> 1;
-    int c_cu_y_in_lcu = (y - tls_lcu_y * lcu_size) >> 1;
-    int uv;
-
-    for (uv = 0; uv < 2; uv++) {
-        if ((cu->i_cbp >> (uv + 4)) & 0x1) {
-            coeff_t *src = (uv == 0) ? fc->coeff_scratch_u : fc->coeff_scratch_v;
-            coeff_t *lcu_base = ((uv == 0) ? fc->coeff_lcu_u : fc->coeff_lcu_v)
-                                + lcu_idx * c_lcu_sq;
-            coeff_t *dst = lcu_base + c_cu_y_in_lcu * c_lcu_size + c_cu_x_in_lcu;
-            int yy;
-            for (yy = 0; yy < c_cu_size; yy++) {
-                memcpy(dst + yy * c_lcu_size, src + yy * c_cu_size,
-                       c_cu_size * sizeof(coeff_t));
-            }
-        }
-    }
-}
-
-/* 从 per-LCU 缓冲区恢复 CU 亮度系数到 scratch (按 LCU 行布局) */
-static void load_cu_coeffs_y(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y)
-{
-    avs2_frame *f = fc->fdec;
-    int lcu_size = 1 << fc->lcu_size;
-    int lcu_sq = lcu_size * lcu_size;
-    /* 使用 TLS lcu_x/lcu_y: Pass 2 中多 worker 并行, 避免 fc->lcu_x/lcu_y 竞争 */
-    int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
-    int cu_size = 1 << cu->cu_level;
-    int cu_x_in_lcu = x - tls_lcu_x * lcu_size;
-    int cu_y_in_lcu = y - tls_lcu_y * lcu_size;
-    int bit_size = cu->cu_level;
-    coeff_t *lcu_base = fc->coeff_lcu_y + lcu_idx * lcu_sq;
-
-    /* 仅清零 CU 大小的区域 (reconstruct_residual 只访问 cu_size^2 元素),
-     * 避免对小 CU 清零整个 LCU 大小的 scratch (lcu=32 时 2048B vs 128B) */
-    memset(tls_coeff_scratch_y, 0, sizeof(coeff_t) * cu_size * cu_size);
-
-    if (cu->i_tu_split == TU_SPLIT_NON) {
-        if (cu->i_cbp & 0x0F) {
-            coeff_t *dst = tls_coeff_scratch_y;
-            coeff_t *src = lcu_base + cu_y_in_lcu * lcu_size + cu_x_in_lcu;
-            int yy;
-            for (yy = 0; yy < cu_size; yy++) {
-                memcpy(dst + yy * cu_size, src + yy * lcu_size,
-                       cu_size * sizeof(coeff_t));
-            }
-        }
-    } else {
-        int8_t tu_x[4], tu_y[4], tu_w[4], tu_h[4];
-        int b8;
-        init_transform_units(cu, tu_x, tu_y, tu_w, tu_h);
-        for (b8 = 0; b8 < 4; b8++) {
-            if (cu->i_cbp & (1 << b8)) {
-                coeff_t *dst = tls_coeff_scratch_y + (b8 << ((bit_size - 1) << 1));
-                coeff_t *src = lcu_base + (cu_y_in_lcu + tu_y[b8]) * lcu_size
-                               + (cu_x_in_lcu + tu_x[b8]);
-                int yy;
-                for (yy = 0; yy < tu_h[b8]; yy++) {
-                    memcpy(dst + yy * tu_w[b8], src + yy * lcu_size,
-                           tu_w[b8] * sizeof(coeff_t));
-                }
-            }
-        }
-    }
-}
-
-/* 从 per-LCU 缓冲区恢复 CU 色度系数到 scratch (按 LCU/2 行布局) */
-static void load_cu_coeffs_c(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y)
-{
-    avs2_frame *f = fc->fdec;
-    int lcu_size = 1 << fc->lcu_size;
-    int c_lcu_size = lcu_size >> 1;
-    int c_lcu_sq = c_lcu_size * c_lcu_size;
-    /* 使用 TLS lcu_x/lcu_y: 避免 Pass 2 中 fc->lcu_x/lcu_y 竞争 */
-    int lcu_idx = tls_lcu_y * f->w_lcu + tls_lcu_x;
-    int cu_size = 1 << cu->cu_level;
-    int c_cu_size = cu_size >> 1;
-    int c_cu_x_in_lcu = (x - tls_lcu_x * lcu_size) >> 1;
-    int c_cu_y_in_lcu = (y - tls_lcu_y * lcu_size) >> 1;
-    int uv;
-
-    for (uv = 0; uv < 2; uv++) {
-        /* 仅清零 CU 色度大小的区域, 避免清零整个 LCU/2 大小 */
-        memset((uv == 0) ? tls_coeff_scratch_u : tls_coeff_scratch_v,
-               0, sizeof(coeff_t) * c_cu_size * c_cu_size);
-        if ((cu->i_cbp >> (uv + 4)) & 0x1) {
-            coeff_t *dst = (uv == 0) ? tls_coeff_scratch_u : tls_coeff_scratch_v;
-            coeff_t *lcu_base = ((uv == 0) ? fc->coeff_lcu_u : fc->coeff_lcu_v)
-                                + lcu_idx * c_lcu_sq;
-            coeff_t *src = lcu_base + c_cu_y_in_lcu * c_lcu_size + c_cu_x_in_lcu;
-            int yy;
-            for (yy = 0; yy < c_cu_size; yy++) {
-                memcpy(dst + yy * c_cu_size, src + yy * c_lcu_size,
-                       c_cu_size * sizeof(coeff_t));
-            }
-        }
-    }
-}
 
 
 /* ===================================================================
@@ -2258,7 +2157,8 @@ static void load_cu_coeffs_c(avs2_frame_ctx *fc, avs2_cu *cu, int x, int y)
  * pass=2: 仅重建 (行级并行 Pass 2) */
 static void decode_cu_recursive(avs2_frame_ctx *fc, struct avs2_internal *c,
                                 avs2_aec *aec, int x, int y, int level,
-                                int qp, int *prev_qp, int pass)
+                                int qp, int *prev_qp, int pass,
+                                int *p_off_y, int *p_off_u)
 {
     avs2_frame *f = fc->fdec;
     avs2_seq_header *seq = c->seq;
@@ -2294,10 +2194,10 @@ static void decode_cu_recursive(avs2_frame_ctx *fc, struct avs2_internal *c,
     if (split) {
         /* 递归处理 4 个子块 */
         int half = size >> 1;
-        decode_cu_recursive(fc, c, aec, x,       y,       level - 1, qp, prev_qp, pass);
-        decode_cu_recursive(fc, c, aec, x + half, y,       level - 1, qp, prev_qp, pass);
-        decode_cu_recursive(fc, c, aec, x,       y + half, level - 1, qp, prev_qp, pass);
-        decode_cu_recursive(fc, c, aec, x + half, y + half, level - 1, qp, prev_qp, pass);
+        decode_cu_recursive(fc, c, aec, x,       y,       level - 1, qp, prev_qp, pass, p_off_y, p_off_u);
+        decode_cu_recursive(fc, c, aec, x + half, y,       level - 1, qp, prev_qp, pass, p_off_y, p_off_u);
+        decode_cu_recursive(fc, c, aec, x,       y + half, level - 1, qp, prev_qp, pass, p_off_y, p_off_u);
+        decode_cu_recursive(fc, c, aec, x + half, y + half, level - 1, qp, prev_qp, pass, p_off_y, p_off_u);
         return;
     }
 
@@ -2310,45 +2210,40 @@ static void decode_cu_recursive(avs2_frame_ctx *fc, struct avs2_internal *c,
         if (bx >= f->w8 || by >= f->h8) return;
         cu = &f->cu_grid[by * f->w8 + bx];
 
+        /* 稠密槽位分配 (2-pass 系数直达): 每个叶 CU 独占
+         * [off, off+cu_size²) 的稠密系数区 (扫描序). AEC 直接写槽,
+         * 重建直接读槽, 消除了原 save/load 两次全量系数拷贝
+         * (实测占 ~14% CPU). 槽位按四叉树叶序累计, 总和恰为 LCU 面积,
+         * 不额外占用内存. 单 pass (pass=0) 不使用槽, 偏移被忽略. */
+        int slot_y = *p_off_y;
+        int slot_u = *p_off_u;
+        *p_off_y += size * size;
+        *p_off_u += (size >> 1) * (size >> 1);   /* 420 色度槽 */
+
         if (pass < 2) {
             /* pass=0 或 pass=1: AEC 解码 CU 信息 */
             if (read_cu_info(fc, aec, cu, level, x, y, frame_type, seq, num_refs,
-                             bit_depth, chroma_format, prev_qp, f) < 0) {
+                             bit_depth, chroma_format, prev_qp, f, slot_y, slot_u) < 0) {
                 /* 解码错误: 标记 CU 为无效 */
                 cu->i_slice_nr = -1;
                 return;
             }
-
-            /* pass=1: 保存系数到 per-LCU 缓冲区 (行级并行 Pass 2 需要恢复) */
-            if (pass == 1 && fc->coeff_lcu_y) {
-                save_cu_coeffs_y(fc, cu, x, y);
-                if (f->chroma_format == AVS2_CHROMA_420) {
-                    save_cu_coeffs_c(fc, cu, x, y);
-                }
-            }
         }
 
         if (pass == 0 || pass == 2 || pass == 3 || pass == 4) {
-            /* pass>=2: 从 per-LCU 缓冲区恢复系数到 scratch (行级并行) */
-            if (pass >= 2 && fc->coeff_lcu_y) {
-                load_cu_coeffs_y(fc, cu, x, y);
-                if (f->chroma_format == AVS2_CHROMA_420)
-                    load_cu_coeffs_c(fc, cu, x, y);
-            }
-
             /* pass=0/pass=2: 完整重建 (inter+intra)
              * pass=3: 仅 inter 重建 (无行依赖, 可并行)
              * pass=4: 仅 intra 重建 (有行依赖, 串行) */
             if (pass == 3) {
                 if (!IS_INTRA_MODE(cu->cu_type)) {
-                    reconstruct_cu(fc, c, cu, x, y);
+                    reconstruct_cu(fc, c, cu, x, y, slot_y, slot_u);
                 }
             } else if (pass == 4) {
                 if (IS_INTRA_MODE(cu->cu_type)) {
-                    reconstruct_cu(fc, c, cu, x, y);
+                    reconstruct_cu(fc, c, cu, x, y, slot_y, slot_u);
                 }
             } else {
-                reconstruct_cu(fc, c, cu, x, y);
+                reconstruct_cu(fc, c, cu, x, y, slot_y, slot_u);
             }
         }
 
@@ -2453,9 +2348,13 @@ int avs2_decode_lcu(avs2_frame_ctx *fc, struct avs2_internal *c,
         }
     }
 
-    /* 递归解码 LCU (pass=0: AEC+重建, pass=1: 仅AEC, pass=2: 仅重建) */
-    decode_cu_recursive(fc, c, fc->aec, x0, y0, (int)seq->log2_lcu_size,
-                        qp, &prev_qp, pass);
+    /* 递归解码 LCU (pass=0: AEC+重建, pass=1: 仅AEC, pass=2: 仅重建).
+     * 稠密槽位偏移: 每 LCU 从 0 起累计 (槽位总和 = LCU 面积). */
+    {
+        int off_y = 0, off_u = 0;
+        decode_cu_recursive(fc, c, fc->aec, x0, y0, (int)seq->log2_lcu_size,
+                            qp, &prev_qp, pass, &off_y, &off_u);
+    }
 
     return AVS2_OK;
 }

@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifndef PIPELINE_DEBUG
 #define PIPELINE_DEBUG 0
+#endif
 #if PIPELINE_DEBUG
 #if defined(_WIN32)
 #include <windows.h>
@@ -18,6 +20,18 @@
 #else
 #define PDBG(fmt, ...) ((void)0)
 #endif
+
+/* ---- 临时计时 (TASK_TIME): P1/P2 阶段耗时分布 ---- */
+#include <time.h>
+static double g_t_p1 = 0, g_t_p2 = 0;
+static long g_n_p1 = 0, g_n_p2 = 0;
+static double g_t_main = 0;
+static inline double task_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
                     int64_t pts, int64_t dts)
@@ -92,8 +106,11 @@ void avs2_default_settings(avs2_settings *s)
  *
  * is_helper=1: 辅助 worker, 在无可用任务且有 pending P1 任务时提前退出.
  * is_helper=0: owning worker, 必须等待帧完成.
+ * is_main=1: 主线程 helper (NOMEM/pick_idle 等待期间帮做 P2):
+ *   跳过 P1 抢占检查 (主线程不做 P1), 空转超限即返回 0 让主线程
+ *   回到 CLI 重试输出/提交.
  */
-int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_helper)
+int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_helper, int is_main)
 {
     avs2_frame *f = fc->fdec;
     const int h_lcu = f->h_lcu;
@@ -231,7 +248,10 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
             }
         }
 
-        if (got_task) continue;
+        if (got_task) {
+            helper_idle_cnt = 0;  /* 有进展: 重置空转计数 */
+            continue;
+        }
 
         /* 无可用任务 */
         if (avs2_atomic_load(&c->shutdown)) {
@@ -241,8 +261,9 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
 
         /* 辅助 worker: 检查是否有更高优先级任务, 有则退出.
          * 通用模式: 检查 pending P1 任务 (state==1 && n_aec_deps==0).
-         * 行级流水线模式: 检查是否有新的 P2 帧可用 (state==6/5 && !recon_active). */
-        if (is_helper) {
+         * 行级流水线模式: 检查是否有新的 P2 帧可用 (state==6/5 && !recon_active).
+         * 主线程 helper (is_main): 跳过 — 主线程不做 P1/P2 owning. */
+        if (is_helper && !is_main) {
             avs2_mutex_lock(&c->task_lock);
             int should_exit = 0;
             if (c->n_aec_threads > 0) {
@@ -274,10 +295,11 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
         /* spin-wait: 短暂等待新任务可用 */
         avs2_cpu_relax();
 
-        /* pipeline 模式 helper: 有界自旋, 无进展则返回 0.
+        /* pipeline 模式 helper / 主线程 helper: 有界自旋, 无进展则返回 0.
          * recon_thread_fn 收到返回值 0 后 cond_wait(recon_cond),
-         * 等 AEC 完成下一行 signal 时唤醒, 避免空转. */
-        if (is_helper && c->n_aec_threads > 0) {
+         * 等 AEC 完成下一行 signal 时唤醒, 避免空转.
+         * 主线程 helper 返回 0 后回到 CLI 重试输出/提交. */
+        if ((is_helper && c->n_aec_threads > 0) || is_main) {
             if (++helper_idle_cnt >= 256) {
                 avs2_set_thread_scratch(NULL, NULL, NULL);
                 return 0;
@@ -570,7 +592,7 @@ static void *recon_thread_fn(void *arg)
         if (helper_fc) {
             /* helper: 参与行级并行 P2.
              * 返回 1=帧完成/shutdown, 0=无进展 (AEC 行未就绪) 或有更高优先级任务. */
-            int did_work = avs2_row_parallel_pass2(c, helper_fc, 1);
+            int did_work = avs2_row_parallel_pass2(c, helper_fc, 1, 0);
             avs2_mutex_lock(&c->task_lock);
             helper_fc->n_row_workers--;
             if (helper_fc->n_row_workers == 0) {
@@ -720,9 +742,9 @@ static void *worker_thread(void *arg)
                 if (fc) break;
 
                 /* 3. 2 线程时 worker 的 P2 任务 (仅当 P1 无活时).
-                 * 2 线程 (n_workers==1): P1 优先, P2 由主线程在 pick_idle_fc
-                 * 等待时帮忙, 实现 P1/P2 重叠. worker 仅在无 P1 可做时接管 P2,
-                 * 避免 P2 名额被 worker 独占导致主线程无法参与. */
+                 * 2 线程 (n_workers==1): P1 优先 (实测 P2 优先会造成 P1 断供,
+                 * 吞吐退化为单线程), P2 由主线程在 pick_idle_fc 等待时帮忙,
+                 * worker 在无 P1 时接管 P2, p2_cap=2 允许与 main 的 P2 重叠. */
                 if (c->n_threads == 2 && c->n_p2_active < c->p2_cap) {
                     int best_i = -1;
                     int best_coi = 0x7fffffff;
@@ -799,7 +821,7 @@ static void *worker_thread(void *arg)
 
         if (row_fc) {
             /* 行级并行辅助 (单 pass WPP 或 2-pass P2 helper) */
-            avs2_row_parallel_pass2(c, row_fc, 1);
+            avs2_row_parallel_pass2(c, row_fc, 1, 0);
             avs2_mutex_lock(&c->task_lock);
             row_fc->n_row_workers--;
             if (row_fc->n_row_workers == 0) {
@@ -811,7 +833,9 @@ static void *worker_thread(void *arg)
 
         if (phase == 1) {
             /* ---- 2-pass Phase 1 (AEC) ---- */
+            { double _t0 = task_now_ms();
             avs2_decode_frame_fc_phase1(c, fc);
+            g_t_p1 += task_now_ms() - _t0; g_n_p1++; }
 
             if (c->shutdown) break;
 
@@ -828,11 +852,13 @@ static void *worker_thread(void *arg)
             /* ---- 2-pass Phase 2 (重建+LF) ----
              * ROW 模式: 行级并行重建+LF (avs2_row_parallel_pass2)
              * FRAME 模式: 逐行 inline deblock (cache 友好) */
+            { double _t0 = task_now_ms();
             if (c->thread_mode == AVS2_THREAD_ROW) {
                 avs2_decode_frame_fc_phase2_row(c, fc);
             } else {
                 avs2_decode_frame_fc_phase2(c, fc);
             }
+            g_t_p2 += task_now_ms() - _t0; g_n_p2++; }
             avs2_mutex_lock(&c->task_lock);
             c->n_p2_active--;  /* 释放 P2 名额 */
             if (c->thread_mode == AVS2_THREAD_ROW)
@@ -867,6 +893,97 @@ static void *worker_thread(void *arg)
     return NULL;
 }
 
+/* 主线程 P2 帮助: 认领一个 state==5 且参考帧就绪的帧执行 Phase 2 (重建+LF).
+ *
+ * 使用场景 (调用方持有 task_lock, n_p2_active < p2_cap 已由调用方检查):
+ *   1. pick_idle_fc: 无空闲 fc 等待期间, 主线程帮 worker 做 P2,
+ *      实现 P1/P2 重叠 (2 线程提升的关键).
+ *   2. avs2_send_data NOMEM 等待: DPB 满时主线程不再空睡, 而是帮做一帧 P2
+ *      加速帧完成 (帧完成释放参考帧 ref_cnt, 直接缓解 DPB 压力).
+ *      3+ 线程实测: 主线程在 NOMEM 等待中空睡, 第三线程完全浪费,
+ *      P2 串行瓶颈限制吞吐; 帮做 P2 后主线程成为第三个工作线程.
+ *
+ * 帧选择: coi 最小 (最早提交) 且参考帧就绪的 state==5 帧.
+ * refs_ready 检查 (参考帧 P2 已开始且完成 >= 2 行 LF 或已完成) 保证
+ * 跨帧 LF 依赖链无环: P2(N) 启动要求 P2(N-1) 已启动并领先 2 行,
+ * 归纳可得依赖链末端帧的 P2 必然已在执行/完成, 无死锁.
+ *
+ * 返回 1 = 完成了一帧 P2 (task_lock 已重新持有);
+ * 返回 0 = 无可帮助任务 (task_lock 全程持有, 未释放). */
+static int main_help_p2(struct avs2_internal *c)
+{
+    avs2_frame_ctx *p2 = NULL;
+    int best_coi = 0x7fffffff;
+    for (int i = 0; i < c->n_fc; i++) {
+        avs2_frame_ctx *cand = &c->fc[i];
+        if (cand->task_state != 5) continue;
+        int refs_ready = 1;
+        for (int j = 0; j < cand->n_refs; j++) {
+            avs2_frame *ref = cand->fref[j];
+            if (ref && !ref->done) {
+                if (!avs2_atomic_load(&ref->p2_started) &&
+                    avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                    refs_ready = 0;
+                    break;
+                }
+                if (avs2_atomic_load(&ref->lf_row_done_count) < 2) {
+                    refs_ready = 0;
+                    break;
+                }
+            }
+        }
+        if (!refs_ready) continue;
+        int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
+        if (coi < best_coi) {
+            best_coi = coi;
+            p2 = cand;
+        }
+    }
+    if (!p2) {
+        /* ROW 模式回退: 无可认领的 state==5 帧时, 加入一个进行中的
+         * 行级 P2 帧做行窃取 helper (与 owning worker 分抢重建/LF 行,
+         * 无认领竞争 — worker 总是先于主线程抢到新 P2 帧).
+         * is_main=1: 跳过 P1 抢占检查, 空转超限返回让主线程回 CLI 重试. */
+        if (c->thread_mode == AVS2_THREAD_ROW) {
+            for (int i = 0; i < c->n_fc; i++) {
+                avs2_frame_ctx *cand = &c->fc[i];
+                if (cand->task_state == 2 && cand->recon_active &&
+                    !avs2_atomic_load(&cand->row_recon_completed)) {
+                    cand->n_row_workers++;
+                    avs2_mutex_unlock(&c->task_lock);
+                    { double _t0 = task_now_ms();
+                    avs2_row_parallel_pass2(c, cand, 1, 1);
+                    g_t_main += task_now_ms() - _t0; }
+                    avs2_mutex_lock(&c->task_lock);
+                    cand->n_row_workers--;
+                    if (cand->n_row_workers == 0) {
+                        avs2_cond_broadcast(&c->done_cond, &c->task_lock,
+                                            c->n_waiters_done);
+                    }
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    p2->task_state = 2;  /* decoding */
+    c->n_p2_active++;
+    avs2_mutex_unlock(&c->task_lock);
+    /* 主线程执行 Phase 2 (逐行重建+LF).
+     * 参考帧 LF 领先 2 行 (refs_ready 保证), 跨帧 LF 等待不会死锁:
+     * worker 会按 coi 顺序推进参考帧 P2. */
+    { double _t0 = task_now_ms();
+    avs2_decode_frame_fc_phase2(c, p2);
+    g_t_p2 += task_now_ms() - _t0; g_n_p2++;
+    g_t_main += task_now_ms() - _t0; }
+    avs2_mutex_lock(&c->task_lock);
+    c->n_p2_active--;
+    complete_frame(c, p2);
+    avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
+    return 1;
+}
+
 /* 从空闲 fc 中选取一个用于新帧. n_threads>1 时由主线程调用.
  * 若无空闲 fc, 等待某个 worker 完成后释放. */
 static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
@@ -883,51 +1000,10 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
         }
         if (fc) break;
 
-        /* 2 线程优化: 主线程空闲等待时认领一个 P2 (重建) 任务帮 worker.
-         * worker 同时做 P1 (AEC), 实现 P1/P2 重叠 (单 worker 无法自重叠,
-         * 这是 2 线程提升的关键). 仅多线程 (worker 存在) 时参与. */
-        if (c->n_threads_active > 0 && c->n_p2_active < c->p2_cap) {
-            avs2_frame_ctx *p2 = NULL;
-            int best_coi = 0x7fffffff;
-            for (int i = 0; i < c->n_fc; i++) {
-                avs2_frame_ctx *cand = &c->fc[i];
-                if (cand->task_state != 5) continue;
-                int refs_ready = 1;
-                for (int j = 0; j < cand->n_refs; j++) {
-                    avs2_frame *ref = cand->fref[j];
-                    if (ref && !ref->done) {
-                        if (!avs2_atomic_load(&ref->p2_started) &&
-                            avs2_atomic_load(&ref->lf_row_done_count) < 2) {
-                            refs_ready = 0;
-                            break;
-                        }
-                        if (avs2_atomic_load(&ref->lf_row_done_count) < 2) {
-                            refs_ready = 0;
-                            break;
-                        }
-                    }
-                }
-                if (!refs_ready) continue;
-                int coi = cand->fdec ? cand->fdec->coi : 0x7fffffff;
-                if (coi < best_coi) {
-                    best_coi = coi;
-                    p2 = cand;
-                }
-            }
-            if (p2) {
-                p2->task_state = 2;  /* decoding */
-                c->n_p2_active++;
-                avs2_mutex_unlock(&c->task_lock);
-                /* 主线程执行 Phase 2 (逐行重建+LF).
-                 * 参考帧 LF 领先 2 行 (refs_ready 保证), 跨帧 LF 等待不会死锁:
-                 * worker 会按 coi 顺序推进参考帧 P2. */
-                avs2_decode_frame_fc_phase2(c, p2);
-                avs2_mutex_lock(&c->task_lock);
-                c->n_p2_active--;
-                complete_frame(c, p2);
-                avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
-                continue;  /* 重新扫描空闲 fc */
-            }
+        /* 无空闲 fc: 主线程帮做一帧 P2 (P1/P2 重叠), 完成后重新扫描. */
+        if (c->n_threads_active > 0 && c->n_p2_active < c->p2_cap &&
+            main_help_p2(c)) {
+            continue;
         }
 
         /* 无空闲 fc, 等待 worker 完成. 带超时: 若 broadcast 在进入等待前
@@ -1052,7 +1128,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
 
     avs2_cpu_detect(&c->cpu);
 
-    aec_init_context_tab(c->aec_tab_ctx_mps, c->aec_tab_ctx_lps);
+    aec_init_context_tab(c->aec_tab_ctx);
 
     int nthr = c->n_threads;
     if (nthr <= 0) nthr = avs2_cpu_count();
@@ -1064,11 +1140,11 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     if (nfc <= 0) {
         /* 2-pass 调度 (ROW 和 FRAME): Phase 1 (AEC) 完成后帧进入 state==5 等待
          * Phase 2. 行级 LF 依赖 (spin-wait): Phase 2 可在参考帧 Phase 2 开始后
-         * 即启动, P2 重叠执行提高吞吐. n_fc = n_threads * 2: 足够覆盖 P1 并行 +
-         * P2 pipeline 深度, 让更多帧同时进入 Phase 2 重叠执行.
+         * 即启动, P2 重叠执行提高吞吐. n_fc = n_threads * 2 + 2: 覆盖 P1 并行 +
+         * 双 P2 重叠 + main 解析前瞻深度, 减少 worker P1 断供空转.
          * ROW 模式 Phase 2 使用行级并行 (avs2_row_parallel_pass2), 仍需帧间
          * pipeline 深度使 P1(AEC) 与 P2(重建) 重叠. */
-        nfc = nthr * 2;
+        nfc = nthr * 2 + 2;
         if (nfc < 1) nfc = 1;
         if (nfc > AVS2_MAX_FRAME_DELAY) nfc = AVS2_MAX_FRAME_DELAY;
     }
@@ -1108,7 +1184,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         /* coeff_scratch_y/u/v 为静态数组, 无需分配 */
         c->fc[i].task_state = 0;  /* idle */
         /* 预分配 AEC 上下文 (避免每帧 create/destroy 堆操作) */
-        c->fc[i].aec_pool = avs2_aec_create(c->aec_tab_ctx_mps, c->aec_tab_ctx_lps);
+        c->fc[i].aec_pool = avs2_aec_create(c->aec_tab_ctx);
         if (!c->fc[i].aec_pool) {
             avs2_close((avs2_ctx **)&c);
             return NULL;
@@ -1122,6 +1198,17 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     if (c->n_threads > 1) {
         c->p2_cap = (c->thread_mode == AVS2_THREAD_ROW) ?
                     (c->n_threads - 1) : (c->n_threads - 1) * 2 / 3;
+        /* <= 2 线程: p2_cap=1 时, main 在帮助 P2 期间 worker 空转
+         * (唯一 P2 名额被占, 又无 P1 可做). 允许 2 个并发 P2 (相邻帧,
+         * coi 顺序), 后继帧 P2 的跨帧行级 LF 依赖 (lf_row_done) 与前帧
+         * P2 重叠执行, 消除串行化等待. ROW 模式同理: worker 做行级 P2
+         * (owning) 期间 main 可做后继帧的单块 P2.
+         * >= 3 线程 (FRAME): main 在 NOMEM/pick_idle 等待期间也帮做 P2,
+         * p2_cap >= 2 保证 worker 的 P2 名额不被 main 占用. */
+        if (c->n_threads <= 2 ||
+            (c->thread_mode != AVS2_THREAD_ROW && c->p2_cap < 2)) {
+            c->p2_cap = 2;
+        }
     } else {
         c->p2_cap = 1;
     }
@@ -1272,6 +1359,9 @@ void avs2_close(avs2_ctx **ctx)
 {
     if (!ctx || !*ctx) return;
     struct avs2_internal *c = (struct avs2_internal *)*ctx;
+    fprintf(stderr, "[TASK_TIME] P1: %.1f ms (%ld frames, %.2f ms/f) | P2: %.1f ms (%ld frames, %.2f ms/f) | mainP2: %.1f ms\n",
+            g_t_p1, g_n_p1, g_n_p1 ? g_t_p1 / g_n_p1 : 0.0,
+            g_t_p2, g_n_p2, g_n_p2 ? g_t_p2 / g_n_p2 : 0.0, g_t_main);
 
     /* 关闭线程池: 设置 shutdown, 唤醒所有 worker, join.
      * 仅当同步原语已初始化时才进行 (avs2_open 失败路径可能未初始化). */
@@ -1435,15 +1525,23 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
         if (r2 == AVS2_ERR_NOMEM) {
             /* DPB 满: 不消费比特流数据, 释放预留 fc.
              * 等待 worker 完成帧后返回, 让调用者 avs2_get_picture 输出帧释放 DPB 空间.
-             * 避免 busy-spin: 阻塞等待 done_cond 而非空转轮询. */
+             * 等待期间主线程不空睡: 帮做一帧 P2 (n_p2_active < p2_cap 时),
+             * 帧完成释放参考帧 ref_cnt 直接缓解 DPB 压力, 同时把主线程
+             * 变成第三个工作线程 (3+ 线程时 P2 不再是串行瓶颈).
+             * 帮不到 (无 state==5 就绪帧) 时短超时等待后返回, 让调用者
+             * 尽快重试输出 (DPB 满也可能因输出积压). */
             if (c->n_threads_active > 0 && c->cur_fc && c->cur_fc->task_state == 4) {
                 c->cur_fc->task_state = 0;
             }
             if (c->n_threads_active > 0 && c->n_pending > 0) {
                 avs2_mutex_lock(&c->task_lock);
-                if (c->n_pending > 0) {
+                int helped = 0;
+                if (c->n_pending > 0 && c->n_p2_active < c->p2_cap) {
+                    helped = main_help_p2(c);
+                }
+                if (!helped && c->n_pending > 0) {
                     c->n_waiters_done++;
-                    avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
+                    avs2_cond_timedwait(&c->done_cond, &c->task_lock, 10);
                     c->n_waiters_done--;
                 }
                 avs2_mutex_unlock(&c->task_lock);
@@ -1482,6 +1580,10 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
         avs2_mutex_lock(&c->task_lock);
         if (c->flushing) {
             while (c->n_pending > 0) {
+                /* flush 尾部: 主线程帮做 P2 加速收尾, 无可帮时短超时等待. */
+                if (c->n_p2_active < c->p2_cap && main_help_p2(c)) {
+                    continue;
+                }
                 c->n_waiters_done++;
                 avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
                 c->n_waiters_done--;
@@ -1497,7 +1599,9 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
      * 2. flushing 模式下: 查找最小的 POC >= out_next_poc (跳过缺失的 POC),
      *    若不存在则输出最小的 POC (处理迟到/重复帧)
      * 3. 输出帧后检查是否有相同 POC 的重复帧, 若有则保持 out_next_poc 不变 */
-    if (c->out_initialized) {
+    /* flushing 时 out_initialized 可能已被 avs2_flush 重置 (用于 seek 重启),
+     * 但 DPB 中仍有待输出帧, 因此 flushing 模式下也执行输出搜索. */
+    if (c->out_initialized || c->flushing) {
         /* 1. 精确匹配: 在所有 POC == out_next_poc 的帧中选 coi 最大的
          *    (对应 davs2 有序链表: 后解码的重复帧插入在前面, 先输出).
          *    多线程时只选 done 的帧 (已解码完成). */

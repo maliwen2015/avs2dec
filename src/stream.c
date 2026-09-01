@@ -1,21 +1,42 @@
 #include "internal.h"
 #include <stdlib.h>
+#include <string.h>
 
 /*
  * Scan for an AVS2 start code (00 00 01 XX). Returns the byte offset of the
  * start code in *sc_pos and the start code id (XX) in *sc_id. Returns 1 if
  * found, 0 otherwise.
+ *
+ * 优化: 起始码必以 0x00 开头, 用 memchr (glibc 内部为 SIMD 实现) 快速
+ * 跳到下一个候选 0x00, 避免逐字节 3 次比较. 码流中 0x00 稀疏,
+ * 平均每次 memchr 可跳过 ~256 字节.
  */
 int avs2_find_start_code(const uint8_t *data, int sz, int *sc_pos, int *sc_id)
 {
-    for (int i = 0; i + 3 < sz; i++) {
-        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
-            *sc_pos = i;
-            *sc_id = data[i+3];
+    const uint8_t *base;
+    const uint8_t *p;
+    const uint8_t *limit;
+
+    if (sz < 4)
+        return 0;
+
+    /* 起始码前缀 (00 00 01) 的最大起始下标为 sz-4 */
+    base  = data;
+    limit = data + sz - 4;
+    p     = data;
+
+    for (;;) {
+        const uint8_t *z = (const uint8_t *)memchr(p, 0, (size_t)(limit - p) + 1);
+        if (!z)
+            return 0;
+        /* z+3 <= data+sz-1, 越界访问安全 */
+        if (z[1] == 0 && z[2] == 1) {
+            *sc_pos = (int)(z - base);
+            *sc_id  = z[3];
             return 1;
         }
+        p = z + 1;
     }
-    return 0;
 }
 
 /*
@@ -41,6 +62,33 @@ int avs2_dispose_pseudo_code(uint8_t *dst, const uint8_t *src, int i_src)
     uint8_t curr_byte = 0;
 
     while (i_pos < i_src) {
+        /* 快路径: 不处于位重排状态 (last_bit_count==0)、无待决起始码
+         * (b_found_start_code==0) 且前导零 < 2 时, 到下一个 0x00 之前的
+         * 连续非零字节均原样拷贝 (状态机对它们不做任何特判):
+         *   - 0x01 需要 leading_zeros>=2 才构成起始码;
+         *   - 0x02 需要 b_dispose 且 leading_zeros==2 才触发位重排;
+         * 均不满足, 逐字节状态机退化为纯拷贝.
+         * 用 memchr 定位下一个 0x00 (AEC 数据中 0x00 稀疏),
+         * 中间区间整体 memcpy, 消除逐字节 switch 分支树. */
+        if (last_bit_count == 0 && !b_found_start_code && leading_zeros < 2) {
+            const uint8_t *cur  = src + i_pos;
+            const uint8_t *zero = (const uint8_t *)memchr(cur, 0, (size_t)(i_src - i_pos));
+            if (!zero) {
+                memcpy(dst + i_dst, cur, (size_t)(i_src - i_pos));
+                i_dst += i_src - i_pos;
+                break;
+            }
+            {
+                int run = (int)(zero - cur);
+                if (run > 0) {
+                    memcpy(dst + i_dst, cur, (size_t)run);
+                    i_dst += run;
+                    i_pos += run;
+                    leading_zeros = 0;
+                }
+            }
+        }
+
         curr_byte = src[i_pos++];
         curr_bit_count = 8;
         switch (curr_byte) {
