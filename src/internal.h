@@ -2,8 +2,6 @@
 #define AVS2DEC_SRC_INTERNAL_H
 
 #include "avs2dec/avs2dec.h"
-#include "avs2dec/headers.h"
-#include "avs2dec/picture.h"
 
 #include "levels.h"
 #include "getbits.h"

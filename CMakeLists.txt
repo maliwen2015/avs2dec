@@ -68,11 +68,6 @@ set(AVS2DEC_SOURCES
 
 set(AVS2DEC_HEADERS
     include/avs2dec/avs2dec.h
-    include/avs2dec/common.h
-    include/avs2dec/picture.h
-    include/avs2dec/data.h
-    include/avs2dec/headers.h
-    include/avs2dec/version.h
 )
 
 add_library(avs2dec ${AVS2DEC_SOURCES})

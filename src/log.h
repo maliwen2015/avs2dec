@@ -1,7 +1,7 @@
 #ifndef AVS2DEC_SRC_LOG_H
 #define AVS2DEC_SRC_LOG_H
 
-#include "avs2dec/common.h"
+#include "avs2dec/avs2dec.h"
 
 struct avs2_internal;
 
