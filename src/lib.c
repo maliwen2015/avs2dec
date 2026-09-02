@@ -43,15 +43,6 @@ void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
     data->dts = dts;
 }
 
-void avs2_data_wrap_with_cb(avs2_data *data, const uint8_t *buf, size_t sz,
-                            int64_t pts, int64_t dts, void *ref,
-                            void (*free_cb)(const uint8_t *, void *))
-{
-    avs2_data_wrap(data, buf, sz, pts, dts);
-    data->ref = ref;
-    data->free_cb = free_cb;
-}
-
 const char *avs2_version(void) { return AVS2DEC_VERSION_STR; }
 
 unsigned avs2_version_api(void) { return AVS2DEC_API_VERSION; }

@@ -32,14 +32,6 @@ typedef struct avs2_data {
 AVS2DEC_API void avs2_data_wrap(avs2_data *data, const uint8_t *buf,
                                 size_t sz, int64_t pts, int64_t dts);
 
-/*
- * Wrap user-provided data with a custom free callback.
- */
-AVS2DEC_API void avs2_data_wrap_with_cb(avs2_data *data, const uint8_t *buf,
-                                        size_t sz, int64_t pts, int64_t dts,
-                                        void *ref,
-                                        void (*free_cb)(const uint8_t *, void *));
-
 #ifdef __cplusplus
 }
 #endif
