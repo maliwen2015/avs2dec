@@ -57,7 +57,6 @@ void avs2_default_settings(avs2_settings *s)
     s->strict_std_compliance = 0;
     s->skip_loop_filter = 0;
     s->thread_mode = AVS2_THREAD_FRAME;
-    s->force_8bit = 0;
 }
 
 /* ===================================================================
@@ -1110,7 +1109,6 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->strict_std_compliance = s->strict_std_compliance;
         c->skip_loop_filter = s->skip_loop_filter;
         c->thread_mode = s->thread_mode;
-        c->force_8bit = s->force_8bit;
         c->allocator = s->allocator;
         c->logger = s->logger;
     } else {

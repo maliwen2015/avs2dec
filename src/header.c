@@ -365,9 +365,6 @@ int avs2_parse_sequence_header(struct avs2_internal *c, avs2_bs *bs)
     s->enc_width  = ((s->horizontal_size + MIN_CU_SIZE - 1) >> MIN_CU_SIZE_IN_BIT) << MIN_CU_SIZE_IN_BIT;
     s->enc_height = ((s->vertical_size   + MIN_CU_SIZE - 1) >> MIN_CU_SIZE_IN_BIT) << MIN_CU_SIZE_IN_BIT;
 
-    /* force_8bit: 始终在原始位深空间解码, 仅在输出时降为 8-bit.
-     * force_8bit 标志由输出路径 (yuv.c) 检查, 逐像素右移 >>2 输出. */
-
     /* 多线程优化: 比较新旧 sequence header.
      * 若内容相同 (同一序列的重复 sequence header), 跳过写入 c->seq/c->bit_depth/g_dc_value,
      * 避免 memset 竞争, 无需等待 worker.

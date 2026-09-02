@@ -314,7 +314,6 @@ typedef struct avs2_settings {
     int strict_std_compliance;
     int skip_loop_filter;   /* 1 = skip all in-loop filters */
     int thread_mode;        /* avs2_thread_mode: 0=frame, 1=row */
-    int force_8bit;         /* 1 = 强制 8-bit 解码 (有损, 提升性能) */
     uint8_t reserved[24];
 } avs2_settings;
 
