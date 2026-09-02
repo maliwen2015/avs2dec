@@ -2,8 +2,6 @@
 #define AVS2DEC_SRC_INTERNAL_H
 
 #include "avs2dec/avs2dec.h"
-#include "avs2dec/headers.h"
-#include "avs2dec/picture.h"
 
 #include "levels.h"
 #include "getbits.h"
@@ -305,7 +303,6 @@ struct avs2_internal {
     int strict_std_compliance;
     int skip_loop_filter;
     int thread_mode;  /* avs2_thread_mode: 0=frame, 1=row */
-    int force_8bit;   /* 1 = 强制 8-bit 解码 (有损) */
     avs2_picture_alloc allocator;
     avs2_logger logger;
 

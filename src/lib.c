@@ -43,15 +43,6 @@ void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
     data->dts = dts;
 }
 
-void avs2_data_wrap_with_cb(avs2_data *data, const uint8_t *buf, size_t sz,
-                            int64_t pts, int64_t dts, void *ref,
-                            void (*free_cb)(const uint8_t *, void *))
-{
-    avs2_data_wrap(data, buf, sz, pts, dts);
-    data->ref = ref;
-    data->free_cb = free_cb;
-}
-
 const char *avs2_version(void) { return AVS2DEC_VERSION_STR; }
 
 unsigned avs2_version_api(void) { return AVS2DEC_API_VERSION; }
@@ -66,7 +57,6 @@ void avs2_default_settings(avs2_settings *s)
     s->strict_std_compliance = 0;
     s->skip_loop_filter = 0;
     s->thread_mode = AVS2_THREAD_FRAME;
-    s->force_8bit = 0;
 }
 
 /* ===================================================================
@@ -1119,7 +1109,6 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->strict_std_compliance = s->strict_std_compliance;
         c->skip_loop_filter = s->skip_loop_filter;
         c->thread_mode = s->thread_mode;
-        c->force_8bit = s->force_8bit;
         c->allocator = s->allocator;
         c->logger = s->logger;
     } else {

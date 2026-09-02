@@ -74,7 +74,6 @@ static void usage(const char *prog)
         "  --benchmark  decode without writing output, print fps\n"
         "  --frames N   stop after decoding N frames\n"
         "  --no-simd    disable SIMD optimizations\n"
-        "  --8bit       force 8-bit decode (lossy, faster)\n"
         "  --frame-hash  print per-frame FNV-1a hash (for diff debugging)\n"
         "  -v           verbose (debug)\n"
         "  --version    print version and exit\n",
@@ -91,7 +90,6 @@ int main(int argc, char *argv[])
     int max_frames = 0;  /* 0 = unlimited */
     int no_simd = 0;
     int frame_hash = 0;  /* 逐帧哈希输出 */
-    int force_8bit = 0;  /* 强制 8-bit 解码 */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc) in_path = argv[++i];
@@ -104,7 +102,6 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "--benchmark")) benchmark = 1;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-simd")) no_simd = 1;
-        else if (!strcmp(argv[i], "--8bit")) force_8bit = 1;
         else if (!strcmp(argv[i], "--frame-hash")) { frame_hash = 1; benchmark = 1; }
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "--version")) {
@@ -128,7 +125,6 @@ int main(int argc, char *argv[])
     s.thread_mode = thread_mode;
     s.log_level = quiet ? AVS2_LOG_ERROR : (verbose ? AVS2_LOG_DEBUG : AVS2_LOG_INFO);
     s.skip_loop_filter = no_filter;
-    s.force_8bit = force_8bit;
 
     avs2_ctx *ctx = avs2_open(&s);
     if (!ctx) { fprintf(stderr, "avs2_open failed\n"); return 1; }
@@ -151,7 +147,6 @@ int main(int argc, char *argv[])
             avs2_close(&ctx);
             return 1;
         }
-        out.force_8bit = force_8bit;
         has_output = 1;
     }
 

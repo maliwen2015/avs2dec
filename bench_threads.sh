@@ -270,13 +270,6 @@ if [[ "$BITEXACT_ONLY" -eq 0 ]]; then
         echo ""
     fi
 
-    # ---- 10-bit vs 8-bit 对比 ----
-    log "${BOLD}--- 10-bit vs 8-bit 对比 (单线程) ---${NC}"
-    run_decode "10-bit原生" "1" "0" "" "$PERF_FILE" || true
-    run_decode "强制8-bit" "1" "0" "--8bit" "$PERF_FILE" || true
-    echo "" >> "$LOG_FILE"
-    echo ""
-
     # ---- 性能汇总表 ----
     log "${BOLD}${BLUE}========== 性能汇总 ==========${NC}"
     echo "" >> "$LOG_FILE"
