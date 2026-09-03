@@ -5,6 +5,89 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include <pthread.h>
+
+/* ---- 临时调试: SIGUSR1 转储内部状态 (AVS2DEC_DEBUG_USR1=1 启用) ---- */
+static struct avs2_internal *g_dbg_c;
+static void dbg_dump_state(int sig)
+{
+    (void)sig;
+    struct avs2_internal *c = g_dbg_c;
+    if (!c) return;
+    char buf[16384];
+    int n = 0;
+#define DBG(...) n += snprintf(buf + n, sizeof(buf) - n, __VA_ARGS__)
+    DBG("\n=== AVS2DEC STATE DUMP ===\n");
+    DBG("in_buf_sz=%d flushing=%d n_dpb=%d out_next_poc=%d out_q=[%d,%d)\n",
+        c->in_buf_sz, c->flushing, c->n_dpb, c->out_next_poc, c->out_head, c->out_tail);
+    DBG("n_pending=%d n_p2_active=%d/%d n_aec_active=%d/%d task_q=[%d,%d) p2_q=[%d,%d)\n",
+        c->n_pending, c->n_p2_active, c->p2_cap, c->n_aec_active, c->aec_cap,
+        c->task_q_head, c->task_q_tail, c->phase2_q_head, c->phase2_q_tail);
+    DBG("row_task_fc=%d n_fc=%d\n", c->row_task_fc ? (int)(c->row_task_fc - c->fc) : -1, c->n_fc);
+    for (int i = 0; i < c->n_fc; i++) {
+        avs2_frame_ctx *fc = &c->fc[i];
+        n += snprintf(buf + n, sizeof(buf) - n,
+            "fc[%d] st=%d deps=%d/%d aec_done=%d aec_st=%d recon_st=%d/%d "
+            "p2par=%d rowsplit=%d nrow=%d aecC=%d rnext=%d lnext=%d lcnt=%d fdec=%d refs=[",
+            i, fc->task_state, fc->n_deps, fc->n_aec_deps, fc->aec_done, fc->aec_started,
+            fc->recon_started, fc->recon_active, fc->p2_parallel, fc->p2_split_row,
+            fc->n_row_workers, fc->row_aec_completed, fc->row_recon_next,
+            fc->row_lf_next, fc->row_lf_done_count,
+            fc->fdec ? fc->fdec->poc : -9999);
+        for (int j = 0; j < fc->n_refs && j < AVS2_MAX_REFS; j++) {
+            if (fc->fref[j])
+                n += snprintf(buf + n, sizeof(buf) - n, "%d(lf%d) ",
+                              fc->fref[j]->poc,
+                              (int)avs2_atomic_load(&fc->fref[j]->lf_row_done_count));
+            else
+                n += snprintf(buf + n, sizeof(buf) - n, "null ");
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "] mrr[39]=%d mrr[46]=%d\n",
+                      fc->mv_row_range[39], fc->mv_row_range[46]);
+    }
+    for (int i = 0; i < c->n_dpb; i++) {
+        avs2_frame *f = c->dpb[i];
+        if (!f) continue;
+        int naec = 0, nlf = 0;
+        for (int r = 0; r < f->h_lcu; r++) { naec += f->aec_row_done[r] ? 1 : 0; nlf += f->lf_row_done[r] ? 1 : 0; }
+        DBG("dpb[%d] poc=%d coi=%d used=%d ref=%d out=%d refcnt=%d done=%d p2st=%d aec_rows=%d/%d lf_rows=%d/%d\n",
+            i, f->poc, f->coi, f->used, f->referenced, f->output, f->ref_cnt,
+            f->done, f->p2_started, naec, f->h_lcu, nlf, f->h_lcu);
+    }
+    DBG("=== END DUMP ===\n");
+#undef DBG
+    write(2, buf, n);
+}
+static void *dbg_watchdog(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 600; i++) {
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
+        struct sigaction sa;
+        if (sigaction(SIGUSR1, NULL, &sa) != 0) continue;
+        if (sa.sa_handler != dbg_dump_state) {
+            fprintf(stderr, "[dbg] !!! SIGUSR1 handler CHANGED at t=%ds to %p\n",
+                    i + 1, (void *)sa.sa_handler);
+            fflush(stderr);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+static void dbg_install(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = dbg_dump_state;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    pthread_t th;
+    pthread_create(&th, NULL, dbg_watchdog, NULL);
+    pthread_detach(th);
+}
 
 #ifndef PIPELINE_DEBUG
 #define PIPELINE_DEBUG 0
@@ -21,18 +104,6 @@
 #define PDBG(fmt, ...) ((void)0)
 #endif
 
-/* ---- 临时计时 (TASK_TIME): P1/P2 阶段耗时分布 ---- */
-#include <time.h>
-static double g_t_p1 = 0, g_t_p2 = 0;
-static long g_n_p1 = 0, g_n_p2 = 0;
-static double g_t_main = 0;
-static inline double task_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
-}
-
 void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
                     int64_t pts, int64_t dts)
 {
@@ -45,8 +116,6 @@ void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
 
 const char *avs2_version(void) { return AVS2DEC_VERSION_STR; }
 
-unsigned avs2_version_api(void) { return AVS2DEC_API_VERSION; }
-
 void avs2_default_settings(avs2_settings *s)
 {
     memset(s, 0, sizeof(*s));
@@ -54,7 +123,6 @@ void avs2_default_settings(avs2_settings *s)
     s->max_frame_delay = 0;
     s->log_level = AVS2_LOG_WARNING;
     s->frame_size_limit = 0;
-    s->strict_std_compliance = 0;
     s->skip_loop_filter = 0;
     s->thread_mode = AVS2_THREAD_FRAME;
 }
@@ -121,6 +189,18 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
 
     /* pipeline 模式 helper 空转计数: 超限返回 0, 让 recon_thread_fn cond_wait */
     int helper_idle_cnt = 0;
+
+    /* 空帧 (h_lcu==0): 例如序列头未解析成功时喂入的垃圾帧, 无行可处理.
+     * 不在此直接标记完成的话, owning worker (is_helper=0) 会因
+     * row_recon_completed 永不置位而无限 spin-wait 卡死 (FRAME 模式
+     * Phase 2 对空帧不做任何行循环, 直接完成, 故不受影响).
+     * 置位 row_recon_completed 让 owner 与所有 helper 立即退出,
+     * 帧随后经 complete_frame 正常完成. */
+    if (h_lcu <= 0) {
+        avs2_atomic_store(&fc->row_recon_completed, 1);
+        avs2_set_thread_scratch(NULL, NULL, NULL);
+        return 1;
+    }
 
     for (;;) {
         /* 帧完成检查 */
@@ -823,9 +903,7 @@ static void *worker_thread(void *arg)
 
         if (phase == 1) {
             /* ---- 2-pass Phase 1 (AEC) ---- */
-            { double _t0 = task_now_ms();
             avs2_decode_frame_fc_phase1(c, fc);
-            g_t_p1 += task_now_ms() - _t0; g_n_p1++; }
 
             if (c->shutdown) break;
 
@@ -842,13 +920,11 @@ static void *worker_thread(void *arg)
             /* ---- 2-pass Phase 2 (重建+LF) ----
              * ROW 模式: 行级并行重建+LF (avs2_row_parallel_pass2)
              * FRAME 模式: 逐行 inline deblock (cache 友好) */
-            { double _t0 = task_now_ms();
             if (c->thread_mode == AVS2_THREAD_ROW) {
                 avs2_decode_frame_fc_phase2_row(c, fc);
             } else {
                 avs2_decode_frame_fc_phase2(c, fc);
             }
-            g_t_p2 += task_now_ms() - _t0; g_n_p2++; }
             avs2_mutex_lock(&c->task_lock);
             c->n_p2_active--;  /* 释放 P2 名额 */
             if (c->thread_mode == AVS2_THREAD_ROW)
@@ -941,9 +1017,7 @@ static int main_help_p2(struct avs2_internal *c)
                     !avs2_atomic_load(&cand->row_recon_completed)) {
                     cand->n_row_workers++;
                     avs2_mutex_unlock(&c->task_lock);
-                    { double _t0 = task_now_ms();
                     avs2_row_parallel_pass2(c, cand, 1, 1);
-                    g_t_main += task_now_ms() - _t0; }
                     avs2_mutex_lock(&c->task_lock);
                     cand->n_row_workers--;
                     if (cand->n_row_workers == 0) {
@@ -963,10 +1037,7 @@ static int main_help_p2(struct avs2_internal *c)
     /* 主线程执行 Phase 2 (逐行重建+LF).
      * 参考帧 LF 领先 2 行 (refs_ready 保证), 跨帧 LF 等待不会死锁:
      * worker 会按 coi 顺序推进参考帧 P2. */
-    { double _t0 = task_now_ms();
     avs2_decode_frame_fc_phase2(c, p2);
-    g_t_p2 += task_now_ms() - _t0; g_n_p2++;
-    g_t_main += task_now_ms() - _t0; }
     avs2_mutex_lock(&c->task_lock);
     c->n_p2_active--;
     complete_frame(c, p2);
@@ -1106,16 +1177,17 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->max_frame_delay = s->max_frame_delay;
         c->log_level = s->log_level;
         c->frame_size_limit = s->frame_size_limit;
-        c->strict_std_compliance = s->strict_std_compliance;
         c->skip_loop_filter = s->skip_loop_filter;
         c->thread_mode = s->thread_mode;
-        c->allocator = s->allocator;
         c->logger = s->logger;
     } else {
         c->log_level = AVS2_LOG_WARNING;
     }
 
     avs2_cpu_detect(&c->cpu);
+
+    g_dbg_c = c;
+    dbg_install();
 
     aec_init_context_tab(c->aec_tab_ctx);
 
@@ -1348,9 +1420,6 @@ void avs2_close(avs2_ctx **ctx)
 {
     if (!ctx || !*ctx) return;
     struct avs2_internal *c = (struct avs2_internal *)*ctx;
-    fprintf(stderr, "[TASK_TIME] P1: %.1f ms (%ld frames, %.2f ms/f) | P2: %.1f ms (%ld frames, %.2f ms/f) | mainP2: %.1f ms\n",
-            g_t_p1, g_n_p1, g_n_p1 ? g_t_p1 / g_n_p1 : 0.0,
-            g_t_p2, g_n_p2, g_n_p2 ? g_t_p2 / g_n_p2 : 0.0, g_t_main);
 
     /* 关闭线程池: 设置 shutdown, 唤醒所有 worker, join.
      * 仅当同步原语已初始化时才进行 (avs2_open 失败路径可能未初始化). */
@@ -1470,24 +1539,15 @@ static int find_next_picture(struct avs2_internal *c, int offset)
     return -1;
 }
 
-int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
+/* Try to extract and decode complete pictures from in_buf.
+ * Returns the last error seen (AVS2_OK if none), *progress set to 1 if at
+ * least one picture was decoded (i.e. in_buf advanced).
+ * Called from avs2_send_data and from avs2_get_picture (flush 尾部恢复). */
+static int extract_pictures(struct avs2_internal *c, int *progress)
 {
-    struct avs2_internal *c = (struct avs2_internal *)ctx;
-    if (!ctx) return AVS2_ERR_INVALID;
-    if (!data) {
-        /* flush signal: 设置 flushing 标志, 然后处理缓冲区中剩余的帧.
-         * 不在此处解码 — 落入下面的通用帧提取循环处理. */
-        c->flushing = 1;
-    } else {
-        if (!data->data && data->sz > 0) return AVS2_ERR_INVALID;
-        int r = append_input(c, data);
-        if (r) return r;
-        if (data->free_cb) data->free_cb(data->data, data->ref);
-    }
-
-    /* Try to extract and decode complete frames. */
     int scan = 0;
     int last_err = AVS2_OK;
+    if (progress) *progress = 0;
     for (;;) {
         int p = find_next_picture(c, scan);
         if (p < 0) break;
@@ -1535,8 +1595,8 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
                 }
                 avs2_mutex_unlock(&c->task_lock);
             }
-            /* NOMEM 是可恢复的 (调用者输出帧后可重试), 返回 OK 让调用者继续.
-             * 但记录到 last_err 以便在无更多数据时通知调用者. */
+            /* NOMEM 是可恢复的: 数据仍留在 in_buf, DPB 释放后由后续
+             * send_data/get_picture 自动继续解码. */
             if (last_err == AVS2_OK) last_err = AVS2_ERR_NOMEM;
             break;
         }
@@ -1552,8 +1612,26 @@ int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
             memmove(c->in_buf, c->in_buf + q, (size_t)remain);
         c->in_buf_sz = remain;
         scan = 0;
+        if (progress) *progress = 1;
     }
     return last_err;
+}
+
+int avs2_send_data(avs2_ctx *ctx, avs2_data *data)
+{
+    struct avs2_internal *c = (struct avs2_internal *)ctx;
+    if (!ctx) return AVS2_ERR_INVALID;
+    if (!data) {
+        /* flush signal: 设置 flushing 标志, 然后处理缓冲区中剩余的帧.
+         * 不在此处解码 — 落入通用帧提取循环处理. */
+        c->flushing = 1;
+    } else {
+        if (!data->data && data->sz > 0) return AVS2_ERR_INVALID;
+        int r = append_input(c, data);
+        if (r) return r;
+    }
+
+    return extract_pictures(c, NULL);
 }
 
 int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
@@ -1565,6 +1643,7 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
     /* 多线程优化: 非 flushing 模式不等待所有任务完成, 而是按需检查 done 标志.
      * 这样主线程可以在 worker 解码时继续 send_data 提交新帧, 提升流水线深度.
      * flushing 模式仍需等待所有任务完成, 确保所有帧都已解码. */
+retry_output:
     if (mt) {
         avs2_mutex_lock(&c->task_lock);
         if (c->flushing) {
@@ -1662,6 +1741,14 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
         avs2_mutex_unlock(&c->out_lock);
     }
     if (!f) {
+        /* flush 尾部恢复: DPB 曾满导致 in_buf 残留未解码数据时,
+         * 在此继续解码 (锁已释放, 可安全调用 pick_idle_fc 等), 然后重试输出.
+         * 每轮解码至少一帧才重试, 保证终止. */
+        if (c->flushing && c->in_buf_sz > 0) {
+            int progress = 0;
+            extract_pictures(c, &progress);
+            if (progress) goto retry_output;
+        }
         return c->flushing ? AVS2_ERR_EOF : AVS2_ERR_AGAIN;
     }
 

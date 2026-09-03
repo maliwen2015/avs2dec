@@ -277,24 +277,12 @@ avs2_frame *avs2_dpb_get_free(struct avs2_internal *c)
         }
         return nf;
     }
-    /* 4. 最后手段: 释放不被参考且无 worker/user 引用的最老帧 (即使未输出).
-     * 注: 修正原逻辑 — 注释说"即使未输出"但条件仍要求 f->output, 矛盾.
-     * 此处真正移除 f->output 要求, 用于低延迟模式前几帧全未输出时的回收. */
-    {
-        int oldest_coi = 0x7fffffff;
-        avs2_frame *oldest = NULL;
-        for (int i = 0; i < c->n_dpb; i++) {
-            avs2_frame *f = c->dpb[i];
-            if (f && f->used && !f->referenced && f->ref_cnt <= 1 && f->coi < oldest_coi) {
-                oldest_coi = f->coi;
-                oldest = f;
-            }
-        }
-        if (oldest) {
-            avs2_frame_free(oldest);
-            return oldest;
-        }
-    }
+    /* 4. DPB 满 (槽位用尽或内存分配失败): 返回 NULL, 由调用方转为
+     * AVS2_ERR_NOMEM, 向上游施加背压 (send_data 不消费数据, 调用方
+     * get_picture 输出帧释放 DPB 后重试).
+     * 绝不回收未输出的帧: 那会静默丢帧 (输出饥饿时 DPB 堆积, 偷走的
+     * 恰是待输出的最老帧), 且可能偷走 out_next_poc 指向的帧导致
+     * 输出排序永久卡死. */
     return NULL;
 }
 

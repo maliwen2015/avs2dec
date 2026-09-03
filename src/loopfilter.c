@@ -112,8 +112,10 @@ static void lcu_set_deblock_flag(avs2_frame *f, int i_level, int scu_x, int scu_
     avs2_cu *p_cu = &f->cu_grid[scu_y * w_in_scu + scu_x];
     int i;
 
-    if (p_cu->cu_level < i_level) {
-        /* 当前 CU 小于该层级, 递归 4 个子块 */
+    if (p_cu->cu_level < i_level && i_level > MIN_CU_SIZE_IN_BIT) {
+        /* 当前 CU 大于该层级, 递归 4 个子块.
+         * i_level 下界保护: 码流损坏时 cu_grid 可能残留垃圾 cu_level,
+         * 无下界会导致 1 << (i_level - MIN_CU_SIZE_IN_BIT - 1) 负移位 UB. */
         for (i = 0; i < 4; i++) {
             int sub_cu_x = scu_x + ((i & 1) << (i_level - MIN_CU_SIZE_IN_BIT - 1));
             int sub_cu_y = scu_y + ((i >> 1) << (i_level - MIN_CU_SIZE_IN_BIT - 1));

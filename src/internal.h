@@ -124,7 +124,6 @@ typedef struct avs2_frame {
     uint8_t *intra_border[3];
 
     avs2_ref *ref;           /* refcounted buffer */
-    void *pic_cookie;
     int ref_cnt;
     int done;                /* 帧解码完成标志 (多线程: worker 设置, get_picture 读取) */
     volatile int p2_started; /* Phase 2 (重建+LF) 已开始. 依赖帧在 Phase 2 调度时
@@ -300,10 +299,8 @@ struct avs2_internal {
     int max_frame_delay;
     int log_level;
     unsigned frame_size_limit;
-    int strict_std_compliance;
     int skip_loop_filter;
     int thread_mode;  /* avs2_thread_mode: 0=frame, 1=row */
-    avs2_picture_alloc allocator;
     avs2_logger logger;
 
     avs2_cpu_flags cpu;

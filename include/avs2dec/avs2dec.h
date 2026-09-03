@@ -51,14 +51,14 @@ extern "C" {
  * Version
  * ===================================================================== */
 #define AVS2DEC_VERSION_MAJOR 1
-#define AVS2DEC_VERSION_MINOR 0
+#define AVS2DEC_VERSION_MINOR 1
 #define AVS2DEC_VERSION_PATCH 0
 
 #define AVS2DEC_API_MAJOR 1
-#define AVS2DEC_API_MINOR 0
+#define AVS2DEC_API_MINOR 1
 #define AVS2DEC_API_PATCH 0
 
-#define AVS2DEC_VERSION_STR "1.0.0"
+#define AVS2DEC_VERSION_STR "1.1.0"
 
 /* API version (0x00MMmmpp). */
 #define AVS2DEC_API_VERSION                                                 \
@@ -222,7 +222,7 @@ typedef struct avs2_pic_header {
 } avs2_pic_header;
 
 /* =====================================================================
- * Picture descriptor & allocator
+ * Picture descriptor
  * ===================================================================== */
 
 /* Picture structure (1=frame, 2=top field, 3=bottom field) */
@@ -231,18 +231,6 @@ enum avs2_picture_structure_e {
     AVS2_PIC_STRUCTURE_TOP_FIELD   = 1,
     AVS2_PIC_STRUCTURE_BOT_FIELD   = 2,
 };
-
-typedef struct avs2_picture_alloc {
-    void *cookie;
-    /*
-     * Allocate a picture buffer. Returns 0 on success.
-     *  data  - per-plane data pointers (set by allocator)
-     *  stride- per-plane stride in bytes (set by allocator)
-     */
-    int (*alloc_picture)(void *cookie, uint8_t *data[3],
-                         ptrdiff_t stride[3], void **pic_cookie);
-    void (*release_picture)(void *cookie, void *pic_cookie);
-} avs2_picture_alloc;
 
 typedef struct avs2_picture {
     /* picture data */
@@ -265,7 +253,6 @@ typedef struct avs2_picture {
     int64_t pts;
     int64_t dts;
 
-    void *pic_cookie;       /* allocator private */
     void *dec_frame;        /* opaque decoder frame reference */
 } avs2_picture;
 
@@ -277,13 +264,12 @@ typedef struct avs2_data {
     size_t sz;           /* size in bytes */
     int64_t pts;         /* presentation timestamp */
     int64_t dts;         /* decoding timestamp */
-    void *ref;           /* optional reference-tracking cookie */
-    void (*free_cb)(const uint8_t *data, void *ref);
 } avs2_data;
 
 /*
- * Wrap user-provided data. The data pointer must remain valid until the
- * decoder consumes it (i.e. until avs2_send_data() returns AVS2_OK).
+ * Wrap user-provided data. The buffer is copied into the decoder's internal
+ * buffer during avs2_send_data(), so the caller may free or reuse it as soon
+ * as the call returns (regardless of the return value).
  */
 AVS2DEC_API void avs2_data_wrap(avs2_data *data, const uint8_t *buf,
                                 size_t sz, int64_t pts, int64_t dts);
@@ -302,19 +288,15 @@ enum avs2_thread_mode {
 };
 
 typedef struct avs2_ctx avs2_ctx;
-typedef struct avs2_ref avs2_ref;
 
 typedef struct avs2_settings {
     int n_threads;       /* 0 = auto (logical cores) */
     int max_frame_delay; /* 1 = low-latency; 0 = auto */
     int log_level;       /* avs2_log_level_e */
     unsigned frame_size_limit; /* 0 = 默认上限 16384; 否则为单边最大像素数 */
-    avs2_picture_alloc allocator; /* 自定义帧分配器 (当前未实现, 保留) */
     avs2_logger logger;
-    int strict_std_compliance;
     int skip_loop_filter;   /* 1 = skip all in-loop filters */
     int thread_mode;        /* avs2_thread_mode: 0=frame, 1=row */
-    uint8_t reserved[24];
 } avs2_settings;
 
 /* Initialize settings to defaults. */
@@ -322,9 +304,6 @@ AVS2DEC_API void avs2_default_settings(avs2_settings *s);
 
 /* Library version string. */
 AVS2DEC_API const char *avs2_version(void);
-
-/* API version (0x00MMmmpp). */
-AVS2DEC_API unsigned avs2_version_api(void);
 
 /* Open a decoder. Returns NULL on failure. */
 AVS2DEC_API avs2_ctx *avs2_open(const avs2_settings *s);
@@ -335,10 +314,11 @@ AVS2DEC_API void avs2_close(avs2_ctx **ctx);
 /*
  * Push compressed AVS2 bitstream data (Annex B start-code format).
  * Returns AVS2_OK on success (可能已解码若干帧, 调用 avs2_get_picture 取走),
- * AVS2_ERR_NOMEM 表示 DPB 满 (调用 avs2_get_picture 输出帧后重试),
+ * AVS2_ERR_NOMEM 表示 DPB 满 (解码暂停, 数据已被缓冲, DPB 释放后自动继续;
+ * 调用方应继续调用 avs2_get_picture 排空输出, 不要重发同一数据),
  * AVS2_ERR_INVALID 表示码流错误或参数无效.
  * 传入 data==NULL 表示 flush 信号 (排空解码器).
- * 数据在返回前被完全消费 (调用者可立即释放), 但 NOMEM 时当前帧未消费.
+ * 数据在返回前已被复制进内部缓冲 (调用者可立即释放, 无论返回值如何).
  */
 AVS2DEC_API int avs2_send_data(avs2_ctx *ctx, avs2_data *data);
 

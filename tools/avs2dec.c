@@ -105,7 +105,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "--frame-hash")) { frame_hash = 1; benchmark = 1; }
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "--version")) {
-            printf("avs2dec %s (API 0x%06x)\n", avs2_version(), avs2_version_api());
+            printf("avs2dec %s\n", avs2_version());
             return 0;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]); return 0;
@@ -162,8 +162,10 @@ int main(int argc, char *argv[])
         if (rd <= 0) { eof = 1; break; }
         avs2_data data;
         avs2_data_wrap(&data, buf, rd, n_frames, n_frames);
+        /* NOMEM: DPB 满, 数据已被缓冲, 解码会在 DPB 释放后自动继续 —
+         * 不要重发同一数据 (会重复), 继续喂数/排空输出即可. */
         int r = avs2_send_data(ctx, &data);
-        if (r < 0) fprintf(stderr, "send_data: %d\n", r);
+        if (r < 0 && r != AVS2_ERR_NOMEM) fprintf(stderr, "send_data: %d\n", r);
 
         /* drain pictures */
         for (;;) {

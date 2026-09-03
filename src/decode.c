@@ -301,6 +301,51 @@ static void compute_mv_row_range_for_row(avs2_frame *f, int lcu_size,
  * 优势: Phase 1 可与前一帧的 Phase 2 并行执行, 大幅提升帧间并行度.
  *       AEC 占解码时间 ~80%, 将其从依赖链中解耦后, 串行瓶颈仅剩 ~20%.
  * =================================================================== */
+/* Phase 1 异常中止 (提前返回): 补齐 AEC 完成契约.
+ *
+ * 正常情况下 Phase 1 逐行置位 f->aec_row_done[], 全部完成后在 task_lock
+ * 下置位 fc->aec_done 并递减依赖帧的 n_aec_deps. 但遇到无效 slice 数据
+ * (bs.buf == NULL, 例如 mpegts 喂入的垃圾数据) 时, Phase 1 会在进入 LCU
+ * 循环前提前返回. 若此时不置位 aec_row_done/aec_done:
+ *   1. ROW 模式 Phase 2 (avs2_row_parallel_pass2) 的 owning worker 会
+ *      在领取重建行时 spin-wait aec_row_done[0], 该标志永不置位 → 无限自旋卡死
+ *      (FRAME 模式 Phase 2 不检查 aec_row_done, 故不受影响).
+ *   2. 依赖此帧 AEC 的后续帧 n_aec_deps 永不递减 → 依赖帧卡在 state==1.
+ *
+ * 此函数模拟"整帧 AEC 已完成": 置位全部 aec_row_done + aec_done (以及
+ * aec_started, 与正常路径一致, 避免 complete_frame 的 n_aec_deps 补偿
+ * 二次递减), 并执行与正常收尾相同的依赖递减和广播. 错误帧随后在
+ * Phase 2 中按垃圾帧处理并正常完成, 行为与 FRAME 模式一致. */
+static void avs2_phase1_abort(struct avs2_internal *c, avs2_frame_ctx *fc)
+{
+    avs2_frame *f = fc->fdec;
+    if (f) {
+        int h_lcu = f->h_lcu;
+        for (int i = 0; i < h_lcu; i++)
+            avs2_atomic_store(&f->aec_row_done[i], 1);
+    }
+
+    avs2_mutex_lock(&c->task_lock);
+    fc->aec_started = 1;
+    fc->aec_done = 1;
+    {
+        for (int i = 0; i < c->n_fc; i++) {
+            avs2_frame_ctx *other = &c->fc[i];
+            if (other != fc && (other->task_state == 1 || other->task_state == 2 ||
+                                other->task_state == 5 || other->task_state == 6) &&
+                other->n_refs > 0 && other->fref[0] == fc->fdec &&
+                !IS_INTRA(other->slice_type)) {
+                other->n_aec_deps--;
+                if (other->n_aec_deps == 0 && other->task_state == 1) {
+                    avs2_cond_signal(&c->task_cond);
+                }
+            }
+        }
+    }
+    avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
+    avs2_mutex_unlock(&c->task_lock);
+}
+
 /* 2-pass 帧并行: Phase 1 (AEC)
  * 等待 col_pic 的 AEC 完成, 执行 AEC 解码, 发送 aec_done 信号.
  * Phase 1 不等待参考帧重建, 与参考帧 Phase 2 并行. */
@@ -311,16 +356,21 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
 
     if (!f) {
         avs2_warn(c, "no frame allocated\n");
+        avs2_phase1_abort(c, fc);
         return AVS2_ERR_INVALID;
     }
     if (!fc->bs.buf) {
         avs2_warn(c, "no slice data (bs.buf is NULL)\n");
+        avs2_phase1_abort(c, fc);
         return AVS2_ERR_INVALID;
     }
 
     /* 分配 per-LCU 系数缓冲区 */
     int r = ensure_row_parallel_buffers(fc, f, c->seq->log2_lcu_size);
-    if (r) return r;
+    if (r) {
+        avs2_phase1_abort(c, fc);
+        return r;
+    }
 
     /* 重置行级 LF 依赖状态 (行级 LF 依赖).
      * 此处安全: 帧刚被选取 (ref_cnt==1), 上一轮所有依赖帧已完成.

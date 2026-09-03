@@ -125,16 +125,21 @@ else()
     endif()
 endif()
 
+# 内部符号全部隐藏, 只有标记 AVS2DEC_API 的公开函数对外可见
+# (静态库与共享库一致; Windows 上公开函数由头宏生成 dllexport)
+target_compile_definitions(avs2dec PRIVATE AVS2DEC_BUILD_EXPORTS)
+set_target_properties(avs2dec PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
 if(AVS2DEC_BUILD_SHARED)
-    target_compile_definitions(avs2dec PRIVATE AVS2DEC_BUILD_EXPORTS)
     set_target_properties(avs2dec PROPERTIES
         VERSION ${AVS2DEC_VERSION}
         SOVERSION ${AVS2DEC_VERSION_MAJOR}
-        C_VISIBILITY_PRESET hidden
-        VISIBILITY_INLINES_HIDDEN ON
     )
 else()
-    target_compile_definitions(avs2dec PUBLIC AVS2DEC_STATIC)
+    # 静态库使用者: AVS2DEC_API 展开为空 (仅作用于链接方, 不影响本目标编译)
+    target_compile_definitions(avs2dec INTERFACE AVS2DEC_STATIC)
 endif()
 
 if(AVS2DEC_BUILD_CLI)

@@ -138,7 +138,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "--version")) {
             printf("avs2dec_ts (with FFmpeg %s) %s (API 0x%06x)\n",
                    AV_STRINGIFY(LIBAVFORMAT_VERSION),
-                   avs2_version(), avs2_version_api());
+                   avs2_version());
             return 0;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]); return 0;
@@ -303,8 +303,17 @@ int main(int argc, char *argv[])
         avs2_data_wrap(&data, pkt->data, pkt->size,
                        pkt->pts != AV_NOPTS_VALUE ? pkt->pts : n_frames,
                        pkt->dts != AV_NOPTS_VALUE ? pkt->dts : n_frames);
+        if (getenv("AVS2DBG")) {
+            fprintf(stderr, "[AVS2DBG] pkt sz=%d pts=%" PRId64
+                    " head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                    pkt->size, pkt->pts,
+                    pkt->data[0], pkt->data[1], pkt->data[2], pkt->data[3],
+                    pkt->data[4], pkt->data[5], pkt->data[6], pkt->data[7]);
+        }
+        /* NOMEM: DPB 满, 数据已被缓冲, 解码会在 DPB 释放后自动继续 —
+         * 不要重发同一数据 (会重复), 继续喂数/排空输出即可. */
         int r = avs2_send_data(ctx, &data);
-        if (r < 0 && !quiet) {
+        if (r < 0 && r != AVS2_ERR_NOMEM && !quiet) {
             fprintf(stderr, "send_data 警告: %d\n", r);
         }
 
