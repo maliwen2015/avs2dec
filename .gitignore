@@ -1,5 +1,8 @@
 build/
+build-*/
 build_mingw/
+# 调试复现脚本 (一次性的卡死复现源)
+tests/
 cmake-build-*/
 .idea/
 *.yuv
