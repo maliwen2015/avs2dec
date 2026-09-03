@@ -5,104 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <signal.h>
-#include <unistd.h>
 #include <pthread.h>
-
-/* ---- 临时调试: SIGUSR1 转储内部状态 (AVS2DEC_DEBUG_USR1=1 启用) ---- */
-static struct avs2_internal *g_dbg_c;
-static void dbg_dump_state(int sig)
-{
-    (void)sig;
-    struct avs2_internal *c = g_dbg_c;
-    if (!c) return;
-    char buf[16384];
-    int n = 0;
-#define DBG(...) n += snprintf(buf + n, sizeof(buf) - n, __VA_ARGS__)
-    DBG("\n=== AVS2DEC STATE DUMP ===\n");
-    DBG("in_buf_sz=%d flushing=%d n_dpb=%d out_next_poc=%d out_q=[%d,%d)\n",
-        c->in_buf_sz, c->flushing, c->n_dpb, c->out_next_poc, c->out_head, c->out_tail);
-    DBG("n_pending=%d n_p2_active=%d/%d n_aec_active=%d/%d task_q=[%d,%d) p2_q=[%d,%d)\n",
-        c->n_pending, c->n_p2_active, c->p2_cap, c->n_aec_active, c->aec_cap,
-        c->task_q_head, c->task_q_tail, c->phase2_q_head, c->phase2_q_tail);
-    DBG("row_task_fc=%d n_fc=%d\n", c->row_task_fc ? (int)(c->row_task_fc - c->fc) : -1, c->n_fc);
-    for (int i = 0; i < c->n_fc; i++) {
-        avs2_frame_ctx *fc = &c->fc[i];
-        n += snprintf(buf + n, sizeof(buf) - n,
-            "fc[%d] st=%d deps=%d/%d aec_done=%d aec_st=%d recon_st=%d/%d "
-            "p2par=%d rowsplit=%d nrow=%d aecC=%d rnext=%d lnext=%d lcnt=%d fdec=%d refs=[",
-            i, fc->task_state, fc->n_deps, fc->n_aec_deps, fc->aec_done, fc->aec_started,
-            fc->recon_started, fc->recon_active, fc->p2_parallel, fc->p2_split_row,
-            fc->n_row_workers, fc->row_aec_completed, fc->row_recon_next,
-            fc->row_lf_next, fc->row_lf_done_count,
-            fc->fdec ? fc->fdec->poc : -9999);
-        for (int j = 0; j < fc->n_refs && j < AVS2_MAX_REFS; j++) {
-            if (fc->fref[j])
-                n += snprintf(buf + n, sizeof(buf) - n, "%d(lf%d) ",
-                              fc->fref[j]->poc,
-                              (int)avs2_atomic_load(&fc->fref[j]->lf_row_done_count));
-            else
-                n += snprintf(buf + n, sizeof(buf) - n, "null ");
-        }
-        n += snprintf(buf + n, sizeof(buf) - n, "] mrr[39]=%d mrr[46]=%d\n",
-                      fc->mv_row_range[39], fc->mv_row_range[46]);
-    }
-    for (int i = 0; i < c->n_dpb; i++) {
-        avs2_frame *f = c->dpb[i];
-        if (!f) continue;
-        int naec = 0, nlf = 0;
-        for (int r = 0; r < f->h_lcu; r++) { naec += f->aec_row_done[r] ? 1 : 0; nlf += f->lf_row_done[r] ? 1 : 0; }
-        DBG("dpb[%d] poc=%d coi=%d used=%d ref=%d out=%d refcnt=%d done=%d p2st=%d aec_rows=%d/%d lf_rows=%d/%d\n",
-            i, f->poc, f->coi, f->used, f->referenced, f->output, f->ref_cnt,
-            f->done, f->p2_started, naec, f->h_lcu, nlf, f->h_lcu);
-    }
-    DBG("=== END DUMP ===\n");
-#undef DBG
-    write(2, buf, n);
-}
-static void *dbg_watchdog(void *arg)
-{
-    (void)arg;
-    for (int i = 0; i < 600; i++) {
-        struct timespec ts = { 1, 0 };
-        nanosleep(&ts, NULL);
-        struct sigaction sa;
-        if (sigaction(SIGUSR1, NULL, &sa) != 0) continue;
-        if (sa.sa_handler != dbg_dump_state) {
-            fprintf(stderr, "[dbg] !!! SIGUSR1 handler CHANGED at t=%ds to %p\n",
-                    i + 1, (void *)sa.sa_handler);
-            fflush(stderr);
-            return NULL;
-        }
-    }
-    return NULL;
-}
-static void dbg_install(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = dbg_dump_state;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, NULL);
-    pthread_t th;
-    pthread_create(&th, NULL, dbg_watchdog, NULL);
-    pthread_detach(th);
-}
-
-#ifndef PIPELINE_DEBUG
-#define PIPELINE_DEBUG 0
-#endif
-#if PIPELINE_DEBUG
-#if defined(_WIN32)
-#include <windows.h>
-#define PDBG(fmt, ...) fprintf(stderr, "[PDBG %lu] " fmt, (unsigned long)GetCurrentThreadId(), ##__VA_ARGS__)
-#else
-#include <pthread.h>
-#define PDBG(fmt, ...) fprintf(stderr, "[PDBG %lu] " fmt, (unsigned long)pthread_self(), ##__VA_ARGS__)
-#endif
-#else
-#define PDBG(fmt, ...) ((void)0)
-#endif
 
 void avs2_data_wrap(avs2_data *data, const uint8_t *buf, size_t sz,
                     int64_t pts, int64_t dts)
@@ -245,11 +148,6 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
                             }
                             if (all_ready) break;
                             if ((++spin_cnt & 0x3ff) == 0) {
-                                PDBG("SPIN: fc[%d] row=%d wait ref lf (req=%d refs=%d done=%d cnt=%d)\n",
-                                     (int)(fc - c->fc), row, required_row, fc->n_refs,
-                                     fc->n_refs > 0 && fc->fref[0] ? fc->fref[0]->done : -1,
-                                     fc->n_refs > 0 && fc->fref[0] ?
-                                     (int)avs2_atomic_load(&fc->fref[0]->lf_row_done_count) : -1);
                                 if (avs2_atomic_load(&c->shutdown) ||
                                     avs2_atomic_load(&fc->row_recon_completed))
                                     break;
@@ -471,7 +369,6 @@ static void complete_frame(struct avs2_internal *c, avs2_frame_ctx *fc)
     fc->task_state = 3;  /* done */
     fc->fdec->done = 1;
     c->n_pending--;
-    PDBG("COMPLETE: fc[%d] state->3 done, pending=%d\n", (int)(fc - c->fc), c->n_pending);
 
     /* 递减依赖此帧的 queued/decoding/phase1_done 任务的 n_deps.
      * state==1(queued): 尚未开始, n_deps 将在其 Phase 2 前被检查.
@@ -549,7 +446,6 @@ static void *aec_thread_fn(void *arg)
                 if (c->fc[i].task_state == 1 && c->fc[i].n_aec_deps == 0) {
                     fc = &c->fc[i];
                     fc->task_state = 6;  /* aec_running */
-                    PDBG("AEC: take fc[%d] state->6\n", i);
                     break;
                 }
             }
@@ -561,8 +457,6 @@ static void *aec_thread_fn(void *arg)
         avs2_mutex_unlock(&c->task_lock);
 
         if (c->shutdown) break;
-
-        PDBG("AEC: start phase1 fc[%d]\n", (int)(fc - c->fc));
 
         /* 执行 Phase 1 (AEC).
          * avs2_decode_frame_fc_phase1 内部逐行设置 aec_row_done[i]=1,
@@ -580,8 +474,6 @@ static void *aec_thread_fn(void *arg)
         if (fc->task_state != 3) {
             fc->task_state = 5;
         }
-        PDBG("AEC: done phase1 fc[%d] state=%d, waiters_recon=%d\n",
-             (int)(fc - c->fc), fc->task_state, c->n_waiters_recon);
         avs2_cond_signal(&c->task_cond);
         avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
         avs2_mutex_unlock(&c->task_lock);
@@ -802,7 +694,6 @@ static void *worker_thread(void *arg)
                         }
                     }
                     if (best_i >= 0) {
-                        PDBG("WORKER: take P1 fc[%d] (coi=%d)\n", best_i, best_coi);
                         fc = &c->fc[best_i];
                         fc->task_state = 2;  /* decoding */
                         c->n_aec_active++;
@@ -1069,14 +960,12 @@ static avs2_frame_ctx *pick_idle_fc(struct avs2_internal *c)
 
         /* 无空闲 fc, 等待 worker 完成. 带超时: 若 broadcast 在进入等待前
          * 发出 (信号丢失), 超时后重新扫描. */
-        PDBG("PICK: no idle fc, cond_wait(done_cond) pending=%d\n", c->n_pending);
         c->n_waiters_done++;
         avs2_cond_timedwait(&c->done_cond, &c->task_lock, 50);
         c->n_waiters_done--;
     }
     /* 标记为 reserved, 防止其他调用选中同一个 fc */
     fc->task_state = 4;
-    PDBG("PICK: idle fc[%d] -> reserved(4)\n", (int)(fc - c->fc));
     avs2_mutex_unlock(&c->task_lock);
     return fc;
 }
@@ -1185,9 +1074,6 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     }
 
     avs2_cpu_detect(&c->cpu);
-
-    g_dbg_c = c;
-    dbg_install();
 
     aec_init_context_tab(c->aec_tab_ctx);
 
