@@ -24,12 +24,8 @@ else()
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         # 注: 不使用 -march=native, 避免生成的二进制在较旧 CPU 上因非法指令崩溃.
         # SIMD 源文件通过 -msse4.1 -mssse3 单独启用所需指令集.
-        add_compile_options(-O3 -flto -funroll-loops)
+        add_compile_options(-O3 -funroll-loops)
     endif()
-endif()
-
-if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_link_options(-flto)
 endif()
 
 find_package(Threads REQUIRED)
