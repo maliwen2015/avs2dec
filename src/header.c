@@ -409,7 +409,14 @@ int avs2_parse_sequence_header(struct avs2_internal *c, avs2_bs *bs)
         c->seq_logged = 1;
     }
 
-    return bs->error ? AVS2_ERR_INVALID : AVS2_OK;
+    if (bs->error)
+        return AVS2_ERR_INVALID;
+
+    /* 序列头解析成功并已发布到 c->seq (重复序列头内容相同时同样确认同步):
+     * 解除同步门控, 允许后续图像头按序列参数解析. */
+    c->got_seq = 1;
+
+    return AVS2_OK;
 }
 
 /* =====================================================================

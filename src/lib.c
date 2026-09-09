@@ -1728,5 +1728,9 @@ void avs2_flush(avs2_ctx *ctx)
     c->i_prev_coi = -1;
     c->i_tr_wrap_cnt = 0;
     c->seq_logged = 0;
+    /* 重新武装中段接入同步门控: seek 后从新位置接入仍需等待
+     * 序列头/首个 I 帧 (与 out_initialized 复位一致). */
+    c->got_seq = 0;
+    c->sync_warned = 0;
     avs2_mutex_unlock(&c->task_lock);
 }

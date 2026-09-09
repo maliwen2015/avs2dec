@@ -792,7 +792,10 @@ int avs2_decode_frame(struct avs2_internal *c, const uint8_t *data, int sz)
              * 让调用者先输出帧释放 DPB 空间再重试. */
             return AVS2_ERR_NOMEM;
         }
-        if (r < 0) {
+        if (r == AVS2_ERR_WAIT_SYNC) {
+            /* 尚未同步到序列头/首个 I 帧: 图像/条带 NAL 已由
+             * process_start_code 静默跳过 (中段接入场景), 不告警. */
+        } else if (r < 0) {
             avs2_warn(c, "error processing start code %02x: %d\n", sc_id, r);
             /* 不中断解码, 跳过错误继续处理下一个 start code */
         } else {
@@ -859,6 +862,22 @@ static int process_start_code(struct avs2_internal *c, const uint8_t *data,
             return AVS2_OK;
         case AVS2_SC_INTRA_PICTURE:
         case AVS2_SC_INTER_PICTURE: {
+            /* 中段接入同步门控 (对应 davs2 header.cc:708 "sequence should
+             * start with an I frame"):
+             *  - 尚未收到有效序列头: 图像头语法 (low_delay/num_of_rps/背景图
+             *    等) 依赖序列参数, 用默认序列解析会误读比特并报错, 静默跳过;
+             *  - 已收序列头但首个图像不是 I 帧: P/B 等帧间图像没有可参考
+             *    图像, 无法解码, 跳过直到首个 I 帧 (avs2_parse_picture_header
+             *    在首个 I 帧成功解析后置位 out_initialized). */
+            if (!c->got_seq ||
+                (sc_id == AVS2_SC_INTER_PICTURE && !c->out_initialized)) {
+                if (!c->sync_warned) {
+                    c->sync_warned = 1;
+                    avs2_info(c, "input starts mid-sequence: pictures dropped "
+                              "until sequence header / first I frame\n");
+                }
+                return AVS2_ERR_WAIT_SYNC;
+            }
             int r = avs2_parse_picture_header(c, &bs, sc_id);
             if (r) {
                 avs2_warn(c, "parse_picture_header sc=%02x failed: %d\n", sc_id, r);
@@ -918,6 +937,10 @@ static int process_start_code(struct avs2_internal *c, const uint8_t *data,
         default:
             /* slice start code (0x00..0x8F) */
             if (sc_id <= AVS2_SC_SLICE_MAX) {
+                /* 同步门控: 序列头/首个 I 帧之前的条带随图像头一起跳过
+                 * (条带需挂接在已解析的图像上, 未同步时无有效图像上下文). */
+                if (!c->got_seq || !c->out_initialized)
+                    return AVS2_OK;
                 avs2_frame_ctx *fc = c->cur_fc;
                 if (!fc) {
                     avs2_warn(c, "no cur_fc for slice header\n");

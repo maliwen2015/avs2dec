@@ -13,6 +13,11 @@
 #define AVS2_DEC_BLOCK_SIZE 8  /* min CU in pixels */
 #define AVS2_LCU_MAX 64
 
+/* 内部错误码: 中段接入同步门控 — 尚未同步到序列头/首个 I 帧时跳过 NAL,
+ * 由 decode.c 识别并静默处理 (不打印警告、不触发帧调度). 仅限内部使用,
+ * 不出现在公开 API 的错误枚举中. */
+#define AVS2_ERR_WAIT_SYNC (-100)
+
 /* 最大 LCU 行数, 覆盖 8K (4320/32=135) 并留余量 */
 #define AVS2_MAX_H_LCU 256
 
@@ -336,6 +341,10 @@ struct avs2_internal {
     int i_tr_wrap_cnt;      /* COI 回绕计数 (对应 davs2 i_tr_wrap_cnt) */
     int i_prev_coi;         /* 上一个 COI (对应 davs2 i_prev_coi), 初始 -1 */
     int seq_logged;         /* 序列头日志是否已打印 (去重, 避免重复序列头刷屏) */
+    int got_seq;            /* 已收到并发布有效序列头 (header.c 置位, flush 复位).
+                             * 中段接入 (如从 GOP 中间加入码流) 时, 首个序列头之前的
+                             * 图像无法正确解析, 需先跳过等待同步. */
+    int sync_warned;        /* "等待同步"提示是否已打印 (一次性, 避免刷屏) */
 
     /* 线程池 (帧级并行). n_threads=1 时不创建 worker, 走同步路径.
      * 线程分组: AEC 线程 (专做 Phase 1) + 重建线程 (专做 Phase 2 行级 pipeline).
