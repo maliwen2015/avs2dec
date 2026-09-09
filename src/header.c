@@ -927,6 +927,29 @@ void avs2_build_reference_list(struct avs2_internal *c, avs2_frame_ctx *fc)
         }
     }
 
+    /* 强制清理陈旧帧 (对应 davs2 header.cc 的 "clean old frames":
+     * MAX_POC_DISTANCE=128). 部分码流 (如每 GOP 重置 raw COI 的广播流) 中,
+     * RPS 的 remove_pic 仅覆盖当前 COI 回绕窗口内, 更早窗口的帧永远不会被
+     * remove_pic 命中, referenced 残留为 1 导致 DPB 槽位无法回收、内存无界增长.
+     * POC 距离 >= 128 的帧不可能再被后续帧引用 (参考 delta_coi 为 6bit, 上限
+     * 63), 在此解除 referenced, 使其在输出后能被 avs2_picture_unref/dpb_get_free
+     * 回收. 当前 fref 中的帧距离必然很小, 不会被误伤. */
+    {
+        int cur_poc = (int)p->poc;
+        for (j = 0; j < c->n_dpb; j++) {
+            avs2_frame *f = c->dpb[j];
+            if (!f || !f->used || !f->referenced || f == fc->fdec) continue;
+            int dist = f->poc - cur_poc;
+            if (dist < 0) dist = -dist;
+            if (dist >= MAX_POC_DISTANCE) {
+                /* 仍可能被 worker 读取 (作为某在途任务的参考帧, ref_cnt>1),
+                 * 这里只清 referenced 标志; 释放由 unref/dpb_get_free 在
+                 * ref_cnt 安全时进行, 不会 use-after-free. */
+                f->referenced = 0;
+            }
+        }
+    }
+
     /* 计算距离索引 (对应 davs2 header.cc:962-981)
      * 用于时域直接模式的 MV 缩放. */
     {

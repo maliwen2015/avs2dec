@@ -1572,14 +1572,19 @@ retry_output:
             }
         }
 
-        /* 2. flushing 模式: 跳过缺失 POC 或处理迟到帧.
-         *    flushing 时 n_pending==0, 所有帧都 done, 无需额外检查. */
-        if (!f && c->flushing) {
+        /* 2. 跳过缺失 POC 或处理迟到帧 (对应 davs2 output_list_get_one_output_picture).
+         *    flushing 时 n_pending==0, 所有帧都 done, 无需额外检查.
+         *    正常解码遇到输出空洞 (POC 不连续, 常见于 COI 回绕/每 GOP 重置的码流):
+         *    无精确匹配且输出积压帧数达到阈值 (davs2 用 >= 8 帧延迟) 时, 说明该
+         *    POC 不可能再出现, 推进到下一个可用 POC, 避免输出永久卡死导致 DPB 无限增长. */
+        if (!f) {
             int min_poc_ge = 0x7fffffff;  /* >= out_next_poc 的最小 POC */
             int min_poc = 0x7fffffff;     /* 全局最小 POC (迟到帧) */
+            int n_pending = 0;            /* 积压待输出帧数 */
             for (int i = 0; i < c->n_dpb; i++) {
                 avs2_frame *cand = c->dpb[i];
                 if (!cand || !cand->used || cand->output) continue;
+                if (!mt || cand->done) n_pending++;
                 if (cand->poc < min_poc) {
                     min_poc = cand->poc;
                 }
@@ -1587,16 +1592,29 @@ retry_output:
                     min_poc_ge = cand->poc;
                 }
             }
-            int target_poc = (min_poc_ge != 0x7fffffff) ? min_poc_ge : min_poc;
-            if (target_poc != 0x7fffffff) {
-                /* 在相同 POC 的帧中选 coi 最大的 */
-                best_coi = -1;
-                for (int i = 0; i < c->n_dpb; i++) {
-                    avs2_frame *cand = c->dpb[i];
-                    if (cand && cand->used && !cand->output && cand->poc == target_poc) {
-                        if (cand->coi > best_coi) {
-                            best_coi = cand->coi;
-                            f = cand;
+            int skip = 0;
+            if (c->flushing) {
+                /* flush 尾部: 跳过缺失 POC 并补输出迟到帧 */
+                skip = (min_poc_ge != 0x7fffffff || min_poc != 0x7fffffff);
+            } else if (min_poc_ge != 0x7fffffff &&
+                       min_poc_ge > c->out_next_poc && n_pending >= 8) {
+                /* 输出空洞: 积压足够多仍未匹配, 该 POC 不可能出现 */
+                skip = 1;
+            }
+            if (skip) {
+                int target_poc = (min_poc_ge != 0x7fffffff) ? min_poc_ge : min_poc;
+                if (target_poc != 0x7fffffff) {
+                    /* 在相同 POC 的帧中选 coi 最大的 */
+                    best_coi = -1;
+                    for (int i = 0; i < c->n_dpb; i++) {
+                        avs2_frame *cand = c->dpb[i];
+                        if (cand && cand->used && !cand->output && cand->poc == target_poc) {
+                            if (!mt || cand->done) {
+                                if (cand->coi > best_coi) {
+                                    best_coi = cand->coi;
+                                    f = cand;
+                                }
+                            }
                         }
                     }
                 }
