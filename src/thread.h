@@ -117,26 +117,15 @@ static inline void avs2_cond_broadcast(avs2_cond_t *c, avs2_mutex_t *m, int n_wa
 /* ===========================================================================
  * 原子操作 (用于 WPP 行级并行, 避免锁竞争)
  * =========================================================================== */
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define avs2_atomic_load(p)            (*(volatile int*)(p))
-#define avs2_atomic_store(p, v)        (*(volatile int*)(p) = (v))
-#define avs2_atomic_inc(p)             _InterlockedIncrement((volatile long*)(p))
-#define avs2_atomic_cas(p, old, neu)   (_InterlockedCompareExchange((volatile long*)(p), (long)(neu), (long)(old)) == (long)(old))
-#else
 #define avs2_atomic_load(p)            __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define avs2_atomic_store(p, v)        __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #define avs2_atomic_inc(p)             __atomic_add_fetch((p), 1, __ATOMIC_ACQ_REL)
 #define avs2_atomic_cas(p, old, neu)   __atomic_compare_exchange_n((p), &(old), (neu), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-#endif
 
 /* 轻量级 CPU relax (spin-wait 优化) */
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define avs2_cpu_relax() _mm_pause()
-#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 #define avs2_cpu_relax() __builtin_ia32_pause()
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif defined(__aarch64__)
 #define avs2_cpu_relax() __asm__ volatile("yield")
 #elif defined(__ARM_ARCH)
 #define avs2_cpu_relax() __asm__ volatile("nop")

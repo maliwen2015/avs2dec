@@ -16,18 +16,9 @@
 /* ---- clz (前导零计数) 辅助函数 ----
  * 用于 AEC 归一化优化: 一次性计算移位位数, 替代逐比特 while 循环.
  * clz32(0) 是未定义行为, 调用前必须检查 != 0. */
-#if defined(_MSC_VER)
-#include <intrin.h>
-static inline int clz32(uint32_t mask) {
-    unsigned long leading_zero = 0;
-    _BitScanReverse(&leading_zero, mask);
-    return 31 - (int)leading_zero;
-}
-#else
 static inline int clz32(uint32_t mask) {
     return __builtin_clz(mask);
 }
-#endif
 
 /* ---- AEC 算法常量 ---- */
 #define LG_PMPS_SHIFTNO 2           /* LG_PMPS 存储值到使用值的移位 */

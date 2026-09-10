@@ -344,7 +344,7 @@ void avs2_lf_apply_lcu_row(avs2_frame_ctx *fc, struct avs2_internal *c, int lcu_
 avs2_dsp avs2_dsp_table;
 
 /* 是否禁用 SIMD (测试用, --no-simd 设置) */
-int g_disable_simd = 0;
+int __attribute__((visibility("default"))) g_disable_simd = 0;
 
 /* SIMD 注册函数 (x86/arm), 在对应源文件中定义.
  * 每个 init 函数注册其指令集的实现, 后调用者覆盖先调用者. */

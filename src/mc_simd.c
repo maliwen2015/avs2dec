@@ -34,18 +34,11 @@
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
-#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>  /* AVX2 (经 target 属性局部启用) */
-#endif
 
 /* ---- 对齐宏 ---- */
-#if defined(_MSC_VER)
-#define AVS2_ALIGN32(x) __declspec(align(32)) x
-#define AVS2_ALIGN16(x) __declspec(align(16)) x
-#else
 #define AVS2_ALIGN32(x) x __attribute__((aligned(32)))
 #define AVS2_ALIGN16(x) x __attribute__((aligned(16)))
-#endif
 
 /* ---- C 回退函数声明 (在 mc.c 中定义) ---- */
 extern void mc_luma_c(const uint8_t *src, ptrdiff_t sstride, uint8_t *dst,
@@ -1914,7 +1907,7 @@ static void mc_chroma_avg_sse4(const uint8_t *src, ptrdiff_t sstride, uint8_t *d
  * H/V/双向. 8-bit 路径与融合 ext_avg (双向预测第二路) 委托给 SSE4.1 实现.
  * ===========================================================================
  */
-#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
+#if defined(__x86_64__) || defined(__i386__)
 #define AVS2_MC_HAVE_AVX2 1
 #define AVS2_MC_AVX2 __attribute__((target("avx2")))
 #else

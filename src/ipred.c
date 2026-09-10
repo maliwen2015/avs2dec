@@ -39,11 +39,7 @@ int g_dc_value = 128;
 
 /* 栈缓冲区 32 字节对齐宏 (与 itx_simd.c 一致) */
 #ifndef AVS2_ALIGN32
-#if defined(_MSC_VER)
-#define AVS2_ALIGN32(x) __declspec(align(32)) x
-#else
 #define AVS2_ALIGN32(x) x __attribute__((aligned(32)))
-#endif
 #endif
 
 /* 邻域可用性标志位 */

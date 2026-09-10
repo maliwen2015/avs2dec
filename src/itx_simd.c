@@ -29,13 +29,8 @@
 #include <smmintrin.h>  /* SSE4.1 */
 
 /* ---- 对齐宏 ---- */
-#if defined(_MSC_VER)
-#define AVS2_ALIGN32(x) __declspec(align(32)) x
-#define AVS2_ALIGN16(x) __declspec(align(16)) x
-#else
 #define AVS2_ALIGN32(x) x __attribute__((aligned(32)))
 #define AVS2_ALIGN16(x) x __attribute__((aligned(16)))
-#endif
 
 /* ---- C 回退函数声明 (在 itx.c 中定义) ---- */
 extern void idct_4x4_c(const int16_t *src, int16_t *dst, int i_dst, int bit_depth);

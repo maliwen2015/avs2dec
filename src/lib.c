@@ -79,15 +79,9 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
     const int is_inter = (fc->n_refs > 0 && !IS_INTRA(fc->slice_type));
 
     /* 每个 worker 分配独立的栈上系数 scratch 缓冲区 (32 字节对齐). */
-#if defined(_MSC_VER)
-    __declspec(align(32)) int16_t scratch_y[64 * 64];
-    __declspec(align(32)) int16_t scratch_u[32 * 32];
-    __declspec(align(32)) int16_t scratch_v[32 * 32];
-#else
     int16_t scratch_y[64 * 64] __attribute__((aligned(32)));
     int16_t scratch_u[32 * 32] __attribute__((aligned(32)));
     int16_t scratch_v[32 * 32] __attribute__((aligned(32)));
-#endif
     avs2_set_thread_scratch(scratch_y, scratch_u, scratch_v);
 
     /* pipeline 模式 helper 空转计数: 超限返回 0, 让 recon_thread_fn cond_wait */

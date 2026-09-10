@@ -3,13 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_WIN32)
-#include <intrin.h>
-#ifdef _MSC_VER
-#pragma intrinsic(_InterlockedExchangeAdd)
-#endif
-#endif
-
 /* SIMD 友好的对齐分配: 统一 32 字节对齐, 保证 AVX2 的 load/store 不崩溃.
  * 对齐分配/释放配对使用, free 端用对应的对齐释放函数. */
 #define AVS2_MEM_ALIGN 32
@@ -17,7 +10,7 @@
 void *avs2_mem_alloc(size_t sz)
 {
     if (!sz) sz = 1;
-#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+#ifdef _WIN32
     return _aligned_malloc(sz, AVS2_MEM_ALIGN);
 #else
     void *p = NULL;
@@ -36,7 +29,7 @@ void *avs2_mem_allocz(size_t sz)
 void *avs2_mem_realloc(void *p, size_t sz)
 {
     if (!sz) sz = 1;
-#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+#ifdef _WIN32
     return _aligned_realloc(p, sz, AVS2_MEM_ALIGN);
 #else
     /* posix 平台 realloc 通常保持对齐 (glibc 2.28+), 简化处理 */
@@ -47,7 +40,7 @@ void *avs2_mem_realloc(void *p, size_t sz)
 void avs2_mem_free(void *p)
 {
     if (!p) return;
-#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+#ifdef _WIN32
     _aligned_free(p);
 #else
     free(p);

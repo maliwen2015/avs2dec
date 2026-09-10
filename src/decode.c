@@ -555,15 +555,9 @@ int avs2_decode_frame_fc_phase2(struct avs2_internal *c, avs2_frame_ctx *fc)
     const int need_pad = fc->pic_local.rps.refered_by_others;
 
     /* 设置 TLS 系数 scratch 缓冲区 (pass=2 重建所需, 32 字节对齐) */
-#if defined(_MSC_VER)
-    __declspec(align(32)) int16_t scratch_y[64 * 64];
-    __declspec(align(32)) int16_t scratch_u[32 * 32];
-    __declspec(align(32)) int16_t scratch_v[32 * 32];
-#else
     int16_t scratch_y[64 * 64] __attribute__((aligned(32)));
     int16_t scratch_u[32 * 32] __attribute__((aligned(32)));
     int16_t scratch_v[32 * 32] __attribute__((aligned(32)));
-#endif
     avs2_set_thread_scratch(scratch_y, scratch_u, scratch_v);
 
     /* inline deblock: 逐行 重建+deblock+pad, 保持 L2 cache 局部性 */

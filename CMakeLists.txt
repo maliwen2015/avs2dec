@@ -13,19 +13,15 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# ---- 构建目标配置 ----
 option(AVS2DEC_BUILD_CLI "Build the avs2dec command line tool" ON)
-option(AVS2DEC_BUILD_SHARED "Build shared library" OFF)
+option(BUILD_SHARED_LIBS "Build shared libraries (OFF for static)" ON)
 
-if(MSVC)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-    add_compile_options(/W3 /utf-8)
-else()
-    add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-function)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        # 注: 不使用 -march=native, 避免生成的二进制在较旧 CPU 上因非法指令崩溃.
-        # SIMD 源文件通过 -msse4.1 -mssse3 单独启用所需指令集.
-        add_compile_options(-O3 -funroll-loops)
-    endif()
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-function)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    # 注: 不使用 -march=native, 避免生成的二进制在较旧 CPU 上因非法指令崩溃.
+    # SIMD 源文件通过 -msse4.1 -mssse3 单独启用所需指令集.
+    add_compile_options(-O3 -funroll-loops)
 endif()
 
 find_package(Threads REQUIRED)
@@ -66,7 +62,12 @@ set(AVS2DEC_HEADERS
     include/avs2dec/avs2dec.h
 )
 
-add_library(avs2dec ${AVS2DEC_SOURCES})
+if(BUILD_SHARED_LIBS)
+    add_library(avs2dec SHARED ${AVS2DEC_SOURCES})
+else()
+    add_library(avs2dec STATIC ${AVS2DEC_SOURCES})
+endif()
+
 target_include_directories(avs2dec
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -75,9 +76,11 @@ target_include_directories(avs2dec
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(avs2dec PRIVATE Threads::Threads)
-# tables.c 使用 cos(); GCC/Clang 需链接 libm (MSVC 数学库在 UCRT 中)
-if(NOT MSVC)
-    target_link_libraries(avs2dec PRIVATE m)
+target_link_libraries(avs2dec PRIVATE m)
+
+# 动态库: 静态链接 libstdc++/libgcc，不依赖系统运行时
+if(BUILD_SHARED_LIBS)
+    target_link_options(avs2dec PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 # SIMD 源文件主体使用 SSE4.1/SSSE3 intrinsics 编译;
@@ -96,29 +99,23 @@ set(AVS2DEC_SIMD_SOURCES
     src/alf_simd.c
     src/quant_simd.c
 )
-if(MSVC)
+# GCC/MinGW/Clang: 按目标架构启用对应 SIMD 指令集.
+# x86: SSE4.1 + SSSE3 (AVX2 内核用 target 属性局部启用, 见上方说明);
+# aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
     set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "/arch:SSE4.1"
+        COMPILE_OPTIONS "-msse4.1;-mssse3"
     )
-else()
-    # GCC/MinGW/Clang: 按目标架构启用对应 SIMD 指令集.
-    # x86: SSE4.1 + SSSE3 (AVX2 内核用 target 属性局部启用, 见上方说明);
-    # aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
-        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
-            COMPILE_OPTIONS "-msse4.1;-mssse3"
-        )
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
-        # aarch64: NEON 为默认. 启用 ARMv8.2 dotprod (SDOT) 以加速 16x16/32x32 IDCT.
-        # 运行时通过 HWCAP_ASIMDDP 检测, 不支持 dotprod 的 CPU 自动回退蝶形 NEON.
-        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
-            COMPILE_OPTIONS "-march=armv8.2-a+dotprod"
-        )
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|ARM)")
-        set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
-            COMPILE_OPTIONS "-mfpu=neon"
-        )
-    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
+    # aarch64: NEON 为默认. 启用 ARMv8.2 dotprod (SDOT) 以加速 16x16/32x32 IDCT.
+    # 运行时通过 HWCAP_ASIMDDP 检测, 不支持 dotprod 的 CPU 自动回退蝶形 NEON.
+    set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-march=armv8.2-a+dotprod"
+    )
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|ARM)")
+    set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-mfpu=neon"
+    )
 endif()
 
 # 内部符号全部隐藏, 只有标记 AVS2DEC_API 的公开函数对外可见
@@ -128,7 +125,7 @@ set_target_properties(avs2dec PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
-if(AVS2DEC_BUILD_SHARED)
+if(BUILD_SHARED_LIBS)
     set_target_properties(avs2dec PROPERTIES
         VERSION ${AVS2DEC_VERSION}
         SOVERSION ${AVS2DEC_VERSION_MAJOR}
@@ -154,11 +151,4 @@ if(AVS2DEC_BUILD_CLI)
     )
     target_link_libraries(avs2dec_cli PRIVATE avs2dec Threads::Threads)
     set_target_properties(avs2dec_cli PROPERTIES OUTPUT_NAME avs2dec)
-endif()
-
-if(MSVC)
-    target_compile_definitions(avs2dec PRIVATE _CRT_SECURE_NO_WARNINGS)
-    if(AVS2DEC_BUILD_CLI)
-        target_compile_definitions(avs2dec_cli PRIVATE _CRT_SECURE_NO_WARNINGS)
-    endif()
 endif()
