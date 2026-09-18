@@ -25,7 +25,7 @@
 #define AVS2_CLIP3(lo, hi, x) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 
 #include <smmintrin.h>
 
@@ -81,7 +81,7 @@ void avs2_quant_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 
 void avs2_quant_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
 
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
 

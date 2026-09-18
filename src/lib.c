@@ -161,12 +161,8 @@ int avs2_row_parallel_pass2(struct avs2_internal *c, avs2_frame_ctx *fc, int is_
                     avs2_atomic_store(&fc->row_recon_done[row], 1);
                     break;
                 }
-                /* CAS 失败: 重新加载 (GCC 已更新 expected, MSVC 需重新 load) */
-                #if !defined(__GNUC__) && !defined(__clang__)
-                row = avs2_atomic_load(&fc->row_recon_next);
-                #else
+                /* CAS 失败: GCC __atomic_compare_exchange_n 已把 expected 更新为当前值 */
                 row = expected;
-                #endif
             }
         }
 
@@ -1081,11 +1077,11 @@ avs2_ctx *avs2_open(const avs2_settings *s)
     if (nfc <= 0) {
         /* 2-pass 调度 (ROW 和 FRAME): Phase 1 (AEC) 完成后帧进入 state==5 等待
          * Phase 2. 行级 LF 依赖 (spin-wait): Phase 2 可在参考帧 Phase 2 开始后
-         * 即启动, P2 重叠执行提高吞吐. n_fc = n_threads * 2 + 2: 覆盖 P1 并行 +
-         * 双 P2 重叠 + main 解析前瞻深度, 减少 worker P1 断供空转.
-         * ROW 模式 Phase 2 使用行级并行 (avs2_row_parallel_pass2), 仍需帧间
-         * pipeline 深度使 P1(AEC) 与 P2(重建) 重叠. */
-        nfc = nthr * 2 + 2;
+         * 即启动, P2 重叠执行提高吞吐. n_fc = n_threads + 2: 覆盖 P1 并行 +
+         * P2 重叠 + main 解析前瞻深度, 减少 worker P1 断供空转.
+         * (相对旧值 nthr*2+2 更小: 每 fc 常驻 1 帧图像+1 LF 临时帧+系数缓冲,
+         *  降低 pipeline 深度可显著降低峰值内存; 权衡离线片尝试用 max_frame_delay 调大) */
+        nfc = nthr + 2;
         if (nfc < 1) nfc = 1;
         if (nfc > AVS2_MAX_FRAME_DELAY) nfc = AVS2_MAX_FRAME_DELAY;
     }
@@ -1355,10 +1351,10 @@ void avs2_close(avs2_ctx **ctx)
         avs2_mem_free(c->fc[i].coeff_lcu_y);
         avs2_mem_free(c->fc[i].coeff_lcu_u);
         avs2_mem_free(c->fc[i].coeff_lcu_v);
-        /* LF 临时帧 (SAO/ALF 预分配复用) */
-        avs2_lf_tmp_free(&c->fc[i]);
         /* 预分配的 AEC 上下文 */
         avs2_aec_destroy(c->fc[i].aec_pool);
+        /* 每 fc 的 LF 临时帧 */
+        avs2_lf_tmp_free(&c->fc[i]);
     }
     avs2_mem_free(c->fc);
     avs2_mem_free(c->seq);

@@ -43,7 +43,7 @@ extern void deblock_chroma_hor(void *src_u, void *src_v, int stride,
 
 #include <string.h>
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
@@ -944,7 +944,7 @@ void avs2_lf_init_avx2(const avs2_cpu_flags *flags) { (void)flags; }
 /* AVX512 预留 */
 void avs2_lf_init_avx512(const avs2_cpu_flags *flags) { (void)flags; }
 
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
 

@@ -24,6 +24,7 @@
 
 #ifdef AVS2_X86
 
+#if defined(__GNUC__)
 #include <cpuid.h>
 static void avs2_cpuid(int info[4], int leaf) {
     unsigned int a, b, c, d;
@@ -35,6 +36,7 @@ static void avs2_cpuidex(int info[4], int leaf, int subleaf) {
     __cpuid_count(leaf, subleaf, a, b, c, d);
     info[0] = a; info[1] = b; info[2] = c; info[3] = d;
 }
+#endif
 
 /* 检测 x86 CPU 的 SIMD 支持情况 */
 static void avs2_cpu_detect_x86(avs2_cpu_flags *flags)

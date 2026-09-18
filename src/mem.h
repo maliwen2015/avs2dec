@@ -11,7 +11,8 @@ void *avs2_mem_realloc(void *p, size_t sz);
 void  avs2_mem_free(void *p);
 
 /* 32 字节对齐修饰宏 (用于结构体成员和栈数组, SIMD 操作要求).
- * 用法: AVS2_ALIGNED_32(int16_t buf[N]); */
+ * 用法: AVS2_ALIGNED_32(int16_t buf[N]);
+ * MinGW 即 GCC, 使用 __attribute__((aligned)). */
 #define AVS2_ALIGNED_32(decl) decl __attribute__((aligned(32)))
 
 /* Allocate a 2D-ish buffer of rows*cols with alignment. */

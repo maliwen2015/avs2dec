@@ -39,7 +39,7 @@
  *   通过 TLS (线程本地存储) 设置, avs2_decode_lcu 在 pass=2 时使用
  *   TLS scratch 而非 fc->coeff_scratch.
  *
- * __thread 是 GCC 扩展, MinGW 支持. MSVC 等价物为 __declspec(thread).
+ * __thread 是 GCC 扩展, MinGW (GCC) 亦支持.
  * =================================================================== */
 static __thread int16_t *tls_coeff_scratch_y = NULL;
 static __thread int16_t *tls_coeff_scratch_u = NULL;

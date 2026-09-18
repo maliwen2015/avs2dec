@@ -23,12 +23,12 @@
 
 #include "internal.h"
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 
 #include <tmmintrin.h>  /* SSSE3 */
 #include <smmintrin.h>  /* SSE4.1 */
 
-/* ---- 对齐宏 ---- */
+/* ---- 对齐宏 (MinGW/GCC) ---- */
 #define AVS2_ALIGN32(x) x __attribute__((aligned(32)))
 #define AVS2_ALIGN16(x) x __attribute__((aligned(16)))
 
@@ -1920,7 +1920,7 @@ void avs2_itx_init_avx512(const avs2_cpu_flags *flags)
     /* TODO: AVX512 实现可覆盖 8x8/16x16/32x32 */
 }
 
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
 

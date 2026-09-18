@@ -15,7 +15,7 @@ endif()
 
 # ---- 构建目标配置 ----
 option(AVS2DEC_BUILD_CLI "Build the avs2dec command line tool" ON)
-option(BUILD_SHARED_LIBS "Build shared libraries (OFF for static)" ON)
+option(AVS2DEC_BUILD_SHARED "Build shared library" OFF)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-function)
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -62,12 +62,7 @@ set(AVS2DEC_HEADERS
     include/avs2dec/avs2dec.h
 )
 
-if(BUILD_SHARED_LIBS)
-    add_library(avs2dec SHARED ${AVS2DEC_SOURCES})
-else()
-    add_library(avs2dec STATIC ${AVS2DEC_SOURCES})
-endif()
-
+add_library(avs2dec ${AVS2DEC_SOURCES})
 target_include_directories(avs2dec
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -76,12 +71,8 @@ target_include_directories(avs2dec
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(avs2dec PRIVATE Threads::Threads)
+# tables.c 使用 cos(); GCC/MinGW/Clang 需链接 libm
 target_link_libraries(avs2dec PRIVATE m)
-
-# 动态库: 静态链接 libstdc++/libgcc，不依赖系统运行时
-if(BUILD_SHARED_LIBS)
-    target_link_options(avs2dec PRIVATE -static-libgcc -static-libstdc++)
-endif()
 
 # SIMD 源文件主体使用 SSE4.1/SSSE3 intrinsics 编译;
 # AVX2 内核 (mc_simd.c) 通过 __attribute__((target("avx2"))) 局部启用,
@@ -99,7 +90,7 @@ set(AVS2DEC_SIMD_SOURCES
     src/alf_simd.c
     src/quant_simd.c
 )
-# GCC/MinGW/Clang: 按目标架构启用对应 SIMD 指令集.
+# 按目标架构启用对应 SIMD 指令集 (GCC/MinGW/Clang).
 # x86: SSE4.1 + SSSE3 (AVX2 内核用 target 属性局部启用, 见上方说明);
 # aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
@@ -125,7 +116,7 @@ set_target_properties(avs2dec PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
-if(BUILD_SHARED_LIBS)
+if(AVS2DEC_BUILD_SHARED)
     set_target_properties(avs2dec PROPERTIES
         VERSION ${AVS2DEC_VERSION}
         SOVERSION ${AVS2DEC_VERSION_MAJOR}

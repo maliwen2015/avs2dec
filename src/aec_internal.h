@@ -15,7 +15,8 @@
 
 /* ---- clz (前导零计数) 辅助函数 ----
  * 用于 AEC 归一化优化: 一次性计算移位位数, 替代逐比特 while 循环.
- * clz32(0) 是未定义行为, 调用前必须检查 != 0. */
+ * clz32(0) 是未定义行为, 调用前必须检查 != 0.
+ * MinGW 即 GCC, 使用 __builtin_clz. */
 static inline int clz32(uint32_t mask) {
     return __builtin_clz(mask);
 }

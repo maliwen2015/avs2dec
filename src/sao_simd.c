@@ -47,7 +47,7 @@ enum {
     sao_nb_dr = 7    /* down-right  */
 };
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
@@ -726,7 +726,7 @@ void avs2_sao_init_avx2(const avs2_cpu_flags *flags)
     UNUSED_PARAMETER(flags);
 }
 
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
 

@@ -30,13 +30,15 @@
 #include "internal.h"
 #include "tables.h"
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>  /* AVX2 (经 target 属性局部启用) */
+#endif
 
-/* ---- 对齐宏 ---- */
+/* ---- 对齐宏 (MinGW/GCC) ---- */
 #define AVS2_ALIGN32(x) x __attribute__((aligned(32)))
 #define AVS2_ALIGN16(x) x __attribute__((aligned(16)))
 
@@ -1901,7 +1903,7 @@ static void mc_chroma_avg_sse4(const uint8_t *src, ptrdiff_t sstride, uint8_t *d
  *
  * 使用 GCC/Clang 的 target 属性在未全局开启 -mavx2 的编译单元中启用 AVX2,
  * 运行时由 avs2_mc_init_avx2 (经 cpu->avx2 检测) 注册, 不支持 AVX2 的
- * CPU 或编译器 (MSVC) 自动回退 SSE4.1.
+ * CPU 自动回退 SSE4.1.
  *
  * 覆盖的 10-bit 路径: 块拷贝 / 块平均 / 亮度 8 抽头 H/V/双向 / 色度 4 抽头
  * H/V/双向. 8-bit 路径与融合 ext_avg (双向预测第二路) 委托给 SSE4.1 实现.
@@ -2861,7 +2863,7 @@ void avs2_mc_init_avx512(const avs2_cpu_flags *flags)
     (void)flags;
 }
 
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
 
 #include <arm_neon.h>
 

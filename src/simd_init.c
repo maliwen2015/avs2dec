@@ -13,7 +13,7 @@
 /* 反变换 SIMD init (由 itx_simd.c 提供) */
 void avs2_itx_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_itx_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_itx_init_avx2(const avs2_cpu_flags *flags);
     extern void avs2_itx_init_avx512(const avs2_cpu_flags *flags);
@@ -22,7 +22,7 @@ void avs2_itx_init_simd(const avs2_cpu_flags *cpu)
     if (cpu->sse41)  avs2_itx_init_sse41(cpu);
     if (cpu->avx2)   avs2_itx_init_avx2(cpu);
     if (cpu->avx512) avs2_itx_init_avx512(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_itx_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_itx_init_neon(cpu);
 #else
@@ -32,12 +32,12 @@ void avs2_itx_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_mc_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_mc_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_mc_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_mc_init_sse41(cpu);
     if (cpu->avx2)   avs2_mc_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_mc_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_mc_init_neon(cpu);
 #else
@@ -47,12 +47,12 @@ void avs2_mc_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_ipred_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_ipred_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_ipred_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_ipred_init_sse41(cpu);
     if (cpu->avx2)   avs2_ipred_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_ipred_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_ipred_init_neon(cpu);
 #else
@@ -62,12 +62,12 @@ void avs2_ipred_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_lf_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_lf_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_lf_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_lf_init_sse41(cpu);
     if (cpu->avx2)   avs2_lf_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_lf_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_lf_init_neon(cpu);
 #else
@@ -77,12 +77,12 @@ void avs2_lf_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_sao_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_sao_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_sao_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_sao_init_sse41(cpu);
     if (cpu->avx2)   avs2_sao_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_sao_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_sao_init_neon(cpu);
 #else
@@ -92,12 +92,12 @@ void avs2_sao_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_alf_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_alf_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_alf_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_alf_init_sse41(cpu);
     if (cpu->avx2)   avs2_alf_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_alf_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_alf_init_neon(cpu);
 #else
@@ -107,12 +107,12 @@ void avs2_alf_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_quant_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(__i386__)
     extern void avs2_quant_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_quant_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_quant_init_sse41(cpu);
     if (cpu->avx2)   avs2_quant_init_avx2(cpu);
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#elif defined(__aarch64__) || defined(__ARM_NEON)
     extern void avs2_quant_init_neon(const avs2_cpu_flags *flags);
     if (cpu->neon) avs2_quant_init_neon(cpu);
 #else
