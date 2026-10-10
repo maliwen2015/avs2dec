@@ -22,6 +22,13 @@
 /* LOT 小波变换抽头数 (5-3 小波) */
 #define LOT_MAX_WLT_TAP 2
 
+static inline int clamp_residual_value(int value, int max_val)
+{
+    if (value < 0) return 0;
+    if (value > max_val) return max_val;
+    return value;
+}
+
 /* ---------------------------------------------------------------------------
  * DCT 变换矩阵 (用于 partial butterfly 反变换, 取自 davs2)
  * 注意: 这些矩阵的缩放与 avs2_t4/avs2_t8 等不同, 不能混用。
@@ -63,6 +70,37 @@ static const int16_t g_t16[16][16] = {
     {  4, -13,  21, -29,  35, -40,  43, -45,  45, -43,  40, -35,  29, -21,  13,  -4 }
 };
 
+/* --- 一处热点：残差叠加的对齐/分支优化 --- */
+static void recon_residual_c(uint8_t *dst, ptrdiff_t stride, const int16_t *coeff,
+                            int w, int h, int bit_depth)
+{
+    int max_val = (1 << bit_depth) - 1;
+    int x, y;
+
+    if (bit_depth > 8) {
+        uint16_t *dst16 = (uint16_t *)(void *)dst;
+        int stride16 = (int)(stride >> 1);
+        for (y = 0; y < h; y++) {
+            uint16_t *row = dst16 + y * stride16;
+            const int16_t *src = coeff + y * w;
+            for (x = 0; x < w; x++) {
+                int v = (int)row[x] + src[x];
+                row[x] = (uint16_t)clamp_residual_value(v, max_val);
+            }
+        }
+        return;
+    }
+
+    for (y = 0; y < h; y++) {
+        uint8_t *row = dst + y * stride;
+        const int16_t *src = coeff + y * w;
+        for (x = 0; x < w; x++) {
+            int v = (int)row[x] + src[x];
+            row[x] = (uint8_t)clamp_residual_value(v, max_val);
+        }
+    }
+}
+
 static const int16_t g_t32[32][32] = {
     { 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32 },
     { 45, 45, 44, 43, 41, 39, 36, 34, 30, 27, 23, 19, 15, 11,  7,  2, -2, -7,-11,-15,-19,-23,-27,-30,-34,-36,-39,-41,-43,-44,-45,-45 },
@@ -97,6 +135,10 @@ static const int16_t g_t32[32][32] = {
     {  4,-13, 21,-29, 35,-40, 43,-45, 45,-43, 40,-35, 29,-21, 13, -4, -4, 13,-21, 29,-35, 40,-43, 45,-45, 43,-40, 35,-29, 21,-13,  4 },
     {  2, -7, 11,-15, 19,-23, 27,-30, 34,-36, 39,-41, 43,-44, 45,-45, 45,-45, 44,-43, 41,-39, 36,-34, 30,-27, 23,-19, 15,-11,  7, -2 }
 };
+
+/*
+ * 继续保留其余文件内容...
+ */
 
 /* ---------------------------------------------------------------------------
  * 4x4 二次变换 (NSST) 矩阵
@@ -687,7 +729,7 @@ static void itrans_dct64(int16_t *coeff, int w, int h, int bit_depth)
  * 残差叠加 C fallback: dst[i] = clip(dst[i] + coeff[i], 0, max_val)
  */
 static void recon_residual_c(uint8_t *dst, ptrdiff_t stride, const int16_t *coeff,
-                             int w, int h, int bit_depth)
+                            int w, int h, int bit_depth)
 {
     int max_val = (1 << bit_depth) - 1;
     int x, y;
