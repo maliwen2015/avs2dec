@@ -1,5 +1,7 @@
 #include "cpu.h"
 
+#include <stdio.h>
+
 #if defined(__GNUC__) && defined(__linux__)
 #include <stdio.h>
 #endif
@@ -18,13 +20,13 @@
 #endif
 #endif
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 #define AVS2_X86
 #endif
 
 #ifdef AVS2_X86
 
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__wasm__)
 #include <cpuid.h>
 static void avs2_cpuid(int info[4], int leaf) {
     unsigned int a, b, c, d;
@@ -41,9 +43,6 @@ static void avs2_cpuidex(int info[4], int leaf, int subleaf) {
 /* 检测 x86 CPU 的 SIMD 支持情况 */
 static void avs2_cpu_detect_x86(avs2_cpu_flags *flags)
 {
-    int info[4];
-    int max_leaf;
-
     flags->sse2 = 0;
     flags->ssse3 = 0;
     flags->sse41 = 0;
@@ -51,6 +50,16 @@ static void avs2_cpu_detect_x86(avs2_cpu_flags *flags)
     flags->avx512 = 0;
     flags->neon = 0;
     flags->dotprod = 0;
+
+#if defined(__wasm__)
+    /* wasm 构建：x86 intrinsics 由 Emscripten compat 头翻译成 wasm SIMD，
+       运行时固定按 SSE4.1 级别选内核（AVX2 不选，避免 256 位模拟开销）。 */
+    flags->sse2 = 1;
+    flags->ssse3 = 1;
+    flags->sse41 = 1;
+#else
+    int info[4];
+    int max_leaf;
 
     avs2_cpuid(info, 0);
     max_leaf = info[0];
@@ -77,6 +86,7 @@ static void avs2_cpu_detect_x86(avs2_cpu_flags *flags)
             if (info[1] & (1 << 16)) flags->avx512 = 1;
         }
     }
+#endif
 }
 
 #endif /* AVS2_X86 */

@@ -337,7 +337,7 @@ static void avs2_phase1_abort(struct avs2_internal *c, avs2_frame_ctx *fc)
                 !IS_INTRA(other->slice_type)) {
                 other->n_aec_deps--;
                 if (other->n_aec_deps == 0 && other->task_state == 1) {
-                    avs2_cond_signal(&c->task_cond);
+                    avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
                 }
             }
         }
@@ -479,7 +479,7 @@ int avs2_decode_frame_fc_phase1(struct avs2_internal *c, avs2_frame_ctx *fc)
                 !IS_INTRA(other->slice_type)) {
                 other->n_aec_deps--;
                 if (other->n_aec_deps == 0 && other->task_state == 1) {
-                    avs2_cond_signal(&c->task_cond);
+                    avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
                 }
             }
         }

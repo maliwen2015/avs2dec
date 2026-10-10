@@ -13,7 +13,7 @@
 /* 反变换 SIMD init (由 itx_simd.c 提供) */
 void avs2_itx_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_itx_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_itx_init_avx2(const avs2_cpu_flags *flags);
     extern void avs2_itx_init_avx512(const avs2_cpu_flags *flags);
@@ -32,7 +32,7 @@ void avs2_itx_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_mc_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_mc_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_mc_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_mc_init_sse41(cpu);
@@ -47,7 +47,7 @@ void avs2_mc_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_ipred_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_ipred_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_ipred_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_ipred_init_sse41(cpu);
@@ -62,7 +62,7 @@ void avs2_ipred_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_lf_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_lf_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_lf_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_lf_init_sse41(cpu);
@@ -77,7 +77,7 @@ void avs2_lf_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_sao_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_sao_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_sao_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_sao_init_sse41(cpu);
@@ -92,7 +92,7 @@ void avs2_sao_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_alf_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_alf_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_alf_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_alf_init_sse41(cpu);
@@ -107,7 +107,7 @@ void avs2_alf_init_simd(const avs2_cpu_flags *cpu)
 
 void avs2_quant_init_simd(const avs2_cpu_flags *cpu)
 {
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
     extern void avs2_quant_init_sse41(const avs2_cpu_flags *flags);
     extern void avs2_quant_init_avx2(const avs2_cpu_flags *flags);
     if (cpu->sse41)  avs2_quant_init_sse41(cpu);

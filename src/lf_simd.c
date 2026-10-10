@@ -43,7 +43,7 @@ extern void deblock_chroma_hor(void *src_u, void *src_v, int stride,
 
 #include <string.h>
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 
 #include <tmmintrin.h>
 #include <smmintrin.h>

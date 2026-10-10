@@ -93,7 +93,13 @@ set(AVS2DEC_SIMD_SOURCES
 # 按目标架构启用对应 SIMD 指令集 (GCC/MinGW/Clang).
 # x86: SSE4.1 + SSSE3 (AVX2 内核用 target 属性局部启用, 见上方说明);
 # aarch64: NEON 默认启用, 无需标志; arm32: -mfpu=neon.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
+if(EMSCRIPTEN)
+    # wasm: Emscripten 的 x86 intrinsics 兼容头需要开启对应 SSE 级别,
+    # 128 位内建会映射到 wasm SIMD (需同时有 -msimd128, 由调用方 CFLAGS 提供)
+    set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-msse4.1;-mssse3"
+    )
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i386|i686|X86|x86)")
     set_source_files_properties(${AVS2DEC_SIMD_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-msse4.1;-mssse3"
     )

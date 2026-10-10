@@ -403,7 +403,7 @@ static void complete_frame(struct avs2_internal *c, avs2_frame_ctx *fc)
      * - done_cond: worker 等参考帧 (n_deps/n_aec_deps), get_picture 等输出
      * - task_cond: 2-pass 中 state==5 的 fc 可能因 n_deps 归零变为可执行 Phase 2 */
     avs2_cond_broadcast(&c->done_cond, &c->task_lock, c->n_waiters_done);
-    avs2_cond_signal(&c->task_cond);
+    avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
 }
 
 /* ===========================================================================
@@ -464,7 +464,7 @@ static void *aec_thread_fn(void *arg)
         if (fc->task_state != 3) {
             fc->task_state = 5;
         }
-        avs2_cond_signal(&c->task_cond);
+        avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
         avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
         avs2_mutex_unlock(&c->task_lock);
     }
@@ -576,7 +576,7 @@ static void *recon_thread_fn(void *arg)
             c->n_waiters_done--;
         }
         complete_frame(c, fc);
-        avs2_cond_signal(&c->task_cond);
+        avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
         avs2_cond_broadcast(&c->recon_cond, &c->task_lock, c->n_waiters_recon);
         avs2_mutex_unlock(&c->task_lock);
     }
@@ -1034,12 +1034,12 @@ int avs2_submit_frame_task(struct avs2_internal *c, avs2_frame_ctx *fc)
     c->n_pending++;
     if (use_2pass) {
         if (fc->n_aec_deps == 0) {
-            avs2_cond_signal(&c->task_cond);
+            avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
         }
     } else {
         c->task_queue[c->task_q_tail] = fc_idx;
         c->task_q_tail = (c->task_q_tail + 1) % AVS2_MAX_FRAME_DELAY;
-        avs2_cond_signal(&c->task_cond);
+        avs2_cond_broadcast(&c->task_cond, &c->task_lock, c->n_waiters_task);
     }
 
     avs2_mutex_unlock(&c->task_lock);

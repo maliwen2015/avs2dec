@@ -30,12 +30,12 @@
 #include "internal.h"
 #include "tables.h"
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
 #if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>  /* AVX2 (经 target 属性局部启用) */
+#include <immintrin.h>  /* AVX2 (经 target 属性局部启用; wasm 不支持 AVX2) */
 #endif
 
 /* ---- 对齐宏 (MinGW/GCC) ---- */

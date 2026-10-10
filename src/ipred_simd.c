@@ -20,7 +20,7 @@
 #define UNUSED_PARAMETER(x) (void)(x)
 #endif
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 
 #include <tmmintrin.h>
 #include <smmintrin.h>

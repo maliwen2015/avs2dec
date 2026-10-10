@@ -123,7 +123,10 @@ static inline void avs2_cond_broadcast(avs2_cond_t *c, avs2_mutex_t *m, int n_wa
 #define avs2_atomic_cas(p, old, neu)   __atomic_compare_exchange_n((p), &(old), (neu), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
 
 /* 轻量级 CPU relax (spin-wait 优化) */
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__wasm__)
+#include <sched.h>
+#define avs2_cpu_relax() sched_yield()
+#elif defined(__x86_64__) || defined(__i386__)
 #define avs2_cpu_relax() __builtin_ia32_pause()
 #elif defined(__aarch64__)
 #define avs2_cpu_relax() __asm__ volatile("yield")

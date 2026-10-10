@@ -47,7 +47,7 @@ enum {
     sao_nb_dr = 7    /* down-right  */
 };
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 
 #include <tmmintrin.h>
 #include <smmintrin.h>

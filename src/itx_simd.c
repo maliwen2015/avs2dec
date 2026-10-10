@@ -23,7 +23,7 @@
 
 #include "internal.h"
 
-#if defined(__x86_64__) || defined(__i386__)
+#if AVS2_HAVE_X86_SIMD
 
 #include <tmmintrin.h>  /* SSSE3 */
 #include <smmintrin.h>  /* SSE4.1 */
