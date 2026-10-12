@@ -296,6 +296,7 @@ typedef struct avs2_settings {
     unsigned frame_size_limit; /* 0 = 默认上限 16384; 否则为单边最大像素数 */
     avs2_logger logger;
     int skip_loop_filter;   /* 1 = skip all in-loop filters */
+    int keyframe_only;      /* 1 = 只解码关键帧: 跳过非 I 图像(不解码, 省 CPU), 稀疏关键帧输入也逐帧输出 */
     int thread_mode;        /* avs2_thread_mode: 0=frame, 1=row */
 } avs2_settings;
 

@@ -305,6 +305,7 @@ struct avs2_internal {
     int log_level;
     unsigned frame_size_limit;
     int skip_loop_filter;
+    int keyframe_only; /* 1=只解码关键帧: 跳过非 I 图像解码, 稀疏关键帧输入也逐帧输出 */
     int thread_mode;  /* avs2_thread_mode: 0=frame, 1=row */
     avs2_logger logger;
 

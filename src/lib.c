@@ -1057,6 +1057,7 @@ avs2_ctx *avs2_open(const avs2_settings *s)
         c->log_level = s->log_level;
         c->frame_size_limit = s->frame_size_limit;
         c->skip_loop_filter = s->skip_loop_filter;
+        c->keyframe_only = s->keyframe_only;
         c->thread_mode = s->thread_mode;
         c->logger = s->logger;
     } else {
@@ -1434,6 +1435,17 @@ static int extract_pictures(struct avs2_internal *c, int *progress)
             if (!c->flushing) break;
             q = c->in_buf_sz;
         }
+        /* 只解关键帧: 非 I 图像(0xB6)不解码, 直接从缓冲移除(保留其前的序列头前缀),
+         * 使仅输入序列头+图像头+关键帧数据时也能正常解码出帧 */
+        if (c->keyframe_only && c->in_buf[p + 3] == AVS2_SC_INTER_PICTURE) {
+            int tail = c->in_buf_sz - q;
+            if (tail > 0)
+                memmove(c->in_buf + p, c->in_buf + q, (size_t)tail);
+            c->in_buf_sz = p + tail;
+            scan = 0;
+            if (progress) *progress = 1;
+            continue;
+        }
         /* 多线程: 在解码每帧前选取空闲 fc.
          * 单线程: cur_fc 由 avs2_decode_frame 内部设置 (默认 &c->fc[0]). */
         if (c->n_threads_active > 0) {
@@ -1522,7 +1534,7 @@ int avs2_get_picture(avs2_ctx *ctx, avs2_picture *pic, avs2_seq_header *seq)
 retry_output:
     if (mt) {
         avs2_mutex_lock(&c->task_lock);
-        if (c->flushing) {
+        if (c->flushing || c->keyframe_only) {
             while (c->n_pending > 0) {
                 /* flush 尾部: 主线程帮做 P2 加速收尾, 无可帮时短超时等待. */
                 if (c->n_p2_active < c->p2_cap && main_help_p2(c)) {
@@ -1583,8 +1595,9 @@ retry_output:
                 }
             }
             int skip = 0;
-            if (c->flushing) {
-                /* flush 尾部: 跳过缺失 POC 并补输出迟到帧 */
+            if (c->flushing || c->keyframe_only) {
+                /* flush 尾部 / 只解关键帧: 跳过缺失 POC 并补输出迟到帧
+                 * (只解关键帧时 POC 之间有空洞, 不能等积压 8 帧) */
                 skip = (min_poc_ge != 0x7fffffff || min_poc != 0x7fffffff);
             } else if (min_poc_ge != 0x7fffffff &&
                        min_poc_ge > c->out_next_poc && n_pending >= 8) {
